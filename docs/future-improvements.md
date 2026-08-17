@@ -17,9 +17,12 @@
 
 ## Restore Quality
 
-- [ ] **Monitor remapping (implemented; live acceptance pending)**: verify saved
-      workspaces on disconnected, renamed, rewired, and reordered monitors,
-      including floating geometry on a differently sized fallback display.
+- [x] **Monitor remapping implementation**: save connector and display identity,
+      resolve renamed or rewired outputs by description, and move workspaces to
+      a deterministic fallback when their saved monitor is disconnected.
+- [ ] **Monitor remapping acceptance**: verify saved workspaces on disconnected,
+      renamed, rewired, and reordered monitors, including floating geometry on
+      a differently sized fallback display.
 - [ ] **Stable identity**: investigate Hyprland `stableId` support and prefer it
       over title-based matching where it remains valid across compositor
       sessions.
@@ -39,8 +42,11 @@
       dependencies. If the current 200 ms polling becomes a bottleneck,
       investigate Hyprland event notifications or persistent IPC before
       considering a language rewrite.
-- [ ] **Additional launchers**: add application-specific handling only for apps
-      proven not to recreate their saved windows through bounded generic
+- [x] **Chromium app-mode launcher**: strictly recognized web-app windows launch
+      individually through `omarchy-launch-webapp` when Chromium cannot recreate
+      them through a bounded generic relaunch.
+- [ ] **Additional launchers**: add more application-specific handling only for
+      apps proven not to recreate their saved windows through bounded generic
       relaunches.
 
 ## Omarchy Integration
@@ -59,7 +65,7 @@
 
 ## Release Readiness
 
-- [ ] Run the complete Python, Bash, systemd, and plugin validation suite.
+- [x] Run the complete Python, Bash, systemd, and plugin validation suite.
 - [ ] Perform one clean install, update, and uninstall in an isolated home.
 - [ ] Document confirmed limitations and recovery commands in `README.md`.
 - [ ] Remove generated artifacts and review the final release diff.

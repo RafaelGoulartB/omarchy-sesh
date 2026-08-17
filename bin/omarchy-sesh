@@ -1097,6 +1097,13 @@ def launch_command(row):
             command = shlex.join(filtered)
         except ValueError:
             pass
+    if row.get("class") == "org.gnome.Nautilus":
+        try:
+            argv = shlex.split(command)
+            argv = [a for a in argv if a != "--gapplication-service"]
+            command = shlex.join(argv)
+        except ValueError:
+            pass
     if row.get("cwd"):
         command = f"cd -- {shlex.quote(row['cwd'])} && {command}"
     return command

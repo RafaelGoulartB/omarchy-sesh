@@ -442,6 +442,15 @@ class OmarchySeshTests(unittest.TestCase):
             self.module.launch_command(browser),
         )
 
+    def test_nautilus_launch_strips_gapplication_service(self):
+        nautilus = window(1, 0, "org.gnome.Nautilus", 10)
+        nautilus["cmdline"] = "/usr/bin/nautilus --gapplication-service --new-window"
+
+        self.assertEqual(
+            "cd -- /tmp && /usr/bin/nautilus --new-window",
+            self.module.launch_command(nautilus),
+        )
+
     def test_webapp_url_requires_matching_chromium_app_class(self):
         row = window(
             1,
