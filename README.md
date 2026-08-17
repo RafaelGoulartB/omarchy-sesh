@@ -4,10 +4,11 @@ Restore window positions and running apps after reboot or shutdown on
 Omarchy (Hyprland). Snapshot lives in a sqlite DB at
 `${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/session.db`.
 
-Scope: floating windows restore pixel-exact, tiled windows relaunch onto the
-saved workspaces in order (best-effort — Hyprland does not expose the split
-tree), and app content (browser tabs, unsaved docs, tmux sessions) stays
-application-owned. See `docs/session-restore-spec.md`.
+Scope: floating windows restore pixel-exact. Tiled windows relaunch onto the
+saved workspaces and, when Hyprland recreates compatible layout slots, are
+swapped back into their saved slots (best-effort because Hyprland does not
+expose the split tree). App content (browser tabs, unsaved docs, tmux sessions)
+stays application-owned. See `docs/session-restore-spec.md`.
 
 ## How it works
 
@@ -40,9 +41,9 @@ selecting Active mode captures the current desktop first when no successful
 restore marker exists.
 
 Because tiled windows are relaunched independently rather than replayed into
-Hyprland's split tree, ordering onto the right workspace is best-effort —
-see `docs/session-restore-spec.md` for the full design rationale and
-known limitations.
+Hyprland's split tree, the tool can correct which application occupies each
+compatible saved slot but cannot recreate missing splits or ratios. See
+`docs/session-restore-spec.md` for the full design rationale and limitations.
 
 ## Requirements
 

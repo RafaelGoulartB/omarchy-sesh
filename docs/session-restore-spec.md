@@ -11,7 +11,7 @@ window back where it was.
 |---|---|
 | App relaunch | Exact — reconstruct launch command from `/proc/<pid>/cmdline` + cwd |
 | Floating window geometry | Exact — Hyprland dispatchers place/resize by pixel |
-| Tiled window placement | Best-effort — windows relaunch in saved order onto the saved workspace; the dwindle/master split tree is not exposed via IPC, so tiling is re-derived, not pixel-identical |
+| Tiled window placement | Best-effort — windows relaunch onto the saved workspace; if Hyprland recreates the same geometry slots, matched occupants are swapped into their saved slots. The dwindle/master split tree is not exposed via IPC, so missing splits and ratios cannot be reconstructed |
 | Workspace assignment | Yes — launch into the saved workspace and move the matched window there |
 | Monitor remapping | Not yet — saved monitor metadata is retained for a future layout-aware remap |
 | Window flags (float/fullscreen/pinned) | Yes — `setfloating`, `fullscreenstate`, `pin` |
@@ -68,6 +68,8 @@ dispatchers). Key facts confirmed live:
   - `hl.dsp.window.float({ action = "on", window = … })`
   - `hl.dsp.window.fullscreen_state({ internal = <0|1|2>, client = <0|1|2>, window = … })`
   - `hl.dsp.window.pin({ window = … })` (floating only)
+  - `hl.dsp.window.swap({ window = …, target = … })` — exchange two tiled
+    windows while retaining their layout slots
   - `hl.dsp.window.move({ workspace = <N>, follow = false, window = … })` —
     silent workspace move
   - `hl.dsp.workspace.move({ workspace = <N>, monitor = "<NAME>" })` — move a
@@ -97,7 +99,7 @@ CREATE TABLE windows (
     workspace_id  INTEGER NOT NULL,         -- numeric workspace at save time
     workspace_name TEXT,
     monitor_name  TEXT,                     -- hyprctl monitor name (e.g. DP-2)
-    at_x          INTEGER, at_y INTEGER,    -- NULL for tiled windows
+    at_x          INTEGER, at_y INTEGER,    -- exact float position or tiled slot metadata
     size_w        INTEGER, size_h INTEGER,
     floating      INTEGER NOT NULL DEFAULT 0,
     fullscreen    INTEGER NOT NULL DEFAULT 0,  -- 0/1/2
@@ -139,7 +141,8 @@ Rules:
    symlink). Skip windows whose cmdline is empty, is `hyprctl`, or is in the
    exclude list.
 3. Group windows by saved PID. Determine numeric `workspace_id`; resolve `monitor_name` via
-   `hyprctl -j monitors` (map `monitor` id → name).
+   `hyprctl -j monitors` (map `monitor` id → name). Retain `at` and `size` for
+   tiled windows as slot identity metadata, not as pixel-placement commands.
 4. `INSERT` into a new session row in one transaction.
 
 Triggers (any one fires a save):
@@ -176,6 +179,11 @@ the service retries after two seconds.
     - Apply state through the Hyprland Lua dispatcher API: move to the saved
       workspace, set floating state, resize before moving floating windows,
       then restore fullscreen and pinned state.
+    - After discovery, compare saved and current tiled geometries per workspace.
+      When all saved tiled windows uniquely match the complete current slot set,
+      swap occupants by address into their saved slots. Skip correction for
+      missing, extra, fullscreen, ambiguous, or incompatible windows rather
+      than altering an uncertain layout.
 3. Saved monitor metadata is not yet applied. Workspace-to-monitor remapping
    remains a documented future improvement.
 

@@ -163,6 +163,43 @@ class OmarchySeshTests(unittest.TestCase):
             self.assertEqual(0, self.module._save_clients("manual", [], [], "complete", []))
             self.assertTrue(self.module.restore_is_ready())
 
+    def test_save_captures_tiled_geometry_as_slot_metadata(self):
+        client = {
+            "mapped": True,
+            "address": "0x1",
+            "class": "terminal",
+            "initialClass": "terminal",
+            "title": "Terminal",
+            "initialTitle": "Terminal",
+            "pid": 10,
+            "workspace": {"id": 1, "name": "1"},
+            "monitor": 0,
+            "at": [12, 34],
+            "size": [800, 600],
+            "floating": False,
+        }
+        with (
+            mock.patch.object(
+                self.module, "read_proc", return_value=("/usr/bin/terminal", "/tmp", "")
+            ),
+            mock.patch.object(
+                self.module, "persist_snapshot", return_value=7
+            ) as persist,
+            mock.patch.object(self.module, "log"),
+        ):
+            self.assertEqual(
+                0,
+                self.module._save_clients(
+                    "periodic", [client], [{"id": 0, "name": "DP-1"}], "complete", []
+                ),
+            )
+
+        saved = persist.call_args.args[3][0]
+        self.assertEqual(
+            (12, 34, 800, 600),
+            (saved["at_x"], saved["at_y"], saved["size_w"], saved["size_h"]),
+        )
+
     def test_process_groups_share_pid_but_not_class(self):
         rows = [
             window(1, 0, "chromium", 10),
@@ -638,6 +675,193 @@ class OmarchySeshTests(unittest.TestCase):
         self.assertEqual(0, result)
         self.assertEqual(1, dispatch.call_count)
         place.assert_called_once()
+
+    def test_tiled_slot_restore_corrects_chromium_appearance_order(self):
+        slack = window(1, 0, "slack", 10)
+        discord = window(2, 1, "discord", 20)
+        chrome = window(3, 2, "chromium", 30)
+        slack.update(at_x=0, at_y=0, size_w=500, size_h=500)
+        discord.update(at_x=0, at_y=500, size_w=500, size_h=500)
+        chrome.update(at_x=500, at_y=0, size_w=1000, size_h=1000)
+        matches = {1: "0xslack", 2: "0xdiscord", 3: "0xchrome"}
+        clients = [
+            {
+                "mapped": True,
+                "address": "0xdiscord",
+                "class": "discord",
+                "initialClass": "discord",
+                "workspace": {"id": 1},
+                "at": [0, 0],
+                "size": [500, 500],
+                "floating": False,
+                "fullscreen": 0,
+            },
+            {
+                "mapped": True,
+                "address": "0xchrome",
+                "class": "chromium",
+                "initialClass": "chromium",
+                "workspace": {"id": 1},
+                "at": [0, 500],
+                "size": [500, 500],
+                "floating": False,
+                "fullscreen": 0,
+            },
+            {
+                "mapped": True,
+                "address": "0xslack",
+                "class": "slack",
+                "initialClass": "slack",
+                "workspace": {"id": 1},
+                "at": [500, 0],
+                "size": [1000, 1000],
+                "floating": False,
+                "fullscreen": 0,
+            },
+        ]
+
+        with mock.patch.object(self.module, "dispatch", return_value=True) as dispatch:
+            self.assertTrue(
+                self.module.restore_tiled_slots(
+                    [slack, discord, chrome], matches, clients
+                )
+            )
+
+        self.assertEqual(
+            [
+                "hl.dsp.window.swap({ window = [[address:0xslack]], target = [[address:0xdiscord]] })",
+                "hl.dsp.window.swap({ window = [[address:0xdiscord]], target = [[address:0xchrome]] })",
+            ],
+            [call.args[0] for call in dispatch.call_args_list],
+        )
+
+    def test_tiled_slot_restore_skips_incompatible_geometry(self):
+        left = window(1, 0, "left", 10)
+        right = window(2, 1, "right", 20)
+        left.update(at_x=0, at_y=0, size_w=500, size_h=1000)
+        right.update(at_x=500, at_y=0, size_w=500, size_h=1000)
+        clients = [
+            {
+                "mapped": True,
+                "address": "0xleft",
+                "workspace": {"id": 1},
+                "at": [0, 0],
+                "size": [400, 1000],
+                "floating": False,
+                "fullscreen": 0,
+            },
+            {
+                "mapped": True,
+                "address": "0xright",
+                "workspace": {"id": 1},
+                "at": [400, 0],
+                "size": [600, 1000],
+                "floating": False,
+                "fullscreen": 0,
+            },
+        ]
+
+        with mock.patch.object(self.module, "dispatch") as dispatch:
+            self.assertTrue(
+                self.module.restore_tiled_slots(
+                    [left, right], {1: "0xleft", 2: "0xright"}, clients
+                )
+            )
+        dispatch.assert_not_called()
+
+    def test_tiled_slot_restore_skips_ambiguous_identities(self):
+        first = window(1, 0, "terminal", 10)
+        second = window(2, 1, "terminal", 20)
+        first.update(at_x=0, at_y=0, size_w=500, size_h=1000)
+        second.update(at_x=500, at_y=0, size_w=500, size_h=1000)
+        clients = [
+            {
+                "mapped": True,
+                "address": "0xsecond",
+                "class": "terminal",
+                "initialClass": "terminal",
+                "workspace": {"id": 1},
+                "at": [0, 0],
+                "size": [500, 1000],
+                "floating": False,
+                "fullscreen": 0,
+            },
+            {
+                "mapped": True,
+                "address": "0xfirst",
+                "class": "terminal",
+                "initialClass": "terminal",
+                "workspace": {"id": 1},
+                "at": [500, 0],
+                "size": [500, 1000],
+                "floating": False,
+                "fullscreen": 0,
+            },
+        ]
+
+        with mock.patch.object(self.module, "dispatch") as dispatch:
+            self.assertTrue(
+                self.module.restore_tiled_slots(
+                    [first, second], {1: "0xfirst", 2: "0xsecond"}, clients
+                )
+            )
+        dispatch.assert_not_called()
+
+        first["title"] = second["title"] = "Shared"
+        for client in clients:
+            client["title"] = "Shared"
+        with mock.patch.object(self.module, "dispatch") as dispatch:
+            self.assertTrue(
+                self.module.restore_tiled_slots(
+                    [first, second], {1: "0xfirst", 2: "0xsecond"}, clients
+                )
+            )
+        dispatch.assert_not_called()
+
+    def test_tiled_slot_failure_does_not_block_later_workspace(self):
+        rows = []
+        clients = []
+        matches = {}
+        for workspace_id in (1, 2):
+            left = window(workspace_id * 10, 0, f"left-{workspace_id}", 10)
+            right = window(workspace_id * 10 + 1, 1, f"right-{workspace_id}", 20)
+            left.update(
+                workspace_id=workspace_id, at_x=0, at_y=0, size_w=500, size_h=1000
+            )
+            right.update(
+                workspace_id=workspace_id,
+                at_x=500,
+                at_y=0,
+                size_w=500,
+                size_h=1000,
+            )
+            rows.extend((left, right))
+            matches.update(
+                {
+                    left["id"]: f"0xleft{workspace_id}",
+                    right["id"]: f"0xright{workspace_id}",
+                }
+            )
+            for row, x in ((right, 0), (left, 500)):
+                clients.append(
+                    {
+                        "mapped": True,
+                        "address": matches[row["id"]],
+                        "class": row["class"],
+                        "initialClass": row["initial_class"],
+                        "workspace": {"id": workspace_id},
+                        "at": [x, 0],
+                        "size": [500, 1000],
+                        "floating": False,
+                        "fullscreen": 0,
+                    }
+                )
+
+        with mock.patch.object(
+            self.module, "dispatch", side_effect=[False, True]
+        ) as dispatch:
+            self.assertFalse(self.module.restore_tiled_slots(rows, matches, clients))
+        self.assertEqual(2, dispatch.call_count)
 
     def test_discovery_rejects_class_only_window_on_another_workspace(self):
         row = window(1, 0, "terminal", 10, title="Saved")

@@ -301,10 +301,10 @@ def _save_clients(label, clients, monitors, status, errors):
                 "workspace_id": ws.get("id"),
                 "workspace_name": ws.get("name"),
                 "monitor_name": monitor_by_id.get(w.get("monitor")),
-                "at_x": at[0] if w.get("floating") and len(at) > 0 else None,
-                "at_y": at[1] if w.get("floating") and len(at) > 1 else None,
-                "size_w": size[0] if w.get("floating") and len(size) > 0 else None,
-                "size_h": size[1] if w.get("floating") and len(size) > 1 else None,
+                "at_x": at[0] if len(at) > 0 else None,
+                "at_y": at[1] if len(at) > 1 else None,
+                "size_w": size[0] if len(size) > 0 else None,
+                "size_h": size[1] if len(size) > 1 else None,
                 "floating": 1 if w.get("floating") else 0,
                 "fullscreen": w.get("fullscreen", 0),
                 "pinned": 1 if w.get("pinned") else 0,
@@ -505,6 +505,120 @@ def place_window(w, address, current=None):
     if bool(w.get("pinned")) != current_pinned:
         ok = dispatch(f"hl.dsp.window.pin({{ window = {win} }})") and ok
     return ok
+
+
+def window_geometry(window):
+    at = window.get("at") or []
+    size = window.get("size") or []
+    if len(at) < 2 or len(size) < 2:
+        return None
+    return at[0], at[1], size[0], size[1]
+
+
+def saved_geometry(row):
+    values = (
+        row.get("at_x"),
+        row.get("at_y"),
+        row.get("size_w"),
+        row.get("size_h"),
+    )
+    return None if any(value is None for value in values) else values
+
+
+def geometries_match(left, right, tolerance=2):
+    return all(abs(a - b) <= tolerance for a, b in zip(left, right))
+
+
+def restore_tiled_slots(rows, matches, clients):
+    rows_by_workspace = {}
+    all_ok = True
+    for row in rows:
+        if not row.get("floating") and row.get("workspace_id") is not None:
+            rows_by_workspace.setdefault(row["workspace_id"], []).append(row)
+
+    for workspace_id, workspace_rows in rows_by_workspace.items():
+        workspace_rows.sort(key=lambda row: row["ord"])
+        if len(workspace_rows) < 2 or any(
+            saved_geometry(row) is None for row in workspace_rows
+        ):
+            continue
+        if any(
+            row.get("fullscreen") or row["id"] not in matches
+            for row in workspace_rows
+        ):
+            continue
+
+        current = [
+            client
+            for client in clients
+            if client.get("mapped")
+            and not client.get("floating")
+            and (client.get("workspace") or {}).get("id") == workspace_id
+        ]
+        if len(current) != len(workspace_rows) or any(
+            client.get("fullscreen") or window_geometry(client) is None
+            for client in current
+        ):
+            continue
+
+        matched_addresses = {matches[row["id"]] for row in workspace_rows}
+        current_addresses = {client.get("address") for client in current}
+        if None in current_addresses or matched_addresses != current_addresses:
+            continue
+
+        client_by_address = {client["address"]: client for client in current}
+        identities_are_unique = True
+        for row in workspace_rows:
+            client = client_by_address[matches[row["id"]]]
+            rank = client_matches(row, client)
+            candidate_ranks = [
+                candidate_rank
+                for candidate in workspace_rows
+                if (candidate_rank := client_matches(candidate, client)) is not None
+            ]
+            if (
+                rank is None
+                or rank != min(candidate_ranks)
+                or candidate_ranks.count(rank) != 1
+            ):
+                identities_are_unique = False
+                break
+        if not identities_are_unique:
+            continue
+
+        slot_addresses = []
+        for row in workspace_rows:
+            candidates = [
+                client["address"]
+                for client in current
+                if geometries_match(saved_geometry(row), window_geometry(client))
+            ]
+            if len(candidates) != 1:
+                slot_addresses = []
+                break
+            slot_addresses.append(candidates[0])
+        if len(set(slot_addresses)) != len(workspace_rows):
+            continue
+
+        for index, row in enumerate(workspace_rows):
+            desired = matches[row["id"]]
+            occupant = slot_addresses[index]
+            if desired == occupant:
+                continue
+            other_index = slot_addresses.index(desired)
+            if not dispatch(
+                "hl.dsp.window.swap({ "
+                f"window = {lua_quote(f'address:{desired}')}, "
+                f"target = {lua_quote(f'address:{occupant}')} "
+                "})"
+            ):
+                all_ok = False
+                break
+            slot_addresses[index], slot_addresses[other_index] = (
+                slot_addresses[other_index],
+                slot_addresses[index],
+            )
+    return all_ok
 
 
 def restore_was_completed(sid):
@@ -781,6 +895,13 @@ def restore_windows(rows, initial_matches, initial_clients):
             failures += 1
             state = next(state for state in states if row in state["rows"])
             log(f"restore: no window appeared for {row['class']} ({state['launch_cmd']})")
+    if any(not row.get("floating") and saved_geometry(row) is not None for row in rows):
+        clients = hyprctl_json("clients")
+        if clients is None:
+            log("restore: Hyprland IPC failed while correcting tiled slots")
+            return restored, failures, launched_processes, True
+        if not restore_tiled_slots(rows, matches, clients):
+            failures += 1
     return restored, failures, launched_processes, False
 
 
