@@ -1,12 +1,12 @@
 import importlib.machinery
 import importlib.util
 import os
-from pathlib import Path
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 sys.dont_write_bytecode = True
@@ -14,6 +14,7 @@ sys.dont_write_bytecode = True
 
 SCRIPT = Path(__file__).parents[1] / "bin" / "omarchy-sesh"
 INSTALLER = Path(__file__).parents[1] / "install.sh"
+UNINSTALLER = Path(__file__).parents[1] / "uninstall.sh"
 
 
 def load_module(state_home):
@@ -99,6 +100,36 @@ class OmarchySeshTests(unittest.TestCase):
 
         self.assertEqual("legacy_unknown", status)
         self.assertIn("pid", columns)
+
+    def test_empty_xdg_paths_migrate_relative_state_and_config(self):
+        legacy = Path(self.tempdir.name) / "legacy" / "omarchy"
+        legacy.mkdir(parents=True)
+        (legacy / "session.db").write_text("database")
+        (legacy / "sesh").mkdir()
+        (legacy / "sesh" / "config.json").write_text("{}")
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"XDG_STATE_HOME": "", "XDG_CONFIG_HOME": ""},
+                clear=False,
+            ),
+            mock.patch.object(self.module, "STATE_DIR", Path(self.tempdir.name) / "state" / "omarchy"),
+            mock.patch.object(
+                self.module,
+                "CONFIG_PATH",
+                Path(self.tempdir.name) / "config" / "omarchy" / "sesh" / "config.json",
+            ),
+            mock.patch.object(self.module, "Path", wraps=Path) as path_class,
+        ):
+            path_class.return_value = legacy
+            self.module.migrate_empty_xdg_paths()
+        self.assertEqual(
+            "database",
+            (Path(self.tempdir.name) / "state" / "omarchy" / "session.db").read_text(),
+        )
+        self.assertTrue(
+            (Path(self.tempdir.name) / "config" / "omarchy" / "sesh" / "config.json").exists()
+        )
 
     def test_complete_empty_snapshot_supersedes_older_nonempty_snapshot(self):
         row = window(1, 0, "terminal", 10)
@@ -199,6 +230,99 @@ class OmarchySeshTests(unittest.TestCase):
         )
         self.assertIsNone(self.module.chromium_webapp_url(row))
 
+    def test_webapp_url_uses_validated_app_argument_when_title_is_not_url(self):
+        row = window(
+            1,
+            0,
+            "chrome-app.slack.com__client_team_channel-Default",
+            10,
+            initial_title="Slack",
+        )
+        row["cmdline"] = (
+            "/usr/lib/chromium/chromium "
+            "--app=https://app.slack.com/client/team/channel"
+        )
+        self.assertEqual(
+            "https://app.slack.com/client/team/channel",
+            self.module.chromium_webapp_url(row),
+        )
+
+    def test_webapp_profile_suffix_can_change_during_restore(self):
+        row = window(
+            1,
+            0,
+            "chrome-app.slack.com__client_team_channel-Default",
+            10,
+            initial_title="app.slack.com_/client/team/channel",
+        )
+        client = {
+            "mapped": True,
+            "address": "0x1",
+            "class": "chrome-app.slack.com__client_team_channel-Profile_3",
+            "initialClass": "chrome-app.slack.com__client_team_channel-Profile_3",
+            "title": "Slack",
+            "initialTitle": "app.slack.com_/client/team/channel",
+            "workspace": {"id": 1},
+        }
+        self.assertEqual(1, self.module.client_matches(row, client))
+
+    def test_shared_chromium_app_argument_does_not_duplicate_webapp(self):
+        slack = window(
+            1,
+            0,
+            "chrome-app.slack.com__client_team_channel-Default",
+            10,
+            initial_title="Slack",
+        )
+        browser = window(2, 1, "chromium", 10)
+        shared_cmdline = (
+            "/usr/lib/chromium/chromium "
+            "--app=https://app.slack.com/client/team/channel"
+        )
+        slack["cmdline"] = shared_cmdline
+        browser["cmdline"] = shared_cmdline
+
+        self.assertEqual([[slack], [browser]], self.module.process_groups([slack, browser]))
+        self.assertEqual(
+            "omarchy-launch-webapp https://app.slack.com/client/team/channel",
+            self.module.launch_command(slack),
+        )
+        self.assertEqual(
+            "cd -- /tmp && /usr/lib/chromium/chromium",
+            self.module.launch_command(browser),
+        )
+
+    def test_unrecognized_webapp_cannot_supply_shared_browser_launch(self):
+        unrecognized = window(
+            1,
+            0,
+            "chrome-app.slack.com__client_team_channel-Default",
+            10,
+            initial_title="Slack",
+        )
+        browser = window(2, 1, "chromium", 10)
+        shared_cmdline = (
+            "/usr/lib/chromium/chromium "
+            "--app=https://different.example.com/wrong"
+        )
+        unrecognized["cmdline"] = shared_cmdline
+        browser["cmdline"] = shared_cmdline
+
+        group = self.module.process_groups([unrecognized, browser])[0]
+        self.assertIs(browser, self.module.process_launch_row(group))
+        self.assertEqual(
+            "cd -- /tmp && /usr/lib/chromium/chromium",
+            self.module.launch_command(self.module.process_launch_row(group)),
+        )
+
+    def test_profile_alias_requires_plausible_webapp_class(self):
+        self.assertFalse(
+            self.module.window_classes_match(
+                "chrome-arbitrary-Default",
+                "chrome-arbitrary-Profile_3",
+            )
+        )
+
     def test_normal_chromium_class_alias_matches(self):
         row = window(1, 0, "chromium", 10, initial_title="New Tab - Chromium")
         client = {
@@ -211,34 +335,6 @@ class OmarchySeshTests(unittest.TestCase):
             "workspace": {"id": 1},
         }
         self.assertEqual(1, self.module.client_matches(row, client))
-
-    def test_duplicate_class_guard_uses_multiplicity(self):
-        rows = [
-            window(1, 0, "terminal", 10, title="One"),
-            window(2, 1, "terminal", 20, title="Two"),
-        ]
-        one_terminal = [
-            {
-                "mapped": True,
-                "address": "0x1",
-                "class": "terminal",
-                "initialClass": "terminal",
-                "title": "One",
-                "workspace": {"id": 1},
-            }
-        ]
-        two_terminals = one_terminal + [
-            {
-                "mapped": True,
-                "address": "0x2",
-                "class": "terminal",
-                "initialClass": "terminal",
-                "title": "Two",
-                "workspace": {"id": 1},
-            }
-        ]
-        self.assertFalse(self.module.double_restore_guard(rows, one_terminal))
-        self.assertTrue(self.module.double_restore_guard(rows, two_terminals))
 
     def test_match_prefers_current_title_when_initial_titles_are_blank(self):
         rows = [
@@ -342,6 +438,47 @@ class OmarchySeshTests(unittest.TestCase):
         matches = self.module.match_windows(rows, clients, max_rank=1)
         self.assertEqual({1: "0xflexible", 2: "0xshared"}, matches)
 
+    def test_matching_does_not_displace_exact_match_with_class_fallback(self):
+        rows = [
+            window(1, 0, "terminal", 10, title="Exact"),
+            window(2, 1, "terminal", 20),
+        ]
+        clients = [
+            {
+                "mapped": True,
+                "address": "0xexact",
+                "class": "terminal",
+                "initialClass": "terminal",
+                "title": "Exact",
+                "workspace": {"id": 1},
+            },
+            {
+                "mapped": True,
+                "address": "0xfallback",
+                "class": "terminal",
+                "initialClass": "terminal",
+                "title": "Other",
+                "workspace": {"id": 1},
+            },
+        ]
+        self.assertEqual(
+            {1: "0xexact", 2: "0xfallback"},
+            self.module.match_windows(rows, clients),
+        )
+
+    def test_initial_class_fallback_matches_on_saved_workspace(self):
+        row = window(1, 0, "current-class", 10)
+        row["initial_class"] = "stable-class"
+        client = {
+            "mapped": True,
+            "address": "0x1",
+            "class": "changed-class",
+            "initialClass": "stable-class",
+            "title": "",
+            "workspace": {"id": 1},
+        }
+        self.assertEqual({1: "0x1"}, self.module.match_windows([row], [client]))
+
     def run_restore(
         self,
         rows,
@@ -350,6 +487,7 @@ class OmarchySeshTests(unittest.TestCase):
         place_result=True,
         clients=None,
         appearances=None,
+        appearance_workspaces=None,
         events=None,
     ):
         connection = mock.Mock()
@@ -358,6 +496,7 @@ class OmarchySeshTests(unittest.TestCase):
         clients = clients or []
         wait_matches = wait_matches or {}
         appearances = appearances or {row_id: 1 for row_id in wait_matches}
+        appearance_workspaces = appearance_workspaces or {}
         events = events if events is not None else []
         clock = [0.0]
 
@@ -369,7 +508,9 @@ class OmarchySeshTests(unittest.TestCase):
                 "initialClass": row["initial_class"],
                 "title": row["title"],
                 "initialTitle": row["initial_title"],
-                "workspace": {"id": row["workspace_id"]},
+                "workspace": {
+                    "id": appearance_workspaces.get(row["id"], row["workspace_id"])
+                },
             }
 
         calls = [0]
@@ -396,6 +537,11 @@ class OmarchySeshTests(unittest.TestCase):
             clock[0] += seconds
 
         with (
+            mock.patch.dict(
+                os.environ,
+                {"HYPRLAND_INSTANCE_SIGNATURE": "test-instance"},
+                clear=False,
+            ),
             mock.patch.object(self.module, "acquire_operation_lock", return_value=lock_file),
             mock.patch.object(self.module, "db_conn", return_value=connection),
             mock.patch.object(self.module, "latest_session", return_value=(1, "periodic", "now")),
@@ -482,6 +628,32 @@ class OmarchySeshTests(unittest.TestCase):
             ["initial-scan", "dispatch", "dispatch", "poll"], events[:4]
         )
 
+    def test_launched_window_is_discovered_before_workspace_placement(self):
+        row = window(1, 0, "terminal", 10, title="Saved")
+        result, dispatch, place = self.run_restore(
+            [row],
+            wait_matches={1: "0x1"},
+            appearance_workspaces={1: 2},
+        )
+        self.assertEqual(0, result)
+        self.assertEqual(1, dispatch.call_count)
+        place.assert_called_once()
+
+    def test_discovery_rejects_class_only_window_on_another_workspace(self):
+        row = window(1, 0, "terminal", 10, title="Saved")
+        client = {
+            "mapped": True,
+            "address": "0xother",
+            "class": "terminal",
+            "initialClass": "terminal",
+            "title": "Unrelated",
+            "workspace": {"id": 2},
+        }
+        self.assertEqual(
+            {},
+            self.module.match_windows([row], [client], max_rank=3),
+        )
+
     def test_fast_window_is_placed_while_slow_group_is_still_pending(self):
         rows = [
             window(1, 0, "slow-app", 10),
@@ -554,6 +726,20 @@ class OmarchySeshTests(unittest.TestCase):
         self.assertEqual(75, result)
         dispatch.assert_not_called()
 
+    def test_no_session_without_compositor_requests_retry(self):
+        connection = mock.Mock()
+        lock_file = mock.Mock()
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.object(self.module, "acquire_operation_lock", return_value=lock_file),
+            mock.patch.object(self.module, "db_conn", return_value=connection),
+            mock.patch.object(self.module, "latest_session", return_value=None),
+            mock.patch.object(self.module, "hyprctl_json") as hyprctl,
+        ):
+            result = self.module.cmd_restore()
+        self.assertEqual(75, result)
+        hyprctl.assert_not_called()
+
     def test_second_operation_cannot_acquire_lock(self):
         first = self.module.acquire_operation_lock()
         second = self.module.acquire_operation_lock()
@@ -576,6 +762,7 @@ class OmarchySeshTests(unittest.TestCase):
                 mock.patch.object(
                     self.module, "latest_session", return_value=(7, "periodic", "now")
                 ),
+                mock.patch.object(self.module, "hyprctl_json", return_value=[]),
                 mock.patch.object(self.module, "load_windows") as load_windows,
                 mock.patch.object(self.module, "dispatch") as dispatch,
             ):
@@ -584,15 +771,105 @@ class OmarchySeshTests(unittest.TestCase):
         load_windows.assert_not_called()
         dispatch.assert_not_called()
 
+    def test_completed_marker_still_requires_live_compositor(self):
+        connection = mock.Mock()
+        lock_file = mock.Mock()
+        with mock.patch.dict(os.environ, {"HYPRLAND_INSTANCE_SIGNATURE": "instance-1"}):
+            self.module.mark_restore_completed(7)
+            with (
+                mock.patch.object(
+                    self.module, "acquire_operation_lock", return_value=lock_file
+                ),
+                mock.patch.object(self.module, "db_conn", return_value=connection),
+                mock.patch.object(
+                    self.module, "latest_session", return_value=(7, "periodic", "now")
+                ),
+                mock.patch.object(self.module, "hyprctl_json", return_value=None),
+                mock.patch.object(self.module, "load_windows") as load_windows,
+            ):
+                result = self.module.cmd_restore()
+        self.assertEqual(75, result)
+        load_windows.assert_not_called()
+
+    def test_dry_run_does_not_change_restore_marker(self):
+        connection = mock.Mock()
+        lock_file = mock.Mock()
+        row = window(1, 0, "terminal", 10)
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"HYPRLAND_INSTANCE_SIGNATURE": "instance-1"},
+                clear=False,
+            ),
+            mock.patch.object(self.module, "acquire_operation_lock", return_value=lock_file),
+            mock.patch.object(self.module, "db_conn", return_value=connection),
+            mock.patch.object(
+                self.module, "latest_session", return_value=(1, "periodic", "now")
+            ),
+            mock.patch.object(self.module, "load_windows", return_value=[row]),
+            mock.patch.object(self.module, "hyprctl_json", return_value=[]),
+            mock.patch.object(self.module, "mark_restore_completed") as mark,
+        ):
+            self.assertEqual(0, self.module.cmd_restore(dry_run=True))
+        mark.assert_not_called()
+
+    def test_empty_dry_run_does_not_change_restore_marker(self):
+        connection = mock.Mock()
+        lock_file = mock.Mock()
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"HYPRLAND_INSTANCE_SIGNATURE": "instance-1"},
+                clear=False,
+            ),
+            mock.patch.object(self.module, "acquire_operation_lock", return_value=lock_file),
+            mock.patch.object(self.module, "db_conn", return_value=connection),
+            mock.patch.object(
+                self.module, "latest_session", return_value=(1, "periodic", "now")
+            ),
+            mock.patch.object(self.module, "load_windows", return_value=[]),
+            mock.patch.object(self.module, "hyprctl_json", return_value=[]),
+            mock.patch.object(self.module, "mark_restore_completed") as mark,
+        ):
+            self.assertEqual(0, self.module.cmd_restore(dry_run=True))
+        mark.assert_not_called()
+
+    def test_application_failure_remains_nonretryable_after_gate_is_written(self):
+        with mock.patch.object(
+            self.module,
+            "mark_restore_completed",
+            side_effect=[True, False],
+        ) as mark:
+            result, _, _ = self.run_restore(
+                [window(1, 0, "terminal", 10)],
+                dispatch_result=False,
+            )
+        self.assertEqual(1, result)
+        mark.assert_called_once_with(1, complete=False)
+
+    def test_restore_marker_write_failure_is_retryable(self):
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"HYPRLAND_INSTANCE_SIGNATURE": "instance-1"},
+                clear=False,
+            ),
+            mock.patch.object(
+                self.module.os, "replace", side_effect=OSError("disk full")
+            ),
+            mock.patch.object(self.module, "log"),
+        ):
+            self.assertFalse(self.module.mark_restore_completed(1))
+
     def test_autosave_sleeps_before_first_capture(self):
         with (
             mock.patch.object(self.module, "load_config", return_value={"autosave_seconds": 60}),
             mock.patch.object(self.module.time, "sleep", side_effect=RuntimeError("stop")) as sleep,
             mock.patch.object(self.module, "refresh_hyprland_instance"),
             mock.patch.object(self.module, "cmd_save") as save,
+            self.assertRaisesRegex(RuntimeError, "stop"),
         ):
-            with self.assertRaisesRegex(RuntimeError, "stop"):
-                self.module.cmd_autosave()
+            self.module.cmd_autosave()
         sleep.assert_called_once_with(60)
         save.assert_not_called()
 
@@ -605,9 +882,9 @@ class OmarchySeshTests(unittest.TestCase):
             ),
             mock.patch.object(self.module, "refresh_hyprland_instance"),
             mock.patch.object(self.module, "cmd_save") as save,
+            self.assertRaisesRegex(RuntimeError, "stop"),
         ):
-            with self.assertRaisesRegex(RuntimeError, "stop"):
-                self.module.cmd_autosave()
+            self.module.cmd_autosave()
         save.assert_not_called()
 
     def test_autosave_is_not_ready_without_compositor_instance(self):
@@ -638,7 +915,21 @@ class OmarchySeshTests(unittest.TestCase):
             ["systemctl", "--user", "show-environment"],
             capture_output=True,
             text=True,
+            check=False,
         )
+
+    def test_autosave_clears_stale_compositor_instance(self):
+        result = mock.Mock(returncode=0, stdout="HOME=/home/test\n")
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"HYPRLAND_INSTANCE_SIGNATURE": "stale-instance"},
+                clear=False,
+            ),
+            mock.patch.object(self.module.subprocess, "run", return_value=result),
+        ):
+            self.assertFalse(self.module.refresh_hyprland_instance())
+            self.assertNotIn("HYPRLAND_INSTANCE_SIGNATURE", os.environ)
 
     def test_mode_reports_enabled_autosave_as_active(self):
         result = mock.Mock(returncode=0, stdout="enabled\n")
@@ -651,6 +942,7 @@ class OmarchySeshTests(unittest.TestCase):
             ["systemctl", "--user", "is-enabled", "omarchy-sesh-autosave.service"],
             capture_output=True,
             text=True,
+            check=False,
         )
         output.assert_called_once_with("active")
 
@@ -671,6 +963,7 @@ class OmarchySeshTests(unittest.TestCase):
             ["systemctl", "--user", "disable", "--now", "omarchy-sesh-autosave.service"],
             capture_output=True,
             text=True,
+            check=False,
         )
 
     def test_active_mode_enables_autosave_now(self):
@@ -684,6 +977,7 @@ class OmarchySeshTests(unittest.TestCase):
             ["systemctl", "--user", "enable", "--now", "omarchy-sesh-autosave.service"],
             capture_output=True,
             text=True,
+            check=False,
         )
 
     def test_active_mode_captures_baseline_when_restore_is_not_ready(self):
@@ -714,10 +1008,17 @@ class OmarchySeshTests(unittest.TestCase):
             self.assertEqual(1, self.module.cmd_mode("active"))
         run.assert_not_called()
 
-    def run_installer(self, autosave_unit_exists, wrapped_menu=False, autosave_enabled=False):
+    def run_installer(
+        self,
+        autosave_unit_exists,
+        wrapped_menu=False,
+        autosave_enabled=False,
+        completed_install=None,
+        config_name=".config",
+    ):
         with tempfile.TemporaryDirectory() as home:
             home_path = Path(home)
-            config_home = home_path / ".config"
+            config_home = home_path / config_name
             state_home = home_path / ".local" / "state"
             unit_dir = config_home / "systemd" / "user"
             if autosave_unit_exists:
@@ -727,6 +1028,12 @@ class OmarchySeshTests(unittest.TestCase):
             if wrapped_menu:
                 menu.parent.mkdir(parents=True)
                 menu.write_text('{"items": {"custom": {"label": "Custom"}}}\n')
+            if completed_install is None:
+                completed_install = autosave_unit_exists
+            marker = state_home / "omarchy" / "sesh-installed"
+            if completed_install:
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.write_text("0.1.0\n")
 
             calls = home_path / "systemctl.calls"
             fake_systemctl = home_path / "systemctl"
@@ -755,7 +1062,6 @@ class OmarchySeshTests(unittest.TestCase):
                 text=True,
                 env=environment,
             )
-            marker = state_home / "omarchy" / "sesh-installed"
             return calls.read_text().splitlines(), menu.read_text(), marker.read_text().strip()
 
     def test_first_install_enables_autosave(self):
@@ -766,6 +1072,13 @@ class OmarchySeshTests(unittest.TestCase):
     def test_reinstall_preserves_manual_mode(self):
         calls, _, _ = self.run_installer(autosave_unit_exists=True)
         self.assertNotIn("--user enable omarchy-sesh-autosave.service", calls)
+
+    def test_interrupted_install_recovers_active_mode(self):
+        calls, _, _ = self.run_installer(
+            autosave_unit_exists=True,
+            completed_install=False,
+        )
+        self.assertIn("--user enable omarchy-sesh-autosave.service", calls)
 
     def test_update_restarts_running_autosave(self):
         calls, _, _ = self.run_installer(
@@ -781,6 +1094,87 @@ class OmarchySeshTests(unittest.TestCase):
         custom = menu.index('"custom"')
         self.assertLess(items, begin)
         self.assertLess(begin, custom)
+
+    def test_installer_honors_xdg_config_home(self):
+        _, menu, _ = self.run_installer(
+            autosave_unit_exists=False,
+            config_name="xdg-config",
+        )
+        self.assertIn("omarchy-sesh: begin power-menu overrides", menu)
+
+    def test_power_action_quotes_home_binary_path(self):
+        _, menu, _ = self.run_installer(autosave_unit_exists=False)
+        self.assertIn(r'\"$HOME/.local/bin/omarchy-sesh\" save', menu)
+
+    def run_uninstaller(self, stop_status=0, active_status=3):
+        temporary = tempfile.TemporaryDirectory()
+        home = Path(temporary.name)
+        config_home = home / "xdg-config"
+        state_home = home / ".local" / "state"
+        binary = home / ".local" / "bin" / "omarchy-sesh"
+        binary.parent.mkdir(parents=True)
+        binary.symlink_to(home / "missing-binary")
+        unit_dir = config_home / "systemd" / "user"
+        unit_dir.mkdir(parents=True)
+        (unit_dir / "omarchy-sesh.service").symlink_to(home / "missing-unit")
+        legacy_menu = home / ".config" / "omarchy" / "extensions" / "omarchy-menu.jsonc"
+        legacy_menu.parent.mkdir(parents=True)
+        legacy_menu.write_text(
+            "{\n"
+            "  // omarchy-sesh: begin power-menu overrides\n"
+            '  "system.logout": {},\n'
+            "  // omarchy-sesh: end power-menu overrides\n"
+            "}\n"
+        )
+        fake_systemctl = home / "systemctl"
+        fake_systemctl.write_text(
+            "#!/bin/sh\n"
+            '[ "${2:-}" = stop ] && exit "$STOP_STATUS"\n'
+            '[ "${2:-}" = is-active ] && exit "$ACTIVE_STATUS"\n'
+            "exit 0\n"
+        )
+        fake_systemctl.chmod(0o755)
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "HOME": str(home),
+                "XDG_CONFIG_HOME": str(config_home),
+                "XDG_STATE_HOME": str(state_home),
+                "SYSTEMCTL": str(fake_systemctl),
+                "STOP_STATUS": str(stop_status),
+                "ACTIVE_STATUS": str(active_status),
+            }
+        )
+        result = subprocess.run(
+            ["bash", str(UNINSTALLER)],
+            capture_output=True,
+            text=True,
+            env=environment,
+            check=False,
+        )
+        return temporary, result, binary, unit_dir, legacy_menu
+
+    def test_uninstall_removes_dangling_artifacts_and_legacy_menu(self):
+        temporary, result, binary, unit_dir, legacy_menu = self.run_uninstaller()
+        try:
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertFalse(binary.is_symlink())
+            self.assertFalse((unit_dir / "omarchy-sesh.service").is_symlink())
+            self.assertNotIn("omarchy-sesh", legacy_menu.read_text())
+        finally:
+            temporary.cleanup()
+
+    def test_uninstall_aborts_when_service_state_cannot_be_verified(self):
+        temporary, result, binary, _, _ = self.run_uninstaller(
+            stop_status=1,
+            active_status=1,
+        )
+        try:
+            self.assertNotEqual(0, result.returncode)
+            self.assertTrue(binary.is_symlink())
+            self.assertIn("could not verify", result.stderr)
+        finally:
+            temporary.cleanup()
 
 
 if __name__ == "__main__":

@@ -14,12 +14,15 @@ UNIT="$CONFIG_HOME/systemd/user/omarchy-sesh.service"
 UNIT_WANTS="$CONFIG_HOME/systemd/user/graphical-session.target.wants/omarchy-sesh.service"
 AUTOSAVE_UNIT="$CONFIG_HOME/systemd/user/omarchy-sesh-autosave.service"
 AUTOSAVE_WANTS="$CONFIG_HOME/systemd/user/graphical-session.target.wants/omarchy-sesh-autosave.service"
-AUTOSTART="$HOME/.config/hypr/autostart.lua"
-MENU="$HOME/.config/omarchy/extensions/omarchy-menu.jsonc"
+AUTOSTART="$CONFIG_HOME/hypr/autostart.lua"
+MENU="$CONFIG_HOME/omarchy/extensions/omarchy-menu.jsonc"
+LEGACY_AUTOSTART="$HOME/.config/hypr/autostart.lua"
+LEGACY_MENU="$HOME/.config/omarchy/extensions/omarchy-menu.jsonc"
 DB="$STATE_HOME/omarchy/session.db"
 LOCK="$STATE_HOME/omarchy/session.lock"
 RESTORE_MARKER="$STATE_HOME/omarchy/restore-complete.json"
 INSTALL_MARKER="$STATE_HOME/omarchy/sesh-installed"
+MENU_CREATED_MARKER="$STATE_HOME/omarchy/sesh-menu-created"
 LOG_DIR="$STATE_HOME/omarchy/log"
 
 MARKER_COMMENT="# omarchy-sesh: restore saved windows after login (guard skips if already restored)"
@@ -29,7 +32,25 @@ SYSTEMCTL="${SYSTEMCTL:-systemctl}"
 
 removed=0
 
-"$SYSTEMCTL" --user stop omarchy-sesh-autosave.service omarchy-sesh.service >/dev/null 2>&1 || true
+if ! "$SYSTEMCTL" --user stop omarchy-sesh-autosave.service omarchy-sesh.service >/dev/null 2>&1; then
+  for unit in omarchy-sesh-autosave.service omarchy-sesh.service; do
+    set +e
+    "$SYSTEMCTL" --user is-active --quiet "$unit" >/dev/null 2>&1
+    active_status=$?
+    set -e
+    case "$active_status" in
+      0)
+        echo "error: failed to stop active $unit" >&2
+        exit 1
+        ;;
+      3|4) ;;
+      *)
+        echo "error: could not verify whether $unit stopped" >&2
+        exit 1
+        ;;
+    esac
+  done
+fi
 "$SYSTEMCTL" --user disable omarchy-sesh-autosave.service omarchy-sesh.service >/dev/null 2>&1 || true
 
 for link in "$UNIT_WANTS" "$AUTOSAVE_WANTS"; do
@@ -39,20 +60,23 @@ for link in "$UNIT_WANTS" "$AUTOSAVE_WANTS"; do
   fi
 done
 
-if [[ -f "$UNIT" || -f "$AUTOSAVE_UNIT" ]]; then
+if [[ -e "$UNIT" || -L "$UNIT" || -e "$AUTOSAVE_UNIT" || -L "$AUTOSAVE_UNIT" ]]; then
   rm -f "$UNIT" "$AUTOSAVE_UNIT"
   "$SYSTEMCTL" --user daemon-reload
   removed=1
 fi
 
-if [[ -f "$MENU" ]] && grep -qF "// omarchy-sesh: begin power-menu overrides" "$MENU"; then
-  python3 - "$MENU" <<'PY'
+menu_paths=("$MENU")
+[[ "$MENU" != "$LEGACY_MENU" ]] && menu_paths+=("$LEGACY_MENU")
+for menu_path in "${menu_paths[@]}"; do
+  if [[ -f "$menu_path" ]] && grep -qF "// omarchy-sesh: begin power-menu overrides" "$menu_path"; then
+    python3 - "$menu_path" <<'PY'
 import sys
 from pathlib import Path
 import os
 import tempfile
 
-path = Path(sys.argv[1])
+path = Path(sys.argv[1]).resolve()
 text = path.read_text()
 begin = "// omarchy-sesh: begin power-menu overrides"
 end = "// omarchy-sesh: end power-menu overrides"
@@ -70,23 +94,27 @@ with tempfile.NamedTemporaryFile("w", dir=path.parent, delete=False) as handle:
 os.chmod(temporary, path.stat().st_mode)
 os.replace(temporary, path)
 PY
-  removed=1
-fi
+    removed=1
+  fi
+done
 
-if [[ -f "$BIN" ]]; then
+if [[ -e "$BIN" || -L "$BIN" ]]; then
   rm -f "$BIN"
   removed=1
 fi
 
-if [[ -f "$AUTOSTART" ]] && grep -qF -- "$RESTORE_LINE" "$AUTOSTART" \
-  && { grep -qF -- "$MARKER_COMMENT" "$AUTOSTART" || grep -qF -- "$LUA_MARKER_COMMENT" "$AUTOSTART"; }; then
-  python3 - "$AUTOSTART" "$MARKER_COMMENT" "$LUA_MARKER_COMMENT" "$RESTORE_LINE" <<'PY'
+autostart_paths=("$AUTOSTART")
+[[ "$AUTOSTART" != "$LEGACY_AUTOSTART" ]] && autostart_paths+=("$LEGACY_AUTOSTART")
+for autostart_path in "${autostart_paths[@]}"; do
+  if [[ -f "$autostart_path" ]] && grep -qF -- "$RESTORE_LINE" "$autostart_path" \
+    && { grep -qF -- "$MARKER_COMMENT" "$autostart_path" || grep -qF -- "$LUA_MARKER_COMMENT" "$autostart_path"; }; then
+    python3 - "$autostart_path" "$MARKER_COMMENT" "$LUA_MARKER_COMMENT" "$RESTORE_LINE" <<'PY'
 import sys
 from pathlib import Path
 import os
 import tempfile
 
-path = Path(sys.argv[1])
+path = Path(sys.argv[1]).resolve()
 markers = set(sys.argv[2:4])
 restore_line = sys.argv[4]
 lines = path.read_text().splitlines(keepends=True)
@@ -103,11 +131,23 @@ with tempfile.NamedTemporaryFile("w", dir=path.parent, delete=False) as handle:
 os.chmod(temporary, path.stat().st_mode)
 os.replace(temporary, path)
 PY
-  removed=1
+    removed=1
+  fi
+done
+
+if [[ -f "$MENU_CREATED_MARKER" && -f "$MENU" ]]; then
+  python3 - "$MENU" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1]).resolve()
+if path.read_text().strip() == "{}":
+    path.unlink()
+PY
 fi
 
-if [[ -f "$DB" || -f "$DB-wal" || -f "$DB-shm" || -f "$LOCK" || -f "$RESTORE_MARKER" || -f "$INSTALL_MARKER" ]]; then
-  rm -f "$DB" "$DB-wal" "$DB-shm" "$LOCK" "$RESTORE_MARKER" "$INSTALL_MARKER"
+if [[ -f "$DB" || -f "$DB-wal" || -f "$DB-shm" || -f "$LOCK" || -f "$RESTORE_MARKER" || -f "$INSTALL_MARKER" || -f "$MENU_CREATED_MARKER" ]]; then
+  rm -f "$DB" "$DB-wal" "$DB-shm" "$LOCK" "$RESTORE_MARKER" "$INSTALL_MARKER" "$MENU_CREATED_MARKER"
   removed=1
 fi
 

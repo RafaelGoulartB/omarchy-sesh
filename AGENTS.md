@@ -23,7 +23,7 @@ Read `README.md` for user-facing behavior and
 - `Panel.qml`: Omarchy shell panel and the three-action UI.
 - `Service.qml`: installation checks and asynchronous CLI process orchestration
   for the panel.
-- `SupermanIcon.qml`: active/manual status icon.
+- `SessionIcon.qml`: active/manual status icon.
 - `manifest.json`: Omarchy plugin metadata and bar-widget entry point.
 - `systemd/user/omarchy-sesh.service`: the only startup restore trigger.
 - `systemd/user/omarchy-sesh-autosave.service`: periodic crash-cover snapshots,
@@ -56,11 +56,11 @@ service's `ExecStop` capture is diagnostic fallback only.
 
 ## State And Configuration
 
-- Database: `${XDG_STATE_HOME:-~/.local/state}/omarchy/session.db`
-- Operation lock: `${XDG_STATE_HOME:-~/.local/state}/omarchy/session.lock`
-- Restore marker: `${XDG_STATE_HOME:-~/.local/state}/omarchy/restore-complete.json`
-- Log: `${XDG_STATE_HOME:-~/.local/state}/omarchy/log/omarchy-sesh.log`
-- Optional config: `${XDG_CONFIG_HOME:-~/.config}/omarchy/sesh/config.json`
+- Database: `${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/session.db`
+- Operation lock: `${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/session.lock`
+- Restore marker: `${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/restore-complete.json`
+- Log: `${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/log/omarchy-sesh.log`
+- Optional config: `${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/sesh/config.json`
 - Installed CLI: `~/.local/bin/omarchy-sesh`
 
 The configuration currently supports `exclude_classes` and `autosave_seconds`.
@@ -124,7 +124,7 @@ Hyprland session and its real saved database are intentionally part of the test.
 - Update `README.md` when user-visible behavior or commands change.
 - Update `docs/session-restore-spec.md` when architecture, state, dispatch API,
   restore guarantees, or limitations change.
-- Consult `tasks/next-steps.md` for known gaps. Current notable limitations are
+- Consult `docs/future-improvements.md` for known gaps. Current notable limitations are
   workspace-to-monitor remapping, unverified cross-restart `stableId` behavior,
   tab-group reconstruction, and ambiguous same-class windows without stable
   titles.

@@ -12,7 +12,8 @@ window back where it was.
 | App relaunch | Exact — reconstruct launch command from `/proc/<pid>/cmdline` + cwd |
 | Floating window geometry | Exact — Hyprland dispatchers place/resize by pixel |
 | Tiled window placement | Best-effort — windows relaunch in saved order onto the saved workspace; the dwindle/master split tree is not exposed via IPC, so tiling is re-derived, not pixel-identical |
-| Workspace / monitor assignment | Yes — launch into workspace via rule prefix; move workspace to saved monitor |
+| Workspace assignment | Yes — launch into the saved workspace and move the matched window there |
+| Monitor remapping | Not yet — saved monitor metadata is retained for a future layout-aware remap |
 | Window flags (float/fullscreen/pinned) | Yes — `setfloating`, `fullscreenstate`, `pin` |
 | App *content* (tabs, unsaved docs, shell sessions) | No — that is application-owned. Browsers/tmux/editors restore their own content |
 
@@ -39,7 +40,7 @@ drives `hyprctl`.
 ```
 
 No Omarchy or Hyprland source change. Storage is sqlite at
-`~/.local/state/omarchy/session.db` (a plain host file — not something
+`${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/session.db` (a plain host file — not something
 Hyprland reads; Hyprland has no read path, the daemon is the reader).
 
 Verified against Hyprland 0.56.2 (Lua dispatch API, not the pre-0.55 hyprlang
@@ -77,7 +78,7 @@ dispatchers). Key facts confirmed live:
 
 ## 3. Storage schema (sqlite)
 
-DB path: `~/.local/state/omarchy/session.db`.
+DB path: `${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/session.db`.
 
 ```sql
 PRAGMA journal_mode = WAL;
@@ -127,9 +128,9 @@ Rules:
 - Only save windows with `mapped == true` and non-empty `cmdline`. Drop the
   Omarchy shell, bars, panels, trays, polkit agents, and whatever the
   autostart already launches (exclude list in config, see §6).
-- A window address is never persisted as a lookup key — it is matched at
-  restore time by `pid` (of the process we spawned) or by
-  `class`+`initial_title`+workspace.
+- A window address is never persisted as a lookup key. Saved PIDs group launch
+  commands only; restore-time windows are matched one-to-one by class, title,
+  initial metadata, and workspace.
 
 ## 4. Save path (`omarchy-sesh save`)
 
@@ -147,7 +148,7 @@ Triggers (any one fires a save):
 |---|---|
 | Clean logout / reboot / shutdown | Power-menu entries (see §6) run `omarchy-sesh save` before `uwsm stop` / `loginctl` |
 | Systemd teardown diagnostic | `ExecStop=omarchy-sesh save --teardown`; never supersedes a healthy snapshot |
-| Periodic (crash cover) | systemd timer / daemon, every 60 s, replaces the `periodic` snapshot |
+| Periodic (crash cover) | systemd daemon, every 60 s, writes a `periodic` snapshot |
 
 ## 5. Restore path (`omarchy-sesh restore`)
 
@@ -163,27 +164,23 @@ the service retries after two seconds.
    each window as soon as it is matched. If one launch does not recreate every
    saved window, retry that group independently after a short grace period, up
    to the number of windows initially missing from the group.
-   - Chromium app-mode windows reconstruct their URL from strict
-     class/initial-title metadata and launch each through
-     `omarchy-launch-webapp`, because the base Chromium process does not reopen
-     those windows after reboot.
+   - Chromium app-mode windows reconstruct their URL from strict class metadata
+     validated against either the initial title or saved `--app` argument and
+     launch each through `omarchy-launch-webapp`, because the base Chromium
+     process does not reopen those windows after reboot. Chromium's `Default`
+     and `Profile_N` class suffixes are treated as the same web-app identity.
    - Launch through `hl.dsp.exec_cmd` with the saved silent workspace and
      floating rules.
    - Discover windows by polling and matching class, initial class/title,
      title, and workspace one-to-one.
-   - Apply state by `address:<new>`:
-      - workspace: `movetoworkspacesilent <ws>,address:<addr>`
-      - floating: `setfloating address:<addr>` then
-        `movewindowpixel exact <x> <y>,address:<addr>` and
-        `resizewindowpixel exact <w> <h>,address:<addr>` (skip if saved `at` is NULL)
-      - fullscreen: `fullscreenstate <n> <n>,address:<addr>`
-      - pinned: `pin address:<addr>`
-3. Monitor remap: if a saved `monitor_name` exists in the current
-   `hyprctl -j monitors`, `moveworkspacetomonitor <ws> <monitor>` after launch;
-   otherwise leave the workspace on the active monitor.
+    - Apply state through the Hyprland Lua dispatcher API: move to the saved
+      workspace, set floating state, resize before moving floating windows,
+      then restore fullscreen and pinned state.
+3. Saved monitor metadata is not yet applied. Workspace-to-monitor remapping
+   remains a documented future improvement.
 
 Restore failures return nonzero so systemd can retry startup IPC failures. Log
-details to `~/.local/state/omarchy/log/omarchy-sesh.log`.
+details to `${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/log/omarchy-sesh.log`.
 
 ## 6. Omarchy integration points
 
@@ -223,16 +220,17 @@ All confirmed against the installed Omarchy defaults.
 4. **Hook mechanism** — Omarchy has no pre-logout hook. Do not add another
    startup hook because that recreates the duplicate-restore race.
 
-5. **Config / exclude list** — `~/.config/omarchy/sesh/config.json`:
+5. **Config / exclude list** — `${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/sesh/config.json`:
    `exclude_classes` (defaults skip polkit/portal agents), `autosave_seconds`
-   (default 60). The prototype reads it at save/restore time.
+   (default 60). Save reads exclusions and autosave reads its interval at startup.
 
 ## 6a. Prototype status (verified live on Hyprland 0.56.2)
 
 `bin/omarchy-sesh` — python3, stdlib only (sqlite3, json, shlex). Subcommands:
 
 - `save [--label X]` — snapshots mapped clients + `/proc/<pid>` cmdline/cwd
-  into `~/.local/state/omarchy/session.db` (WAL, status-aware snapshots).
+  into `${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/session.db` (WAL,
+  status-aware snapshots).
 - `restore [--dry-run]` — loads the latest complete session, matches existing
   windows one-to-one, launches each saved PID group with bounded retries for
   missing windows, and places every matched window. Lua arguments use
@@ -267,7 +265,7 @@ change across reboots), tab-group re-formation, and `stableId` matching.
   stable across compositor restarts (vs. per-run `address`) is unverified —
   worth testing as a more robust restore-time match key than class+title.
 - **Manual vs automatic restore:** default restore on every login, with a
-  "don't restore" toggle (`~/.local/state/omarchy/toggles/…`, matching
+  "don't restore" toggle (`${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/toggles/…`, matching
   omarchy-crash-watch's toggle pattern).
 - **Groups (tab groups):** `grouped` is saved but re-forming groups is not
   spec'd; first version restores members without grouping.

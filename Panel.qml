@@ -20,6 +20,7 @@ Panel {
   readonly property color dim: Qt.darker(foreground, 1.55)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property bool active: service.mode === "active"
+  readonly property bool modeKnown: service.modeKnown
   readonly property var options: [
     { title: "Active", detail: "Enable automatic session snapshots", icon: "󰐊" },
     { title: "Manual", detail: "Disable autosave and save now", icon: "󰆓" },
@@ -30,6 +31,7 @@ Panel {
   implicitHeight: button.implicitHeight
 
   function choose(index) {
+    if (!service.installed || service.busy) return
     selectedIndex = index
     if (index === 0) service.activate()
     else if (index === 1) service.saveManual()
@@ -41,7 +43,8 @@ Panel {
     cursorActive = false
     if (firstOpen) {
       firstOpen = false
-      service.ensureInstalled()
+      if (service.installed) service.refresh()
+      else service.ensureInstalled()
     } else if (!service.installed) {
       service.ensureInstalled()
     } else {
@@ -49,6 +52,7 @@ Panel {
     }
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
+  onActiveChanged: if (opened && !cursorActive) selectedIndex = active ? 0 : 1
 
   Service { id: service }
 
@@ -59,9 +63,9 @@ Panel {
     function show(): void { root.open() }
     function hide(): void { root.close() }
     function toggle(): void { root.toggle() }
-    function active(): string { service.activate(); return "ok" }
-    function manual(): string { service.saveManual(); return "ok" }
-    function restore(): string { service.restore(); return "ok" }
+    function active(): string { return service.activate() ? "ok" : "unavailable" }
+    function manual(): string { return service.saveManual() ? "ok" : "unavailable" }
+    function restore(): string { return service.restore() ? "ok" : "unavailable" }
   }
 
   BarIconButton {
@@ -70,12 +74,13 @@ Panel {
     bar: root.bar
     iconComponent: Component {
       Item {
-        SupermanIcon {
+        SessionIcon {
           anchors.centerIn: parent
           iconSize: Style.space(13)
           primary: root.barForeground
           inverse: Color.background
           active: root.active
+          opacity: root.modeKnown ? 1.0 : 0.55
         }
       }
     }
@@ -98,7 +103,7 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      blocked: service.busy
+      blocked: false
       onMoveRequested: function(dx, dy) {
         if (!root.cursorActive) root.cursorActive = true
         else if (dy !== 0) root.selectedIndex = (root.selectedIndex + dy + root.options.length) % root.options.length
@@ -116,13 +121,13 @@ Panel {
         PanelHero {
           Layout.fillWidth: true
           title: "Omarchy Sesh"
-          meta: root.active ? "Autosave active" : "Manual mode"
+          meta: !root.modeKnown ? "Status unavailable" : (root.active ? "Autosave active" : "Manual mode")
           detail: service.busy ? "Working..." : "Session management"
           foreground: root.foreground
           fontFamily: root.fontFamily
           iconOpacity: service.installed ? 1.0 : 0.6
           iconComponent: Component {
-            SupermanIcon {
+            SessionIcon {
               iconSize: Style.font.display
               primary: root.foreground
               inverse: root.inverse
@@ -157,12 +162,12 @@ Panel {
             implicitHeight: optionRow.implicitHeight + Style.spacing.rowPaddingX
             foreground: root.foreground
             hasCursor: root.cursorActive && root.selectedIndex === index
-            current: (index === 0 && root.active) || (index === 1 && !root.active)
+            current: root.modeKnown && ((index === 0 && root.active) || (index === 1 && !root.active))
 
             MouseArea {
               anchors.fill: parent
               hoverEnabled: true
-              enabled: !service.busy
+              enabled: service.installed && !service.busy
               cursorShape: Qt.PointingHandCursor
               onEntered: { root.cursorActive = true; root.selectedIndex = index }
               onClicked: root.choose(index)

@@ -16,17 +16,20 @@ CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
 UNIT_DIR="$CONFIG_HOME/systemd/user"
 INSTALL_MARKER="$STATE_HOME/omarchy/sesh-installed"
-AUTOSTART="$HOME/.config/hypr/autostart.lua"
-MENU="$HOME/.config/omarchy/extensions/omarchy-menu.jsonc"
+MENU_CREATED_MARKER="$STATE_HOME/omarchy/sesh-menu-created"
+AUTOSTART="$CONFIG_HOME/hypr/autostart.lua"
+MENU="$CONFIG_HOME/omarchy/extensions/omarchy-menu.jsonc"
+LEGACY_AUTOSTART="$HOME/.config/hypr/autostart.lua"
+LEGACY_MENU="$HOME/.config/omarchy/extensions/omarchy-menu.jsonc"
 
 MARKER_COMMENT="# omarchy-sesh: restore saved windows after login (guard skips if already restored)"
 LUA_MARKER_COMMENT="-- omarchy-sesh: restore saved windows after login (guard skips if already restored)"
 RESTORE_LINE='hl.exec_cmd("sleep 2 && omarchy-sesh restore")'
 SYSTEMCTL="${SYSTEMCTL:-systemctl}"
 
-autosave_unit_existed=0
+install_was_complete=0
 autosave_was_enabled=0
-[[ -f "$UNIT_DIR/omarchy-sesh-autosave.service" ]] && autosave_unit_existed=1
+[[ -f "$INSTALL_MARKER" ]] && install_was_complete=1
 if "$SYSTEMCTL" --user is-enabled omarchy-sesh-autosave.service >/dev/null 2>&1; then
   autosave_was_enabled=1
 fi
@@ -39,15 +42,18 @@ install -d "$UNIT_DIR"
 cp "$UNIT_DIR_SRC/omarchy-sesh.service" "$UNIT_DIR_SRC/omarchy-sesh-autosave.service" "$UNIT_DIR/"
 echo "installed units to $UNIT_DIR"
 
-if [[ -f "$AUTOSTART" ]] && grep -qF -- "$RESTORE_LINE" "$AUTOSTART" \
-  && { grep -qF -- "$MARKER_COMMENT" "$AUTOSTART" || grep -qF -- "$LUA_MARKER_COMMENT" "$AUTOSTART"; }; then
-  python3 - "$AUTOSTART" "$MARKER_COMMENT" "$LUA_MARKER_COMMENT" "$RESTORE_LINE" <<'PY'
+autostart_paths=("$AUTOSTART")
+[[ "$AUTOSTART" != "$LEGACY_AUTOSTART" ]] && autostart_paths+=("$LEGACY_AUTOSTART")
+for autostart_path in "${autostart_paths[@]}"; do
+  if [[ -f "$autostart_path" ]] && grep -qF -- "$RESTORE_LINE" "$autostart_path" \
+    && { grep -qF -- "$MARKER_COMMENT" "$autostart_path" || grep -qF -- "$LUA_MARKER_COMMENT" "$autostart_path"; }; then
+    python3 - "$autostart_path" "$MARKER_COMMENT" "$LUA_MARKER_COMMENT" "$RESTORE_LINE" <<'PY'
 import sys
 from pathlib import Path
 import os
 import tempfile
 
-path = Path(sys.argv[1])
+path = Path(sys.argv[1]).resolve()
 markers = set(sys.argv[2:4])
 restore_line = sys.argv[4]
 lines = path.read_text().splitlines(keepends=True)
@@ -64,17 +70,50 @@ with tempfile.NamedTemporaryFile("w", dir=path.parent, delete=False) as handle:
 os.chmod(temporary, path.stat().st_mode)
 os.replace(temporary, path)
 PY
-  echo "removed legacy duplicate restore hook from $AUTOSTART"
+    echo "removed legacy duplicate restore hook from $autostart_path"
+  fi
+done
+
+if [[ "$MENU" != "$LEGACY_MENU" && -f "$LEGACY_MENU" ]] \
+  && grep -qF "// omarchy-sesh: begin power-menu overrides" "$LEGACY_MENU"; then
+  python3 - "$LEGACY_MENU" <<'PY'
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+path = Path(sys.argv[1]).resolve()
+text = path.read_text()
+begin = "// omarchy-sesh: begin power-menu overrides"
+end = "// omarchy-sesh: end power-menu overrides"
+begin_pos = text.find(begin)
+end_pos = text.find(end, begin_pos)
+if begin_pos < 0 or end_pos < begin_pos:
+    print(f"error: incomplete omarchy-sesh block in {path}", file=sys.stderr)
+    raise SystemExit(1)
+start = text.rfind("\n", 0, begin_pos) + 1
+finish = text.find("\n", end_pos)
+updated = text[:start] + text[finish + 1 if finish >= 0 else len(text):]
+with tempfile.NamedTemporaryFile("w", dir=path.parent, delete=False) as handle:
+    handle.write(updated)
+    temporary = handle.name
+os.chmod(temporary, path.stat().st_mode)
+os.replace(temporary, path)
+PY
+  echo "removed legacy power-menu overrides from $LEGACY_MENU"
 fi
 
 if [[ ! -f "$MENU" ]]; then
   install -d "$(dirname "$MENU")"
   printf '{}\n' >"$MENU"
+  install -d "$(dirname "$MENU_CREATED_MARKER")"
+  : >"$MENU_CREATED_MARKER"
 fi
 
 python3 - "$MENU" <<'PY'
 import sys
 from pathlib import Path
+import json
 import os
 import re
 import tempfile
@@ -130,17 +169,28 @@ def atomic_write(path, value):
     os.chmod(temporary, path.stat().st_mode)
     os.replace(temporary, path)
 
-path = Path(sys.argv[1])
+path = Path(sys.argv[1]).resolve()
 text = path.read_text()
-code = strip_comments(text)
 begin = "// omarchy-sesh: begin power-menu overrides"
 end = "// omarchy-sesh: end power-menu overrides"
 if (begin in text) != (end in text):
     print(f"error: incomplete omarchy-sesh block in {path}", file=sys.stderr)
     raise SystemExit(1)
+base = text
 if begin in text:
-    print("power-menu overrides already present (skipped)")
-    raise SystemExit(0)
+    if text.count(begin) != 1 or text.count(end) != 1:
+        print(f"error: duplicate omarchy-sesh blocks in {path}", file=sys.stderr)
+        raise SystemExit(1)
+    begin_pos = text.find(begin)
+    end_pos = text.find(end, begin_pos)
+    if end_pos < begin_pos:
+        print(f"error: reversed omarchy-sesh block in {path}", file=sys.stderr)
+        raise SystemExit(1)
+    start = text.rfind("\n", 0, begin_pos) + 1
+    finish = text.find("\n", end_pos)
+    base = text[:start] + text[finish + 1 if finish >= 0 else len(text):]
+
+code = strip_comments(base)
 
 actions = {
     "system.logout": ('󰍃', "Logout", "omarchy-system-logout"),
@@ -153,31 +203,36 @@ for menu_id, (icon, label, command) in actions.items():
         print(f"warning: preserving customized {menu_id} action")
         continue
     action = (
-        "$HOME/.local/bin/omarchy-sesh save --label logout --wait || true; "
+        '"$HOME/.local/bin/omarchy-sesh" save --label logout --wait || true; '
         f"exec {command}"
     )
-    entries.append(
-        f'  "{menu_id}": {{"icon":"{icon}","label":"{label}","action":"{action}"}},'
+    payload = json.dumps(
+        {"icon": icon, "label": label, "action": action},
+        ensure_ascii=False,
+        separators=(",", ":"),
     )
-if not entries:
-    raise SystemExit(0)
+    entries.append(f'  "{menu_id}": {payload},')
 
-root = re.search(r"(?m)^[ \t]*\{", code)
-if root is None:
-    print(f"error: {path} is not a JSONC object", file=sys.stderr)
-    raise SystemExit(1)
+updated = base
+if entries:
+    root = re.search(r"(?m)^[ \t]*\{", code)
+    if root is None:
+        print(f"error: {path} is not a JSONC object", file=sys.stderr)
+        raise SystemExit(1)
 
-items = re.search(r'"items"\s*:\s*\{', code)
-target = items or root
-indent = "    " if items else "  "
-block = "\n" + indent + begin + "\n" + "\n".join(entries) + "\n" + indent + end + "\n"
-atomic_write(path, text[: target.end()] + block + text[target.end() :])
-print(f"added pre-shutdown saves to {path}")
+    items = re.search(r'"items"\s*:\s*\{', code)
+    target = items or root
+    indent = "    " if items else "  "
+    block = "\n" + indent + begin + "\n" + "\n".join(entries) + "\n" + indent + end + "\n"
+    updated = base[: target.end()] + block + base[target.end() :]
+if updated != text:
+    atomic_write(path, updated)
+    print(f"updated pre-shutdown saves in {path}")
 PY
 
 "$SYSTEMCTL" --user daemon-reload
 "$SYSTEMCTL" --user enable omarchy-sesh.service >/dev/null
-if (( ! autosave_unit_existed || autosave_was_enabled )); then
+if (( ! install_was_complete || autosave_was_enabled )); then
   "$SYSTEMCTL" --user enable omarchy-sesh-autosave.service >/dev/null
   if (( autosave_was_enabled )); then
     "$SYSTEMCTL" --user try-restart omarchy-sesh-autosave.service >/dev/null

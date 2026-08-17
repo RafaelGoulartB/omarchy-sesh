@@ -9,22 +9,31 @@ Item {
   readonly property string installPath: Qt.resolvedUrl("install.sh").toString().replace(/^file:\/\//, "")
   readonly property string manifestPath: Qt.resolvedUrl("manifest.json").toString().replace(/^file:\/\//, "")
   readonly property string stateHome: Quickshell.env("XDG_STATE_HOME") || Quickshell.env("HOME") + "/.local/state"
+  readonly property string configHome: Quickshell.env("XDG_CONFIG_HOME") || Quickshell.env("HOME") + "/.config"
+  readonly property string unitDir: configHome + "/systemd/user"
   readonly property string installMarker: stateHome + "/omarchy/sesh-installed"
 
   property bool installed: false
   property string mode: "manual"
+  property bool modeKnown: false
   property bool busy: checkProcess.running || installProcess.running || modeProcess.running || actionProcess.running
   property string status: ""
   property string error: ""
   property string pendingAction: ""
   property bool startEnabledMode: false
+  property bool installAfterCheck: false
+  property bool preserveStatus: false
 
-  function ensureInstalled() {
+  Component.onCompleted: ensureInstalled(false)
+
+  function ensureInstalled(installIfMissing) {
+    if (installIfMissing === undefined) installIfMissing = true
+    installAfterCheck = installAfterCheck || installIfMissing
     if (checkProcess.running) return
     checkProcess.command = [
       "bash", "-c",
-      "version=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[\"version\"])' \"$3\") && [[ $(cat \"$1\" 2>/dev/null) == \"$version\" ]] && \"$2\" mode >/dev/null",
-      "_", installMarker, binaryPath, manifestPath
+      "version=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[\"version\"])' \"$3\") && [[ $(cat \"$1\" 2>/dev/null) == \"$version\" ]] && [[ -x \"$2\" && -f \"$4/omarchy-sesh.service\" && -f \"$4/omarchy-sesh-autosave.service\" ]] && systemctl --user is-enabled omarchy-sesh.service >/dev/null && \"$2\" mode >/dev/null",
+      "_", installMarker, binaryPath, manifestPath, unitDir
     ]
     checkProcess.running = true
   }
@@ -37,51 +46,58 @@ Item {
     installProcess.running = true
   }
 
-  function refresh() {
-    if (!installed || modeProcess.running) return
+  function refresh(keepStatus) {
+    if (!installed) return
+    if (keepStatus === true) preserveStatus = true
+    if (modeProcess.running) return
+    if (keepStatus !== true) preserveStatus = false
     modeProcess.command = [binaryPath, "mode"]
     modeProcess.running = true
   }
 
   function activate() {
-    runMode("active")
+    return runMode("active")
   }
 
   function saveManual() {
-    if (!installed || busy) return
+    if (!installed || busy) return false
     pendingAction = "save"
-    runMode("manual")
+    return runMode("manual")
   }
 
   function restore() {
-    runAction("restore")
+    return runAction("restore")
   }
 
   function runMode(nextMode) {
-    if (!installed || busy) return
+    if (!installed || busy) return false
     status = nextMode === "active" ? "Enabling autosave..." : "Saving session..."
     error = ""
     modeProcess.command = [binaryPath, "mode", nextMode]
     modeProcess.running = true
+    return true
   }
 
   function runAction(action) {
-    if (!installed || busy) return
+    if (!installed || busy) return false
     status = action === "restore" ? "Restoring session..." : "Saving session..."
     error = ""
     actionProcess.command = action === "restore"
       ? [binaryPath, "restore"]
       : [binaryPath, "save", "--label", "manual"]
     actionProcess.running = true
+    return true
   }
 
   Process {
     id: checkProcess
     command: []
     onExited: function(exitCode) {
+      var shouldInstall = root.installAfterCheck
+      root.installAfterCheck = false
       root.installed = exitCode === 0
       if (root.installed) root.refresh()
-      else root.install()
+      else if (shouldInstall) root.install()
     }
   }
 
@@ -107,13 +123,27 @@ Item {
     stderr: StdioCollector { id: modeError; waitForEnd: true }
     onExited: function(exitCode) {
       if (exitCode !== 0) {
+        if (root.preserveStatus) {
+          root.preserveStatus = false
+          return
+        }
+        root.preserveStatus = false
         root.status = ""
         root.error = modeError.text.trim() || "Could not change autosave mode"
         root.pendingAction = ""
         return
       }
-      var value = modeOutput.text.trim()
-      if (value === "active" || value === "manual") root.mode = value
+      var output = modeOutput.text.trim().split(/\s+/)
+      var value = output.length ? output[output.length - 1] : ""
+      if (value !== "active" && value !== "manual") {
+        root.preserveStatus = false
+        root.status = ""
+        root.error = "Unexpected autosave mode response"
+        root.pendingAction = ""
+        return
+      }
+      root.mode = value
+      root.modeKnown = true
       if (root.startEnabledMode) {
         root.startEnabledMode = false
         if (value === "active") {
@@ -124,9 +154,10 @@ Item {
       if (root.pendingAction === "save") {
         root.pendingAction = ""
         Qt.callLater(function() { root.runAction("save") })
-      } else {
+      } else if (!root.preserveStatus) {
         root.status = value === "active" ? "Autosave active" : "Manual mode"
       }
+      root.preserveStatus = false
     }
   }
 
@@ -143,7 +174,7 @@ Item {
         root.status = ""
         root.error = actionError.text.trim() || actionOutput.text.trim() || "Session action failed"
       }
-      root.refresh()
+      root.refresh(true)
     }
   }
 }
