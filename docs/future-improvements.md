@@ -17,13 +17,19 @@
 
 ## Restore Quality
 
-- [ ] **Monitor remapping**: map saved workspaces to available monitors when a
-      monitor is disconnected, renamed, or reordered.
+- [ ] **Monitor remapping (implemented; live acceptance pending)**: verify saved
+      workspaces on disconnected, renamed, rewired, and reordered monitors,
+      including floating geometry on a differently sized fallback display.
 - [ ] **Stable identity**: investigate Hyprland `stableId` support and prefer it
       over title-based matching where it remains valid across compositor
       sessions.
 - [ ] **Window groups**: restore Hyprland group membership after every member
       has been matched and placed.
+- [ ] **Exact tiled layout serialization**: pursue a Hyprland API or native
+      plugin that exports and restores dwindle/master split trees and ratios.
+      This is the robust replacement for inferred pixel resizing, but a local
+      plugin would require C++ code tied to Hyprland's unstable internal ABI and
+      rebuilding for matching compositor versions.
 - [ ] **Slow applications**: collect real startup timings and make the restore
       timeout configurable only if the current 20-second bound is insufficient.
 - [ ] **Restore performance**: benchmark dispatch and window-discovery latency

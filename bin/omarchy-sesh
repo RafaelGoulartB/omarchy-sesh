@@ -14,8 +14,15 @@ import tempfile
 import time
 from pathlib import Path
 
-STATE_DIR = Path(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")) / "omarchy"
-CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")) / "omarchy" / "sesh"
+STATE_DIR = (
+    Path(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"))
+    / "omarchy"
+)
+CONFIG_DIR = (
+    Path(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"))
+    / "omarchy"
+    / "sesh"
+)
 DB_PATH = STATE_DIR / "session.db"
 CONFIG_PATH = CONFIG_DIR / "config.json"
 LOG_PATH = STATE_DIR / "log" / "omarchy-sesh.log"
@@ -61,7 +68,9 @@ def dispatch(lua):
     out = subprocess.run(
         ["hyprctl", "dispatch", lua], capture_output=True, text=True, check=False
     )
-    output = "\n".join(part.strip() for part in (out.stdout, out.stderr) if part.strip())
+    output = "\n".join(
+        part.strip() for part in (out.stdout, out.stderr) if part.strip()
+    )
     if out.returncode != 0 or "error" in output.lower():
         log(f"dispatch failed ({lua}): {output}")
         return False
@@ -162,6 +171,7 @@ def db_conn():
             workspace_id INTEGER,
             workspace_name TEXT,
             monitor_name TEXT,
+            monitor_description TEXT,
             at_x INTEGER, at_y INTEGER,
             size_w INTEGER, size_h INTEGER,
             floating INTEGER NOT NULL DEFAULT 0,
@@ -173,7 +183,9 @@ def db_conn():
         )
             """
         )
-        session_columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+        session_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(sessions)")
+        }
         if "capture_status" not in session_columns:
             conn.execute(
                 "ALTER TABLE sessions ADD COLUMN capture_status TEXT NOT NULL DEFAULT 'complete'"
@@ -187,7 +199,9 @@ def db_conn():
         window_columns = {row[1] for row in conn.execute("PRAGMA table_info(windows)")}
         if "pid" not in window_columns:
             conn.execute("ALTER TABLE windows ADD COLUMN pid INTEGER")
-        conn.execute("PRAGMA user_version = 2")
+        if "monitor_description" not in window_columns:
+            conn.execute("ALTER TABLE windows ADD COLUMN monitor_description TEXT")
+        conn.execute("PRAGMA user_version = 3")
         conn.commit()
     except Exception:
         conn.rollback()
@@ -224,10 +238,10 @@ def persist_snapshot(label, status, error, rows):
         sid = cur.lastrowid
         conn.executemany(
             "INSERT INTO windows (session, ord, class, initial_class, title, initial_title, "
-            "cmdline, cwd, workspace_id, workspace_name, monitor_name, at_x, at_y, size_w, "
+            "cmdline, cwd, workspace_id, workspace_name, monitor_name, monitor_description, at_x, at_y, size_w, "
             "size_h, floating, fullscreen, pinned, xwayland, pid) "
             "VALUES (:session, :ord, :class, :initial_class, :title, :initial_title, "
-            ":cmdline, :cwd, :workspace_id, :workspace_name, :monitor_name, :at_x, :at_y, "
+            ":cmdline, :cwd, :workspace_id, :workspace_name, :monitor_name, :monitor_description, :at_x, :at_y, "
             ":size_w, :size_h, :floating, :fullscreen, :pinned, :xwayland, :pid)",
             [dict(r, session=sid, ord=i) for i, r in enumerate(rows)],
         )
@@ -244,11 +258,15 @@ def persist_snapshot(label, status, error, rows):
             )
         )
         prune_ids = [
-            row[0] for row in conn.execute("SELECT id FROM sessions") if row[0] not in keep_ids
+            row[0]
+            for row in conn.execute("SELECT id FROM sessions")
+            if row[0] not in keep_ids
         ]
         for session_id in prune_ids:
             conn.execute("DELETE FROM windows WHERE session = ?", (session_id,))
-        conn.executemany("DELETE FROM sessions WHERE id = ?", [(sid,) for sid in prune_ids])
+        conn.executemany(
+            "DELETE FROM sessions WHERE id = ?", [(sid,) for sid in prune_ids]
+        )
     conn.close()
     return sid
 
@@ -274,7 +292,7 @@ def cmd_save(label="manual", teardown=False, wait=False):
 def _save_clients(label, clients, monitors, status, errors):
     cfg = load_config()
     exclude = DEFAULT_EXCLUDE | set(cfg.get("exclude_classes", []))
-    monitor_by_id = {m["id"]: m["name"] for m in monitors}
+    monitor_by_id = {m["id"]: m for m in monitors}
     rows = []
     for w in clients:
         if not w.get("mapped"):
@@ -288,6 +306,7 @@ def _save_clients(label, clients, monitors, status, errors):
             errors.append(f"{w.get('address', cls)}: {proc_error}")
             continue
         ws = w.get("workspace") or {}
+        monitor = monitor_by_id.get(w.get("monitor"), {})
         at = w.get("at") or []
         size = w.get("size") or []
         rows.append(
@@ -300,7 +319,8 @@ def _save_clients(label, clients, monitors, status, errors):
                 "cwd": cwd,
                 "workspace_id": ws.get("id"),
                 "workspace_name": ws.get("name"),
-                "monitor_name": monitor_by_id.get(w.get("monitor")),
+                "monitor_name": monitor.get("name"),
+                "monitor_description": monitor.get("description"),
                 "at_x": at[0] if len(at) > 0 else None,
                 "at_y": at[1] if len(at) > 1 else None,
                 "size_w": size[0] if len(size) > 0 else None,
@@ -318,7 +338,9 @@ def _save_clients(label, clients, monitors, status, errors):
     sid = persist_snapshot(label, status, error, rows)
     if status == "complete" and label == "manual":
         mark_restore_completed(sid)
-    log(f"save[{label}]: {len(rows)} windows -> session {sid} ({status}){': ' + error if error else ''}")
+    log(
+        f"save[{label}]: {len(rows)} windows -> session {sid} ({status}){': ' + error if error else ''}"
+    )
     print(f"saved {len(rows)} windows (session {sid}, {status})")
     return 0 if status == "complete" else 1
 
@@ -333,9 +355,7 @@ def latest_session(conn):
 
 
 def load_windows(conn, sid):
-    cur = conn.execute(
-        "SELECT * FROM windows WHERE session = ? ORDER BY ord", (sid,)
-    )
+    cur = conn.execute("SELECT * FROM windows WHERE session = ? ORDER BY ord", (sid,))
     cols = [d[0] for d in cur.description]
     return [dict(zip(cols, r)) for r in cur.fetchall()]
 
@@ -344,24 +364,26 @@ def window_classes_match(saved, current):
     if saved == current or {saved, current} <= CHROMIUM_NORMAL_CLASSES:
         return True
     saved_webapp = chromium_webapp_class_base(saved)
-    return saved_webapp is not None and saved_webapp == chromium_webapp_class_base(current)
+    return saved_webapp is not None and saved_webapp == chromium_webapp_class_base(
+        current
+    )
 
 
 def client_matches(row, client):
     cls = row["class"]
     initial_cls = row.get("initial_class") or cls
     class_matches = window_classes_match(cls, client.get("class"))
-    initial_class_matches = window_classes_match(initial_cls, client.get("initialClass"))
+    initial_class_matches = window_classes_match(
+        initial_cls, client.get("initialClass")
+    )
     if not class_matches and not initial_class_matches:
         return None
     workspace = client.get("workspace") or {}
-    workspace_matches = (
-        row.get("workspace_id") is None or row.get("workspace_id") == workspace.get("id")
-    )
+    workspace_matches = row.get("workspace_id") is None or row.get(
+        "workspace_id"
+    ) == workspace.get("id")
     title_matches = (
-        bool(row.get("title"))
-        and class_matches
-        and row["title"] == client.get("title")
+        bool(row.get("title")) and class_matches and row["title"] == client.get("title")
     )
     initial_title_matches = (
         bool(row.get("initial_title"))
@@ -395,7 +417,11 @@ def match_windows(rows, clients, used_addresses=None, max_rank=2):
 
     row_ids = [row["id"] for row in sorted(rows, key=lambda row: row["ord"])]
     addresses = sorted(
-        {address for candidates in candidates_by_row.values() for _, address in candidates}
+        {
+            address
+            for candidates in candidates_by_row.values()
+            for _, address in candidates
+        }
     )
     rank_base = len(rows) + 1
     address_index = {address: index for index, address in enumerate(addresses)}
@@ -445,7 +471,10 @@ def match_windows(rows, clients, used_addresses=None, max_rank=2):
                     - row_potential[current_row]
                     - column_potential[candidate_column]
                 )
-                if minimum[candidate_column] is None or candidate < minimum[candidate_column]:
+                if (
+                    minimum[candidate_column] is None
+                    or candidate < minimum[candidate_column]
+                ):
                     minimum[candidate_column] = candidate
                     path[candidate_column] = column
                 if delta is None or minimum[candidate_column] < delta:
@@ -478,29 +507,44 @@ def place_window(w, address, current=None):
     win = lua_quote(f"address:{address}")
     ok = True
     if w.get("workspace_id") is not None:
-        ok = dispatch(
-            f"hl.dsp.window.move({{ workspace = {w['workspace_id']}, follow = false, window = {win} }})"
-        ) and ok
+        ok = (
+            dispatch(
+                f"hl.dsp.window.move({{ workspace = {w['workspace_id']}, follow = false, window = {win} }})"
+            )
+            and ok
+        )
     desired_floating = bool(w.get("floating"))
     current_floating = bool(current and current.get("floating"))
     if current is None or desired_floating != current_floating:
         float_action = "on" if desired_floating else "off"
-        ok = dispatch(
-            f'hl.dsp.window.float({{ action = "{float_action}", window = {win} }})'
-        ) and ok
+        ok = (
+            dispatch(
+                f'hl.dsp.window.float({{ action = "{float_action}", window = {win} }})'
+            )
+            and ok
+        )
     if w.get("floating"):
         if w.get("size_w") is not None and w.get("size_h") is not None:
-            ok = dispatch(
-                f"hl.dsp.window.resize({{ x = {w['size_w']}, y = {w['size_h']}, window = {win} }})"
-            ) and ok
+            ok = (
+                dispatch(
+                    f"hl.dsp.window.resize({{ x = {w['size_w']}, y = {w['size_h']}, window = {win} }})"
+                )
+                and ok
+            )
         if w.get("at_x") is not None and w.get("at_y") is not None:
-            ok = dispatch(
-                f"hl.dsp.window.move({{ x = {w['at_x']}, y = {w['at_y']}, window = {win} }})"
-            ) and ok
+            ok = (
+                dispatch(
+                    f"hl.dsp.window.move({{ x = {w['at_x']}, y = {w['at_y']}, window = {win} }})"
+                )
+                and ok
+            )
     fs = w.get("fullscreen", 0)
-    ok = dispatch(
-        f"hl.dsp.window.fullscreen_state({{ internal = {fs}, client = {fs}, window = {win} }})"
-    ) and ok
+    ok = (
+        dispatch(
+            f"hl.dsp.window.fullscreen_state({{ internal = {fs}, client = {fs}, window = {win} }})"
+        )
+        and ok
+    )
     current_pinned = bool(current and current.get("pinned"))
     if bool(w.get("pinned")) != current_pinned:
         ok = dispatch(f"hl.dsp.window.pin({{ window = {win} }})") and ok
@@ -525,8 +569,197 @@ def saved_geometry(row):
     return None if any(value is None for value in values) else values
 
 
+def monitor_sort_key(monitor):
+    monitor_id = monitor.get("id")
+    if not isinstance(monitor_id, int):
+        monitor_id = sys.maxsize
+    return monitor_id, monitor.get("name") or ""
+
+
+def workspace_monitor_targets(rows, monitors):
+    monitors = [monitor for monitor in monitors if monitor.get("name")]
+    by_name = {monitor["name"]: monitor for monitor in monitors}
+    fallback = next(
+        (
+            monitor
+            for monitor in sorted(monitors, key=monitor_sort_key)
+            if monitor.get("focused")
+        ),
+        min(monitors, key=monitor_sort_key, default=None),
+    )
+    rows_by_workspace = {}
+    for row in rows:
+        if row.get("workspace_id") is not None:
+            rows_by_workspace.setdefault(row["workspace_id"], []).append(row)
+
+    targets = {}
+    for workspace_id, workspace_rows in rows_by_workspace.items():
+        saved_names = {
+            row.get("monitor_name") for row in workspace_rows if row.get("monitor_name")
+        }
+        saved_descriptions = {
+            row.get("monitor_description")
+            for row in workspace_rows
+            if row.get("monitor_description")
+        }
+        if len(saved_names) > 1 or len(saved_descriptions) > 1:
+            log(
+                f"restore: workspace {workspace_id} has conflicting saved monitor identities"
+            )
+            continue
+        saved_name = next(iter(saved_names), None)
+        saved_description = next(iter(saved_descriptions), None)
+        if saved_name is None and saved_description is None:
+            continue
+
+        target = by_name.get(saved_name)
+        if saved_description and (
+            target is None or target.get("description") != saved_description
+        ):
+            description_matches = [
+                monitor
+                for monitor in monitors
+                if monitor.get("description") == saved_description
+            ]
+            if len(description_matches) == 1:
+                target = description_matches[0]
+            elif target is not None:
+                target = None
+        if target is None:
+            target = fallback
+        if target is not None:
+            targets[workspace_id] = target["name"]
+    return targets
+
+
+def load_workspace_monitor_context(rows):
+    monitors = hyprctl_json("monitors")
+    workspaces = hyprctl_json("workspaces")
+    if monitors is None or workspaces is None or not monitors:
+        log("restore: Hyprland IPC failed while remapping workspace monitors")
+        return {}, {}, True
+
+    current_monitors = {
+        workspace.get("id"): workspace.get("monitor") for workspace in workspaces
+    }
+    return workspace_monitor_targets(rows, monitors), current_monitors, False
+
+
+def prepare_workspace_monitor(row, address, targets, current_monitors, prepared):
+    workspace_id = row.get("workspace_id")
+    target = targets.get(workspace_id)
+    if target is None or workspace_id in prepared:
+        return True
+    if current_monitors.get(workspace_id) == target:
+        prepared.add(workspace_id)
+        return True
+
+    win = lua_quote(f"address:{address}")
+    if not dispatch(
+        f"hl.dsp.window.move({{ workspace = {workspace_id}, follow = false, window = {win} }})"
+    ):
+        return False
+    if not dispatch(
+        "hl.dsp.workspace.move({ "
+        f"workspace = {workspace_id}, monitor = {lua_quote(target)} "
+        "})"
+    ):
+        return False
+    current_monitors[workspace_id] = target
+    prepared.add(workspace_id)
+    return True
+
+
 def geometries_match(left, right, tolerance=2):
     return all(abs(a - b) <= tolerance for a, b in zip(left, right))
+
+
+def geometry_bounds(geometries):
+    return (
+        min(geometry[0] for geometry in geometries),
+        min(geometry[1] for geometry in geometries),
+        max(geometry[0] + geometry[2] for geometry in geometries),
+        max(geometry[1] + geometry[3] for geometry in geometries),
+    )
+
+
+def simple_split_order(geometries, tolerance=2):
+    if len(geometries) != 2:
+        return None
+    first, second = geometries
+    if (
+        abs(first[1] - second[1]) <= tolerance
+        and abs(first[3] - second[3]) <= tolerance
+    ):
+        order = sorted(range(2), key=lambda index: geometries[index][0])
+        left, right = (geometries[index] for index in order)
+        if left[0] + left[2] <= right[0] + tolerance:
+            return "x", order
+    if (
+        abs(first[0] - second[0]) <= tolerance
+        and abs(first[2] - second[2]) <= tolerance
+    ):
+        order = sorted(range(2), key=lambda index: geometries[index][1])
+        top, bottom = (geometries[index] for index in order)
+        if top[1] + top[3] <= bottom[1] + tolerance:
+            return "y", order
+    return None
+
+
+def tiled_workspace_clients(workspace_id, rows, matches, clients):
+    if len(rows) < 2 or any(saved_geometry(row) is None for row in rows):
+        return None
+    if any(row.get("fullscreen") or row["id"] not in matches for row in rows):
+        return None
+
+    current = [
+        client
+        for client in clients
+        if client.get("mapped")
+        and not client.get("floating")
+        and (client.get("workspace") or {}).get("id") == workspace_id
+    ]
+    if len(current) != len(rows) or any(
+        client.get("fullscreen") or window_geometry(client) is None
+        for client in current
+    ):
+        return None
+
+    matched_addresses = {matches[row["id"]] for row in rows}
+    current_addresses = {client.get("address") for client in current}
+    if None in current_addresses or matched_addresses != current_addresses:
+        return None
+
+    client_by_address = {client["address"]: client for client in current}
+    for row in rows:
+        client = client_by_address[matches[row["id"]]]
+        rank = client_matches(row, client)
+        candidate_ranks = [
+            candidate_rank
+            for candidate in rows
+            if (candidate_rank := client_matches(candidate, client)) is not None
+        ]
+        if (
+            rank is None
+            or rank != min(candidate_ranks)
+            or candidate_ranks.count(rank) != 1
+        ):
+            return None
+    return current, client_by_address
+
+
+def tiled_slot_addresses(rows, current):
+    slots = []
+    for row in rows:
+        candidates = [
+            client["address"]
+            for client in current
+            if geometries_match(saved_geometry(row), window_geometry(client))
+        ]
+        if len(candidates) != 1:
+            return None
+        slots.append(candidates[0])
+    return slots if len(set(slots)) == len(rows) else None
 
 
 def restore_tiled_slots(rows, matches, clients):
@@ -538,66 +771,138 @@ def restore_tiled_slots(rows, matches, clients):
 
     for workspace_id, workspace_rows in rows_by_workspace.items():
         workspace_rows.sort(key=lambda row: row["ord"])
-        if len(workspace_rows) < 2 or any(
-            saved_geometry(row) is None for row in workspace_rows
-        ):
+
+    resizable_workspaces = set()
+    failed_workspaces = set()
+    swapped_workspaces = set()
+    for workspace_id, workspace_rows in rows_by_workspace.items():
+        context = tiled_workspace_clients(
+            workspace_id, workspace_rows, matches, clients
+        )
+        if context is None:
             continue
-        if any(
-            row.get("fullscreen") or row["id"] not in matches
-            for row in workspace_rows
+        current, _ = context
+        if tiled_slot_addresses(workspace_rows, current) is not None:
+            continue
+        saved = [saved_geometry(row) for row in workspace_rows]
+        current_geometry = [window_geometry(client) for client in current]
+        saved_split = simple_split_order(saved)
+        current_split = simple_split_order(current_geometry)
+        if (
+            saved_split is None
+            or current_split is None
+            or saved_split[0] != current_split[0]
+            or not geometries_match(
+                geometry_bounds(saved), geometry_bounds(current_geometry)
+            )
         ):
             continue
 
-        current = [
-            client
-            for client in clients
-            if client.get("mapped")
-            and not client.get("floating")
-            and (client.get("workspace") or {}).get("id") == workspace_id
+        resizable_workspaces.add(workspace_id)
+        desired_order = [
+            matches[workspace_rows[index]["id"]] for index in saved_split[1]
         ]
-        if len(current) != len(workspace_rows) or any(
-            client.get("fullscreen") or window_geometry(client) is None
-            for client in current
+        occupant_order = [current[index]["address"] for index in current_split[1]]
+        if desired_order != occupant_order:
+            window = lua_quote(f"address:{desired_order[0]}")
+            target = lua_quote(f"address:{occupant_order[0]}")
+            if not dispatch(
+                f"hl.dsp.window.swap({{ window = {window}, target = {target} }})"
+            ):
+                if hyprctl_json("clients") is None:
+                    log("restore: Hyprland IPC failed while arranging tiled windows")
+                    return None
+                all_ok = False
+                failed_workspaces.add(workspace_id)
+                continue
+            swapped_workspaces.add(workspace_id)
+
+    if swapped_workspaces:
+        clients = hyprctl_json("clients")
+        if clients is None:
+            log("restore: Hyprland IPC failed after arranging tiled windows")
+            return None
+
+    resized = False
+    for workspace_id in sorted(resizable_workspaces - failed_workspaces):
+        workspace_rows = rows_by_workspace[workspace_id]
+        context = tiled_workspace_clients(
+            workspace_id, workspace_rows, matches, clients
+        )
+        if context is None:
+            if workspace_id in swapped_workspaces:
+                all_ok = False
+                failed_workspaces.add(workspace_id)
+            continue
+        current, client_by_address = context
+        saved = [saved_geometry(row) for row in workspace_rows]
+        current_geometry = [window_geometry(client) for client in current]
+        saved_split = simple_split_order(saved)
+        current_split = simple_split_order(current_geometry)
+        if (
+            saved_split is None
+            or current_split is None
+            or saved_split[0] != current_split[0]
+            or not geometries_match(
+                geometry_bounds(saved), geometry_bounds(current_geometry)
+            )
         ):
+            if workspace_id in swapped_workspaces:
+                all_ok = False
+                failed_workspaces.add(workspace_id)
             continue
+        if workspace_id in swapped_workspaces:
+            desired_order = [
+                matches[workspace_rows[index]["id"]] for index in saved_split[1]
+            ]
+            occupant_order = [current[index]["address"] for index in current_split[1]]
+            if desired_order != occupant_order:
+                all_ok = False
+                failed_workspaces.add(workspace_id)
+                continue
 
-        matched_addresses = {matches[row["id"]] for row in workspace_rows}
-        current_addresses = {client.get("address") for client in current}
-        if None in current_addresses or matched_addresses != current_addresses:
-            continue
-
-        client_by_address = {client["address"]: client for client in current}
-        identities_are_unique = True
+        candidates = []
         for row in workspace_rows:
             client = client_by_address[matches[row["id"]]]
-            rank = client_matches(row, client)
-            candidate_ranks = [
-                candidate_rank
-                for candidate in workspace_rows
-                if (candidate_rank := client_matches(candidate, client)) is not None
-            ]
-            if (
-                rank is None
-                or rank != min(candidate_ranks)
-                or candidate_ranks.count(rank) != 1
-            ):
-                identities_are_unique = False
-                break
-        if not identities_are_unique:
+            desired = saved_geometry(row)
+            actual = window_geometry(client)
+            if not geometries_match(desired[2:], actual[2:]):
+                error = abs(desired[2] - actual[2]) + abs(desired[3] - actual[3])
+                candidates.append((error, row, client, desired))
+        if not candidates:
             continue
+        _, _, client, desired = max(candidates, key=lambda candidate: candidate[0])
+        window = lua_quote(f"address:{client['address']}")
+        if not dispatch(
+            "hl.dsp.window.resize({ "
+            f"x = {desired[2]}, y = {desired[3]}, window = {window} "
+            "})"
+        ):
+            if hyprctl_json("clients") is None:
+                log("restore: Hyprland IPC failed while resizing tiled windows")
+                return None
+            all_ok = False
+            failed_workspaces.add(workspace_id)
+            continue
+        resized = True
 
-        slot_addresses = []
-        for row in workspace_rows:
-            candidates = [
-                client["address"]
-                for client in current
-                if geometries_match(saved_geometry(row), window_geometry(client))
-            ]
-            if len(candidates) != 1:
-                slot_addresses = []
-                break
-            slot_addresses.append(candidates[0])
-        if len(set(slot_addresses)) != len(workspace_rows):
+    if resized:
+        clients = hyprctl_json("clients")
+        if clients is None:
+            log("restore: Hyprland IPC failed after resizing tiled windows")
+            return None
+
+    for workspace_id, workspace_rows in rows_by_workspace.items():
+        if workspace_id in failed_workspaces:
+            continue
+        context = tiled_workspace_clients(
+            workspace_id, workspace_rows, matches, clients
+        )
+        if context is None:
+            continue
+        current, _ = context
+        slot_addresses = tiled_slot_addresses(workspace_rows, current)
+        if slot_addresses is None:
             continue
 
         for index, row in enumerate(workspace_rows):
@@ -612,6 +917,9 @@ def restore_tiled_slots(rows, matches, clients):
                 f"target = {lua_quote(f'address:{occupant}')} "
                 "})"
             ):
+                if hyprctl_json("clients") is None:
+                    log("restore: Hyprland IPC failed while correcting tiled slots")
+                    return None
                 all_ok = False
                 break
             slot_addresses[index], slot_addresses[other_index] = (
@@ -655,7 +963,9 @@ def mark_restore_completed(sid, complete=True):
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile("w", dir=STATE_DIR, delete=False) as handle:
-            json.dump({"session": sid, "instance": instance, "complete": complete}, handle)
+            json.dump(
+                {"session": sid, "instance": instance, "complete": complete}, handle
+            )
             handle.flush()
             os.fsync(handle.fileno())
             temporary = Path(handle.name)
@@ -724,7 +1034,11 @@ def chromium_webapp_url(row):
 
     for candidate in candidates:
         match = re.fullmatch(r"https://([A-Za-z0-9.-]+\.[A-Za-z]{2,})(/.*)", candidate)
-        if match and class_base == f"chrome-{match.group(1)}_{match.group(2).replace('/', '_')}":
+        if (
+            match
+            and class_base
+            == f"chrome-{match.group(1)}_{match.group(2).replace('/', '_')}"
+        ):
             return candidate
     return None
 
@@ -735,7 +1049,11 @@ def process_groups(rows):
         if chromium_webapp_url(row):
             key = ("webapp", row["id"])
         else:
-            key = ("pid", row["pid"]) if row.get("pid") is not None else ("legacy", row["id"])
+            key = (
+                ("pid", row["pid"])
+                if row.get("pid") is not None
+                else ("legacy", row["id"])
+            )
         groups.setdefault(key, []).append(row)
     return sorted(groups.values(), key=lambda group: min(row["ord"] for row in group))
 
@@ -814,9 +1132,22 @@ def restore_windows(rows, initial_matches, initial_clients):
         for client in initial_clients
         if client.get("address")
     }
+    monitor_targets, current_monitors, monitor_ipc_failed = (
+        load_workspace_monitor_context(rows)
+    )
+    if monitor_ipc_failed:
+        return restored, len(rows), launched_processes, True
+    prepared_workspaces = set()
+    failed_monitor_workspaces = set()
 
     for row_id, address in matches.items():
-        if place_window(row_by_id[row_id], address, client_by_address.get(address)):
+        row = row_by_id[row_id]
+        monitor_ok = prepare_workspace_monitor(
+            row, address, monitor_targets, current_monitors, prepared_workspaces
+        )
+        if not monitor_ok:
+            failed_monitor_workspaces.add(row.get("workspace_id"))
+        if monitor_ok and place_window(row, address, client_by_address.get(address)):
             restored += 1
         else:
             failures += 1
@@ -855,7 +1186,12 @@ def restore_windows(rows, initial_matches, initial_clients):
         clients = hyprctl_json("clients")
         if clients is None:
             log("restore: Hyprland IPC failed while waiting for windows")
-            return restored, failures + len(rows) - len(handled), launched_processes, True
+            return (
+                restored,
+                failures + len(rows) - len(handled),
+                launched_processes,
+                True,
+            )
 
         pending = [row for row in rows if row["id"] not in handled]
         found = match_windows(pending, clients, used_addresses, max_rank=3)
@@ -865,7 +1201,15 @@ def restore_windows(rows, initial_matches, initial_clients):
         for row_id, address in found.items():
             matches[row_id] = address
             used_addresses.add(address)
-            if place_window(row_by_id[row_id], address, client_by_address.get(address)):
+            row = row_by_id[row_id]
+            monitor_ok = prepare_workspace_monitor(
+                row, address, monitor_targets, current_monitors, prepared_workspaces
+            )
+            if not monitor_ok:
+                failed_monitor_workspaces.add(row.get("workspace_id"))
+            if monitor_ok and place_window(
+                row, address, client_by_address.get(address)
+            ):
                 restored += 1
             else:
                 failures += 1
@@ -894,13 +1238,23 @@ def restore_windows(rows, initial_matches, initial_clients):
         if row["id"] not in handled:
             failures += 1
             state = next(state for state in states if row in state["rows"])
-            log(f"restore: no window appeared for {row['class']} ({state['launch_cmd']})")
+            log(
+                f"restore: no window appeared for {row['class']} ({state['launch_cmd']})"
+            )
     if any(not row.get("floating") and saved_geometry(row) is not None for row in rows):
         clients = hyprctl_json("clients")
         if clients is None:
             log("restore: Hyprland IPC failed while correcting tiled slots")
             return restored, failures, launched_processes, True
-        if not restore_tiled_slots(rows, matches, clients):
+        tiled_matches = {
+            row_id: address
+            for row_id, address in matches.items()
+            if row_by_id[row_id].get("workspace_id") not in failed_monitor_workspaces
+        }
+        tiled_result = restore_tiled_slots(rows, tiled_matches, clients)
+        if tiled_result is None:
+            return restored, failures, launched_processes, True
+        if not tiled_result:
             failures += 1
     return restored, failures, launched_processes, False
 
@@ -916,7 +1270,10 @@ def cmd_restore(dry_run=False):
         if sess is None:
             print("no saved session to restore")
             conn.close()
-            if not os.environ.get("HYPRLAND_INSTANCE_SIGNATURE") or hyprctl_json("clients") is None:
+            if (
+                not os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+                or hyprctl_json("clients") is None
+            ):
                 print("restore deferred: Hyprland IPC is unavailable", file=sys.stderr)
                 return 75
             return 0 if dry_run or mark_restore_completed(None) else 75
@@ -948,7 +1305,9 @@ def cmd_restore(dry_run=False):
                         f"rules={{ {rules_str} }}  launches<= {len(missing)}"
                     )
                     launched_processes += len(missing)
-            print(f"would launch up to {launched_processes} processes for {len(rows)} windows")
+            print(
+                f"would launch up to {launched_processes} processes for {len(rows)} windows"
+            )
             return 0
 
         if not mark_restore_completed(sid, complete=False):
@@ -992,7 +1351,9 @@ def cmd_status():
     for sid, label, created, capture_status in conn.execute(
         "SELECT id, label, created_at, capture_status FROM sessions ORDER BY id DESC LIMIT 5"
     ):
-        n = conn.execute("SELECT COUNT(*) FROM windows WHERE session = ?", (sid,)).fetchone()[0]
+        n = conn.execute(
+            "SELECT COUNT(*) FROM windows WHERE session = ?", (sid,)
+        ).fetchone()[0]
         print(f"session {sid} [{label}] {created}: {n} windows ({capture_status})")
     conn.close()
 
@@ -1011,13 +1372,19 @@ def cmd_mode(mode=None):
         if result.stdout.strip() == "disabled":
             print("manual")
             return 0
-        print(result.stderr.strip() or "autosave service is not installed", file=sys.stderr)
+        print(
+            result.stderr.strip() or "autosave service is not installed",
+            file=sys.stderr,
+        )
         return result.returncode or 1
 
     if mode == "active" and not restore_is_ready():
         result = cmd_save("manual", wait=True)
         if result != 0:
-            print("failed to capture the current session before enabling autosave", file=sys.stderr)
+            print(
+                "failed to capture the current session before enabling autosave",
+                file=sys.stderr,
+            )
             return result
         if not restore_is_ready():
             print("failed to establish the current Hyprland session", file=sys.stderr)

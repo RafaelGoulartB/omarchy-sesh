@@ -5,21 +5,22 @@ Omarchy (Hyprland). Snapshot lives in a sqlite DB at
 `${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/session.db`.
 
 Scope: floating windows restore pixel-exact. Tiled windows relaunch onto the
-saved workspaces and, when Hyprland recreates compatible layout slots, are
-swapped back into their saved slots (best-effort because Hyprland does not
-expose the split tree). App content (browser tabs, unsaved docs, tmux sessions)
-stays application-owned. See `docs/session-restore-spec.md`.
+saved workspaces; complete, uniquely matched two-window splits are resized
+toward their saved dimensions, and compatible saved slots have their occupants
+corrected. This remains best-effort because Hyprland does not expose the split
+tree. App content (browser tabs, unsaved docs, tmux sessions) stays
+application-owned. See `docs/session-restore-spec.md`.
 
 ## How it works
 
 **Save** (`omarchy-sesh save`) queries `hyprctl -j clients` and `hyprctl -j monitors`,
 filters out unmapped windows and excluded classes, and for each remaining
 window reads its real command line and cwd from `/proc/<pid>/{cmdline,cwd}`.
-Position, size, workspace, monitor, and floating/fullscreen/pinned state are
-captured alongside the launch command and written as one `sessions` row plus
-one `windows` row per window in the sqlite DB. Windows sharing a saved PID are
-kept as one launch group. The latest five complete and five diagnostic
-snapshots are retained.
+Position, size, workspace, monitor connector and description, and
+floating/fullscreen/pinned state are captured alongside the launch command and
+written as one `sessions` row plus one `windows` row per window in the sqlite
+DB. Windows sharing a saved PID are kept as one launch group. The latest five
+complete and five diagnostic snapshots are retained.
 
 **Restore** (`omarchy-sesh restore`) loads the most recent complete session;
 a healthy empty session intentionally restores nothing. An advisory lock
@@ -31,7 +32,10 @@ appear during one shared bounded polling window. If a process does not recreate
 all of its saved windows, its command is retried independently. Chromium app-mode
 windows are restored individually through
 Omarchy's web-app launcher because Chromium does not reopen them from the base
-browser command. `--dry-run` prints the launch plan without executing it.
+browser command. Each saved workspace returns to the same connected monitor;
+renamed or rewired outputs are identified by monitor description. Workspaces
+from disconnected displays fall back to the focused monitor, then the lowest
+monitor ID. `--dry-run` prints the launch plan without executing it.
 
 **Autosave** (`omarchy-sesh autosave`) waits one interval before its first
 capture, then saves periodically (default 60s, configurable). It remains gated
@@ -41,9 +45,16 @@ selecting Active mode captures the current desktop first when no successful
 restore marker exists.
 
 Because tiled windows are relaunched independently rather than replayed into
-Hyprland's split tree, the tool can correct which application occupies each
-compatible saved slot but cannot recreate missing splits or ratios. See
-`docs/session-restore-spec.md` for the full design rationale and limitations.
+Hyprland's split tree, the tool attempts saved pixel sizes only for a simple
+two-window split when both windows are present, uniquely identified, share the
+same split axis, and the workspace bounds are unchanged. It puts each window on
+the correct side before resizing one split anchor. Compatible multi-window
+slots still receive occupant correction, but their geometry is not resized.
+This usually recovers simple ratios such as 70/30, but cannot reconstruct
+missing or nested splits. See `docs/session-restore-spec.md` for the full design
+rationale and limitations.
+When a disconnected display falls back to a monitor with different dimensions,
+saved floating coordinates may require manual adjustment.
 
 ## Requirements
 
@@ -123,6 +134,6 @@ to rerun.
 
 ## Development roadmap
 
-See `docs/future-improvements.md` for the full roadmap: reboot acceptance test,
-workspace→monitor remap, `stableId` matching, toggle, config surface, and a
-system-level `/usr/bin` install variant.
+See `docs/future-improvements.md` for the full roadmap, including live reboot
+acceptance, stable window identity, window groups, configuration, and upgrade
+coverage.

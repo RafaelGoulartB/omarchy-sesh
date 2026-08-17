@@ -124,7 +124,7 @@ Hyprland session and its real saved database are intentionally part of the test.
 - Update `README.md` when user-visible behavior or commands change.
 - Update `docs/session-restore-spec.md` when architecture, state, dispatch API,
   restore guarantees, or limitations change.
-- Consult `docs/future-improvements.md` for known gaps. Current notable limitations are
-  workspace-to-monitor remapping, unverified cross-restart `stableId` behavior,
-  tab-group reconstruction, and ambiguous same-class windows without stable
-  titles.
+- Consult `docs/future-improvements.md` for known gaps. Current notable
+  limitations are unverified cross-restart `stableId` behavior, tab-group
+  reconstruction, fallback-monitor floating geometry, and ambiguous same-class
+  windows without stable titles.

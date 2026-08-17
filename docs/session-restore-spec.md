@@ -11,9 +11,9 @@ window back where it was.
 |---|---|
 | App relaunch | Exact — reconstruct launch command from `/proc/<pid>/cmdline` + cwd |
 | Floating window geometry | Exact — Hyprland dispatchers place/resize by pixel |
-| Tiled window placement | Best-effort — windows relaunch onto the saved workspace; if Hyprland recreates the same geometry slots, matched occupants are swapped into their saved slots. The dwindle/master split tree is not exposed via IPC, so missing splits and ratios cannot be reconstructed |
+| Tiled window placement | Best-effort — complete, uniquely matched two-window splits with the same axis and bounds are arranged and resized toward saved dimensions; compatible multi-window slots receive occupant correction only. The dwindle/master split tree is not exposed via IPC, so missing and nested splits cannot be reconstructed reliably |
 | Workspace assignment | Yes — launch into the saved workspace and move the matched window there |
-| Monitor remapping | Not yet — saved monitor metadata is retained for a future layout-aware remap |
+| Monitor remapping | Yes — connector name, physical description, then deterministic fallback |
 | Window flags (float/fullscreen/pinned) | Yes — `setfloating`, `fullscreenstate`, `pin` |
 | App *content* (tabs, unsaved docs, shell sessions) | No — that is application-owned. Browsers/tmux/editors restore their own content |
 
@@ -85,20 +85,22 @@ DB path: `${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/session.db`.
 ```sql
 PRAGMA journal_mode = WAL;
 
--- One row per saved window. PRIMARY KEY is a stable identity, not the
--- per-run address (addresses change every launch).
+-- One row per saved window. Per-run addresses are never persisted because
+-- addresses change every launch.
 CREATE TABLE windows (
-    id            INTEGER PRIMARY KEY,      -- restored-launch order (tiling)
+    id            INTEGER PRIMARY KEY,
     session       INTEGER NOT NULL,         -- FK -> sessions.id
+    ord           INTEGER NOT NULL,         -- restored-launch order (tiling)
     class         TEXT NOT NULL,            -- client class
     title         TEXT,
     initial_class TEXT,
     initial_title TEXT,
     cmdline       TEXT NOT NULL,            -- argv join(' ') from /proc/pid/cmdline
     cwd           TEXT,                     -- /proc/pid/cwd
-    workspace_id  INTEGER NOT NULL,         -- numeric workspace at save time
+    workspace_id  INTEGER,                  -- numeric workspace at save time
     workspace_name TEXT,
     monitor_name  TEXT,                     -- hyprctl monitor name (e.g. DP-2)
+    monitor_description TEXT,                -- physical display description
     at_x          INTEGER, at_y INTEGER,    -- exact float position or tiled slot metadata
     size_w        INTEGER, size_h INTEGER,
     floating      INTEGER NOT NULL DEFAULT 0,
@@ -106,21 +108,18 @@ CREATE TABLE windows (
     pinned        INTEGER NOT NULL DEFAULT 0,
     xwayland      INTEGER NOT NULL DEFAULT 0,
     pid           INTEGER,                  -- groups windows from one process
-    saved_at      TEXT NOT NULL DEFAULT (datetime('now'))
+    FOREIGN KEY (session) REFERENCES sessions(id)
 );
 
 CREATE TABLE sessions (
     id        INTEGER PRIMARY KEY,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     label     TEXT,                      -- 'manual' | 'logout' | 'periodic'
-    capture_status TEXT NOT NULL,        -- complete | partial | failed
+    capture_status TEXT NOT NULL DEFAULT 'complete', -- complete | partial | failed
     capture_error TEXT
 );
 
-CREATE TABLE schema_meta (
-    key TEXT PRIMARY KEY, value TEXT
-);
-INSERT INTO schema_meta VALUES ('version','2');
+PRAGMA user_version = 3;
 ```
 
 Rules:
@@ -140,9 +139,10 @@ Rules:
 2. For each, read `/proc/<pid>/cmdline` and `/proc/<pid>/cwd` (resolve cwd
    symlink). Skip windows whose cmdline is empty, is `hyprctl`, or is in the
    exclude list.
-3. Group windows by saved PID. Determine numeric `workspace_id`; resolve `monitor_name` via
-   `hyprctl -j monitors` (map `monitor` id → name). Retain `at` and `size` for
-   tiled windows as slot identity metadata, not as pixel-placement commands.
+3. Group windows by saved PID. Determine numeric `workspace_id`; resolve the
+   monitor connector name and description via `hyprctl -j monitors` (map
+   `monitor` id to its monitor record). Retain `at` and `size` for tiled windows
+   as slot identity metadata and inputs to guarded post-launch sizing.
 4. `INSERT` into a new session row in one transaction.
 
 Triggers (any one fires a save):
@@ -176,16 +176,31 @@ the service retries after two seconds.
      floating rules.
    - Discover windows by polling and matching class, initial class/title,
      title, and workspace one-to-one.
+    - Before applying the first window's state on each workspace, move the
+      workspace to its resolved monitor. Prefer a connected monitor whose name
+      and saved description agree, then a unique description match for renamed
+      or rewired outputs. A disconnected output falls back to the focused
+      monitor, then the lowest monitor ID. Conflicting saved identities are
+      skipped rather than guessed.
     - Apply state through the Hyprland Lua dispatcher API: move to the saved
       workspace, set floating state, resize before moving floating windows,
-      then restore fullscreen and pinned state.
+      then restore fullscreen and pinned state. Monitor remapping happens first
+      so it cannot invalidate restored geometry or pinned state.
     - After discovery, compare saved and current tiled geometries per workspace.
-      When all saved tiled windows uniquely match the complete current slot set,
-      swap occupants by address into their saved slots. Skip correction for
-      missing, extra, fullscreen, ambiguous, or incompatible windows rather
-      than altering an uncertain layout.
-3. Saved monitor metadata is not yet applied. Workspace-to-monitor remapping
-   remains a documented future improvement.
+      For a complete, uniquely matched two-window split whose saved and current
+      axis and workspace bounds agree, first swap occupants onto the correct
+      sides, refresh geometry, resize one mismatched split anchor, and refresh
+      again. Then swap occupants by address into any exact compatible saved
+      slots, including compatible multi-window layouts. Skip inferred sizing
+      for missing, extra, fullscreen, ambiguous, differently oriented,
+      differently bounded, or nested layouts rather than altering an uncertain
+      split tree. A required refresh failure is retryable.
+3. Correct tiled sizing and slot occupants only after monitor remapping and
+   window placement complete. The sizing pass can recover simple split ratios
+   but cannot recreate Hyprland's unexposed split tree. If a missing display
+   falls back to a monitor with a different origin, scale, or dimensions, saved
+   floating coordinates may not fit the replacement display and remain
+   best-effort.
 
 Restore failures return nonzero so systemd can retry startup IPC failures. Log
 details to `${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/log/omarchy-sesh.log`.
@@ -260,8 +275,7 @@ automatically relaunched in a loop. Autosave waits one interval and remains
 gated while startup restore is retryable. Saves retain the latest five complete
 and five diagnostic snapshots.
 
-Not yet implemented: workspace→monitor remap on restore (monitor layout can
-change across reboots), tab-group re-formation, and `stableId` matching.
+Not yet implemented: tab-group re-formation and `stableId` matching.
 
 ## 7. Open decisions
 
