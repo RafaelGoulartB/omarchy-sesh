@@ -1,16 +1,16 @@
 [Unit]
 Description=Omarchy session restore
-# Restore needs the compositor socket; save on teardown covers clean logouts
-# and power-cuts (graphical-session.target stop runs ExecStop).
-After=graphical-session.target
+# Startup IPC failures are retried; ExecStop records teardown diagnostics only.
 PartOf=graphical-session.target
-ConditionEnvironment=WAYLAND_DISPLAY
 
 [Service]
 Type=oneshot
 ExecStart=%h/.local/bin/omarchy-sesh restore
-ExecStop=%h/.local/bin/omarchy-sesh save --label logout
+ExecStop=-%h/.local/bin/omarchy-sesh save --label logout --teardown
 RemainAfterExit=yes
+Restart=on-failure
+RestartPreventExitStatus=1
+RestartSec=2
 
 [Install]
 WantedBy=graphical-session.target

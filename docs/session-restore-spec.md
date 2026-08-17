@@ -28,7 +28,7 @@ drives `hyprctl`.
 
 ```
 ┌────────────────────────────────────────────────────────────┐
-│  omarchy-sesh (single bash + python3 script, /usr/bin)    │
+│  omarchy-sesh (single Python script, ~/.local/bin)        │
 │                                                            │
 │  save:    hyprctl -j clients  +  /proc/<pid>  →  sqlite    │
 │  restore: sqlite                →  hyprctl dispatchers     │
@@ -36,7 +36,6 @@ drives `hyprctl`.
          ▲                        │
    started by               fires on startup,
    systemd service          logout, power menu
-   + exec-once hook
 ```
 
 No Omarchy or Hyprland source change. Storage is sqlite at
@@ -103,26 +102,28 @@ CREATE TABLE windows (
     fullscreen    INTEGER NOT NULL DEFAULT 0,  -- 0/1/2
     pinned        INTEGER NOT NULL DEFAULT 0,
     xwayland      INTEGER NOT NULL DEFAULT 0,
-    pid           INTEGER,                  -- for debugging only
+    pid           INTEGER,                  -- groups windows from one process
     saved_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE TABLE sessions (
     id        INTEGER PRIMARY KEY,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    label     TEXT                       -- 'manual' | 'logout' | 'periodic'
+    label     TEXT,                      -- 'manual' | 'logout' | 'periodic'
+    capture_status TEXT NOT NULL,        -- complete | partial | failed
+    capture_error TEXT
 );
 
 CREATE TABLE schema_meta (
     key TEXT PRIMARY KEY, value TEXT
 );
-INSERT INTO schema_meta VALUES ('version','1');
+INSERT INTO schema_meta VALUES ('version','2');
 ```
 
 Rules:
-- Save is **replace-all**: a new save clears previous rows for that session
-  type and inserts a fresh snapshot. Keep the most recent `logout`/`manual`
-  snapshot as the restore source; `periodic` saves only back up the last one.
+- Restore selects the newest `complete` capture. A healthy zero-window capture
+  is authoritative; partial, failed, and ambiguous legacy captures are never
+  restore sources.
 - Only save windows with `mapped == true` and non-empty `cmdline`. Drop the
   Omarchy shell, bars, panels, trays, polkit agents, and whatever the
   autostart already launches (exclude list in config, see §6).
@@ -136,7 +137,7 @@ Rules:
 2. For each, read `/proc/<pid>/cmdline` and `/proc/<pid>/cwd` (resolve cwd
    symlink). Skip windows whose cmdline is empty, is `hyprctl`, or is in the
    exclude list.
-3. Determine numeric `workspace_id`; resolve `monitor_name` via
+3. Group windows by saved PID. Determine numeric `workspace_id`; resolve `monitor_name` via
    `hyprctl -j monitors` (map `monitor` id → name).
 4. `INSERT` into a new session row in one transaction.
 
@@ -145,27 +146,32 @@ Triggers (any one fires a save):
 | Trigger | Mechanism |
 |---|---|
 | Clean logout / reboot / shutdown | Power-menu entries (see §6) run `omarchy-sesh save` before `uwsm stop` / `loginctl` |
-| Systemd teardown cover | `ExecStop=omarchy-sesh save` on the session-bound unit (§5) — catches crashes and power-cut-free logouts |
+| Systemd teardown diagnostic | `ExecStop=omarchy-sesh save --teardown`; never supersedes a healthy snapshot |
 | Periodic (crash cover) | systemd timer / daemon, every 60 s, replaces the `periodic` snapshot |
 
 ## 5. Restore path (`omarchy-sesh restore`)
 
-Runs once, from the Hyprland startup hook, after the compositor socket is up
-(`sleep 2` standard).
+Runs once from the systemd user service. Startup IPC failures return nonzero;
+the service retries after two seconds.
 
-1. Load most recent non-empty snapshot. **Double-restore guard:** if the number
-   of current mapped clients already equals or exceeds the snapshot count
-   (e.g. Hyprland restarted mid-session via `hyprctl reload`-style restart with
-   windows still alive), abort. Compare by class set, not raw count.
-2. For each saved window, in `id` order (preserves tiling order):
-   a. **Skip** if a client with the same `class` is already present (single-
-      instance apps: browsers, Electron, Discord).
-   b. Launch: `hyprctl dispatch exec -- '[workspace <ws> silent float?] <cmdline>'`
-      — use `float` only when the saved window was floating.
-   c. Discover the new window: poll `hyprctl -j clients` for a client whose
-      `pid` equals the pid `hyprctl dispatch exec` reported (the shell may
-      daemonize; match by spawned pgid fallback), within a timeout (~5 s).
-   d. Apply state by `address:<new>`:
+1. Acquire an advisory operation lock and load the newest complete snapshot.
+   A complete empty snapshot restores nothing. Match existing windows
+   one-to-one and compare class multiplicities for the already-restored guard.
+2. Build saved PID groups in window order and dispatch every missing group
+   immediately, without waiting for an earlier application to start. Then poll
+   all outstanding rows together within one shared 20-second deadline, placing
+   each window as soon as it is matched. If one launch does not recreate every
+   saved window, retry that group independently after a short grace period, up
+   to the number of windows initially missing from the group.
+   - Chromium app-mode windows reconstruct their URL from strict
+     class/initial-title metadata and launch each through
+     `omarchy-launch-webapp`, because the base Chromium process does not reopen
+     those windows after reboot.
+   - Launch through `hl.dsp.exec_cmd` with the saved silent workspace and
+     floating rules.
+   - Discover windows by polling and matching class, initial class/title,
+     title, and workspace one-to-one.
+   - Apply state by `address:<new>`:
       - workspace: `movetoworkspacesilent <ws>,address:<addr>`
       - floating: `setfloating address:<addr>` then
         `movewindowpixel exact <x> <y>,address:<addr>` and
@@ -176,23 +182,16 @@ Runs once, from the Hyprland startup hook, after the compositor socket is up
    `hyprctl -j monitors`, `moveworkspacetomonitor <ws> <monitor>` after launch;
    otherwise leave the workspace on the active monitor.
 
-Non-blocking: restore the whole set without waiting for each window to finish
-launching; per-window placement retries a couple of times then gives up.
-Log failures to `~/.local/state/omarchy/log/omarchy-sesh.log`.
+Restore failures return nonzero so systemd can retry startup IPC failures. Log
+details to `~/.local/state/omarchy/log/omarchy-sesh.log`.
 
 ## 6. Omarchy integration points
 
 All confirmed against the installed Omarchy defaults.
 
-1. **Hyprland startup hook** — `~/.config/hypr/autostart.lua` (user override)
-   or shipped default `default/hypr/autostart.lua`:
-   ```lua
-   hl.exec_cmd("sleep 2 && omarchy-sesh restore")
-   ```
-   The shipped default uses `hl.on("hyprland.start", function() … end)` and
-   `o.launch_on_start`/`o.exec_on_start` (`default/hypr/helpers.lua:97-108`);
-   restore should sit alongside the existing `sleep 2 && omarchy-hook post-boot`
-   line.
+1. **Startup** — `omarchy-sesh.service` is the only restore trigger. Older
+   installer-owned Hyprland autostart lines are removed during upgrade. An
+   advisory lock still protects manual concurrent invocations.
 
 2. **systemd user service** — mirror Omarchy's shipped unit pattern
    (`/usr/share/omarchy/default/systemd/user/omarchy-crash-watch.service`,
@@ -200,35 +199,29 @@ All confirmed against the installed Omarchy defaults.
    ```ini
    [Unit]
    Description=Omarchy session restore
-   After=graphical-session.target
-   PartOf=graphical-session.target
-   ConditionEnvironment=WAYLAND_DISPLAY
+    PartOf=graphical-session.target
 
    [Service]
    Type=oneshot
-   ExecStart=/usr/bin/omarchy-sesh restore
-   ExecStop=/usr/bin/omarchy-sesh save
-   RemainAfterExit=yes
+    ExecStart=%h/.local/bin/omarchy-sesh restore
+    ExecStop=-%h/.local/bin/omarchy-sesh save --label logout --teardown
+    RemainAfterExit=yes
+    Restart=on-failure
+    RestartSec=2
 
    [Install]
    WantedBy=graphical-session.target
    ```
-   `ExecStop` on `graphical-session.target` teardown gives clean-exit saves
-   without touching the power menu. Install source in
-   `/usr/share/omarchy/default/systemd/user/` and add it to
-   `enable-user-units.sh` so it matches the existing provisioning flow.
+   `ExecStop` is diagnostic because graphical teardown may already have removed
+   clients. It cannot replace the newest complete snapshot.
 
-3. **Power-menu / logout wiring** — prepend a save to the Omarchy logout,
-   reboot, and shutdown commands (`omarchy-system-logout`,
-   `omarchy-system-reboot`, `omarchy-system-shutdown` or the power menu entry
-   they bind). Save via `uwsm stop`/`loginctl terminate-user`, never `hyprctl
-   dispatch exit`.
+3. **Power-menu / logout wiring** — marker-delimited user menu overrides save
+   synchronously, then invoke `omarchy-system-logout`, `omarchy-system-reboot`,
+   or `omarchy-system-shutdown`. Direct power commands bypass these overrides
+   and rely on the latest periodic snapshot.
 
-4. **Hook mechanism** — `omarchy-hook` runs `~/.config/omarchy/hooks/<name>`
-   and `<name>.d/` (`/usr/share/omarchy/bin/omarchy-hook`). A
-   `post-boot.d/` hook could run restore, but the explicit `exec-once`
-   approach above is more deterministic; the hook is a viable fallback the
-   user can enable without editing autostart.
+4. **Hook mechanism** — Omarchy has no pre-logout hook. Do not add another
+   startup hook because that recreates the duplicate-restore race.
 
 5. **Config / exclude list** — `~/.config/omarchy/sesh/config.json`:
    `exclude_classes` (defaults skip polkit/portal agents), `autosave_seconds`
@@ -239,31 +232,30 @@ All confirmed against the installed Omarchy defaults.
 `bin/omarchy-sesh` — python3, stdlib only (sqlite3, json, shlex). Subcommands:
 
 - `save [--label X]` — snapshots mapped clients + `/proc/<pid>` cmdline/cwd
-  into `~/.local/state/omarchy/session.db` (WAL, replace-session-per-save).
-- `restore [--dry-run]` — loads latest session, skips classes already present
-  (single-instance guard) and aborts entirely if the session looks already
-  restored (≥80% class overlap + count match). Launches each remaining window
-  via `exec_cmd` with `workspace`/`float` rules, polls for the new address,
-  then resize→move→fullscreen→pin.
-- `autosave [--interval N]` — periodic save loop (crash cover).
+  into `~/.local/state/omarchy/session.db` (WAL, status-aware snapshots).
+- `restore [--dry-run]` — loads the latest complete session, matches existing
+  windows one-to-one, launches each saved PID group with bounded retries for
+  missing windows, and places every matched window. Lua arguments use
+  collision-free long strings.
+- `autosave [--interval N]` — periodic save loop (crash cover). It refreshes
+  the current Hyprland instance from the systemd user manager before each
+  capture so a startup restore retry cannot leave it on a stale compositor.
+  Failed restore markers keep autosave gated until restore succeeds or the user
+  explicitly establishes a new baseline through manual/Active mode.
 - `status` — lists recent sessions.
 
 Verified end-to-end: save → close app → `restore` relaunched Nautilus and
 placed it at the exact saved `at [145,75] size [1000,700]` floating. Test
 windows were cleaned up after each run.
 
-`systemd/user/omarchy-sesh.service` (Type=oneshot, `RemainAfterExit=yes`,
-`ExecStart=restore` / `ExecStop=save --label logout`, WantedBy
-graphical-session.target) and `default/hypr/sesh-restore.lua` (the
-`sleep 2 && omarchy-sesh restore` autostart snippet) ship alongside.
-`systemd/user/omarchy-sesh-autosave.service` runs the periodic saver for the
-whole graphical session (mirrors `omarchy-crash-watch`'s Type=simple +
-Restart=always pattern) so window moves survive a power-off without logout.
-Saves prune old snapshots (latest 5 kept) to keep the DB bounded.
+`systemd/user/omarchy-sesh.service` is the single restore trigger and retries
+temporary lock or IPC failures. Application launch/placement failures are not
+automatically relaunched in a loop. Autosave waits one interval and remains
+gated while startup restore is retryable. Saves retain the latest five complete
+and five diagnostic snapshots.
 
 Not yet implemented: workspace→monitor remap on restore (monitor layout can
-change across reboots), tab-group re-formation, `stableId` matching, and
-power-menu save wiring (relies on ExecStop for now).
+change across reboots), tab-group re-formation, and `stableId` matching.
 
 ## 7. Open decisions
 

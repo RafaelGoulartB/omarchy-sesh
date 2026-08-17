@@ -1,1 +1,36 @@
+# Python
 __pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+ENV/
+
+# Testing
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Editors & IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.bak
+
+# OS
+.DS_Store
+.DS_Store?
+Thumbs.db
+/tasks

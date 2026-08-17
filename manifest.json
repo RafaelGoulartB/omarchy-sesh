@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "mrpbennett.sesh",
+  "name": "Omarchy Sesh",
+  "version": "0.1.0",
+  "author": "Peter Bennett",
+  "license": "MIT",
+  "description": "Save and restore Hyprland sessions from the Omarchy bar.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Session Saver",
+    "description": "Enable automatic snapshots, save manually, or restore the latest session.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {}
+  }
+}

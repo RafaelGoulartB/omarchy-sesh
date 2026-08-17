@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 
 import argparse
+import fcntl
 import json
 import os
+import re
 import shlex
 import sqlite3
 import subprocess
@@ -15,6 +17,9 @@ CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.confi
 DB_PATH = STATE_DIR / "session.db"
 CONFIG_PATH = CONFIG_DIR / "config.json"
 LOG_PATH = STATE_DIR / "log" / "omarchy-sesh.log"
+LOCK_PATH = STATE_DIR / "session.lock"
+RESTORE_MARKER_PATH = STATE_DIR / "restore-complete.json"
+AUTOSAVE_UNIT = "omarchy-sesh-autosave.service"
 
 DEFAULT_CONFIG = {
     "exclude_classes": [
@@ -26,6 +31,9 @@ DEFAULT_CONFIG = {
 }
 
 DEFAULT_EXCLUDE = set(DEFAULT_CONFIG["exclude_classes"])
+CHROMIUM_NORMAL_CLASSES = {"chromium", "chromium-browser"}
+RESTORE_TIMEOUT = 20.0
+RESTORE_RETRY_DELAY = 2.0
 
 
 def log(msg):
@@ -47,10 +55,36 @@ def hyprctl_json(*args):
 
 def dispatch(lua):
     out = subprocess.run(["hyprctl", "dispatch", lua], capture_output=True, text=True)
-    if out.returncode != 0:
-        log(f"dispatch failed ({lua}): {out.stderr.strip()}")
+    output = "\n".join(part.strip() for part in (out.stdout, out.stderr) if part.strip())
+    if out.returncode != 0 or "error" in output.lower():
+        log(f"dispatch failed ({lua}): {output}")
         return False
-    return "error" not in out.stderr
+    return True
+
+
+def lua_quote(value):
+    value = str(value)
+    level = 0
+    while f"]{'=' * level}]" in value:
+        level += 1
+    equals = "=" * level
+    return f"[{equals}[{value}]{equals}]"
+
+
+def acquire_operation_lock(wait=False, wait_timeout=15):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    lock_file = open(LOCK_PATH, "a+")
+    deadline = time.monotonic() + wait_timeout if wait else None
+    while True:
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if deadline is None or time.monotonic() >= deadline:
+                lock_file.close()
+                return None
+            time.sleep(0.1)
+    return lock_file
 
 
 def load_config():
@@ -65,14 +99,25 @@ def load_config():
 
 def db_conn():
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.executescript(
-        """
+    conn = sqlite3.connect(DB_PATH, timeout=5)
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 5000")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """
         CREATE TABLE IF NOT EXISTS sessions (
             id INTEGER PRIMARY KEY,
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            label TEXT
-        );
+            label TEXT,
+            capture_status TEXT NOT NULL DEFAULT 'complete',
+            capture_error TEXT
+        )
+            """
+        )
+        conn.execute(
+            """
         CREATE TABLE IF NOT EXISTS windows (
             id INTEGER PRIMARY KEY,
             session INTEGER NOT NULL,
@@ -92,10 +137,31 @@ def db_conn():
             fullscreen INTEGER NOT NULL DEFAULT 0,
             pinned INTEGER NOT NULL DEFAULT 0,
             xwayland INTEGER NOT NULL DEFAULT 0,
+            pid INTEGER,
             FOREIGN KEY (session) REFERENCES sessions(id)
-        );
-        """
-    )
+        )
+            """
+        )
+        session_columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+        if "capture_status" not in session_columns:
+            conn.execute(
+                "ALTER TABLE sessions ADD COLUMN capture_status TEXT NOT NULL DEFAULT 'complete'"
+            )
+            conn.execute(
+                "UPDATE sessions SET capture_status = 'legacy_unknown' "
+                "WHERE NOT EXISTS (SELECT 1 FROM windows WHERE windows.session = sessions.id)"
+            )
+        if "capture_error" not in session_columns:
+            conn.execute("ALTER TABLE sessions ADD COLUMN capture_error TEXT")
+        window_columns = {row[1] for row in conn.execute("PRAGMA table_info(windows)")}
+        if "pid" not in window_columns:
+            conn.execute("ALTER TABLE windows ADD COLUMN pid INTEGER")
+        conn.execute("PRAGMA user_version = 2")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        conn.close()
+        raise
     return conn
 
 
@@ -103,18 +169,78 @@ def read_proc(pid):
     try:
         with open(f"/proc/{pid}/cmdline", "rb") as f:
             argv = [a.decode(errors="replace") for a in f.read().split(b"\0") if a]
+        if len(argv) == 1 and any(ch.isspace() for ch in argv[0]):
+            nested_argv = shlex.split(argv[0])
+            if nested_argv and Path(nested_argv[0]).exists():
+                argv = nested_argv
         cmdline = shlex.join(argv) if argv else ""
+    except (OSError, FileNotFoundError, ValueError):
+        return "", "", "cmdline unavailable"
+    try:
         cwd = os.readlink(f"/proc/{pid}/cwd")
-    except (OSError, FileNotFoundError):
-        return "", ""
-    return cmdline, cwd
+    except OSError:
+        cwd = ""
+    return cmdline, cwd, "" if cmdline else "empty cmdline"
 
 
-def cmd_save(label="manual"):
-    clients = hyprctl_json("clients")
-    monitors = hyprctl_json("monitors")
-    if clients is None or monitors is None:
-        return 1
+def persist_snapshot(label, status, error, rows):
+    conn = db_conn()
+    with conn:
+        cur = conn.execute(
+            "INSERT INTO sessions (label, capture_status, capture_error) VALUES (?, ?, ?)",
+            (label, status, error or None),
+        )
+        sid = cur.lastrowid
+        conn.executemany(
+            "INSERT INTO windows (session, ord, class, initial_class, title, initial_title, "
+            "cmdline, cwd, workspace_id, workspace_name, monitor_name, at_x, at_y, size_w, "
+            "size_h, floating, fullscreen, pinned, xwayland, pid) "
+            "VALUES (:session, :ord, :class, :initial_class, :title, :initial_title, "
+            ":cmdline, :cwd, :workspace_id, :workspace_name, :monitor_name, :at_x, :at_y, "
+            ":size_w, :size_h, :floating, :fullscreen, :pinned, :xwayland, :pid)",
+            [dict(r, session=sid, ord=i) for i, r in enumerate(rows)],
+        )
+        keep_ids = {
+            row[0]
+            for row in conn.execute(
+                "SELECT id FROM sessions WHERE capture_status = 'complete' ORDER BY id DESC LIMIT 5"
+            )
+        }
+        keep_ids.update(
+            row[0]
+            for row in conn.execute(
+                "SELECT id FROM sessions WHERE capture_status != 'complete' ORDER BY id DESC LIMIT 5"
+            )
+        )
+        prune_ids = [
+            row[0] for row in conn.execute("SELECT id FROM sessions") if row[0] not in keep_ids
+        ]
+        for session_id in prune_ids:
+            conn.execute("DELETE FROM windows WHERE session = ?", (session_id,))
+        conn.executemany("DELETE FROM sessions WHERE id = ?", [(sid,) for sid in prune_ids])
+    conn.close()
+    return sid
+
+
+def cmd_save(label="manual", teardown=False, wait=False):
+    lock_file = acquire_operation_lock(wait=wait)
+    if lock_file is None:
+        log(f"save[{label}]: another session operation is running")
+        return 75
+    try:
+        clients = hyprctl_json("clients")
+        monitors = hyprctl_json("monitors")
+        if clients is None or monitors is None:
+            log(f"save[{label}]: capture failed because Hyprland IPC is unavailable")
+            return 1
+        status = "failed" if teardown else "complete"
+        errors = ["teardown captures are diagnostic only"] if teardown else []
+        return _save_clients(label, clients, monitors, status, errors)
+    finally:
+        lock_file.close()
+
+
+def _save_clients(label, clients, monitors, status, errors):
     cfg = load_config()
     exclude = DEFAULT_EXCLUDE | set(cfg.get("exclude_classes", []))
     monitor_by_id = {m["id"]: m["name"] for m in monitors}
@@ -125,8 +251,10 @@ def cmd_save(label="manual"):
         cls = w.get("class", "")
         if cls in exclude or not cls:
             continue
-        cmdline, cwd = read_proc(w.get("pid", 0))
+        pid = w.get("pid", 0)
+        cmdline, cwd, proc_error = read_proc(pid)
         if not cmdline:
+            errors.append(f"{w.get('address', cls)}: {proc_error}")
             continue
         ws = w.get("workspace") or {}
         at = w.get("at") or []
@@ -142,49 +270,35 @@ def cmd_save(label="manual"):
                 "workspace_id": ws.get("id"),
                 "workspace_name": ws.get("name"),
                 "monitor_name": monitor_by_id.get(w.get("monitor")),
-                "at_x": at[0] if len(at) > 0 else None,
-                "at_y": at[1] if len(at) > 1 else None,
-                "size_w": size[0] if len(size) > 0 else None,
-                "size_h": size[1] if len(size) > 1 else None,
+                "at_x": at[0] if w.get("floating") and len(at) > 0 else None,
+                "at_y": at[1] if w.get("floating") and len(at) > 1 else None,
+                "size_w": size[0] if w.get("floating") and len(size) > 0 else None,
+                "size_h": size[1] if w.get("floating") and len(size) > 1 else None,
                 "floating": 1 if w.get("floating") else 0,
                 "fullscreen": w.get("fullscreen", 0),
                 "pinned": 1 if w.get("pinned") else 0,
                 "xwayland": 1 if w.get("xwayland") else 0,
+                "pid": pid,
             }
         )
-    conn = db_conn()
-    with conn:
-        cur = conn.execute("INSERT INTO sessions (label) VALUES (?)", (label,))
-        sid = cur.lastrowid
-        conn.executemany(
-            "INSERT INTO windows (session, ord, class, initial_class, title, initial_title, "
-            "cmdline, cwd, workspace_id, workspace_name, monitor_name, at_x, at_y, size_w, "
-            "size_h, floating, fullscreen, pinned, xwayland) "
-            "VALUES (:session, :ord, :class, :initial_class, :title, :initial_title, "
-            ":cmdline, :cwd, :workspace_id, :workspace_name, :monitor_name, :at_x, :at_y, "
-            ":size_w, :size_h, :floating, :fullscreen, :pinned, :xwayland)",
-            [dict(r, session=sid, ord=i) for i, r in enumerate(rows)],
-        )
-        prune_ids = [
-            r[0]
-            for r in conn.execute(
-                "SELECT id FROM sessions WHERE id NOT IN "
-                "(SELECT id FROM sessions ORDER BY id DESC LIMIT 5)"
-            )
-        ]
-        for pid in prune_ids:
-            conn.execute("DELETE FROM windows WHERE session = ?", (pid,))
-        conn.executemany("DELETE FROM sessions WHERE id = ?", [(p,) for p in prune_ids])
-    conn.close()
-    log(f"save[{label}]: {len(rows)} windows -> session {sid}")
-    print(f"saved {len(rows)} windows (session {sid})")
-    return 0
+    if errors and status == "complete":
+        status = "partial"
+    error = "; ".join(errors)
+    sid = persist_snapshot(label, status, error, rows)
+    if status == "complete" and label == "manual":
+        mark_restore_completed(sid)
+    log(f"save[{label}]: {len(rows)} windows -> session {sid} ({status}){': ' + error if error else ''}")
+    print(f"saved {len(rows)} windows (session {sid}, {status})")
+    return 0 if status == "complete" else 1
 
 
 def latest_session(conn):
-    cur = conn.execute("SELECT id, label, created_at FROM sessions ORDER BY id DESC LIMIT 1")
-    row = cur.fetchone()
-    return row
+    cur = conn.execute(
+        "SELECT id, label, created_at FROM sessions s "
+        "WHERE capture_status = 'complete' "
+        "ORDER BY s.id DESC LIMIT 1"
+    )
+    return cur.fetchone()
 
 
 def load_windows(conn, sid):
@@ -195,135 +309,466 @@ def load_windows(conn, sid):
     return [dict(zip(cols, r)) for r in cur.fetchall()]
 
 
-def double_restore_guard(rows):
-    clients = hyprctl_json("clients")
-    if clients is None:
+def window_classes_match(saved, current):
+    return saved == current or {saved, current} <= CHROMIUM_NORMAL_CLASSES
+
+
+def client_matches(row, client):
+    cls = row["class"]
+    initial_cls = row.get("initial_class") or cls
+    class_matches = window_classes_match(cls, client.get("class"))
+    initial_class_matches = window_classes_match(initial_cls, client.get("initialClass"))
+    if not class_matches and not initial_class_matches:
+        return None
+    workspace = client.get("workspace") or {}
+    workspace_matches = (
+        row.get("workspace_id") is None or row.get("workspace_id") == workspace.get("id")
+    )
+    if (
+        workspace_matches
+        and row.get("title")
+        and class_matches
+        and row["title"] == client.get("title")
+    ):
+        return 0
+    if (
+        workspace_matches
+        and row.get("initial_title")
+        and initial_class_matches
+        and row["initial_title"] == client.get("initialTitle")
+    ):
+        return 1
+    if class_matches and row.get("workspace_id") == workspace.get("id"):
+        return 2
+    return 3
+
+
+def match_windows(rows, clients, used_addresses=None, max_rank=2):
+    excluded = set(used_addresses or ())
+    candidates_by_row = {}
+    rows_by_id = {row["id"]: row for row in rows}
+    for row in rows:
+        candidates_by_row[row["id"]] = []
+        for client in clients:
+            address = client.get("address")
+            if not client.get("mapped") or not address or address in excluded:
+                continue
+            rank = client_matches(row, client)
+            if rank is not None and rank <= max_rank:
+                candidates_by_row[row["id"]].append((rank, address))
+        candidates_by_row[row["id"]].sort()
+
+    address_to_row = {}
+
+    def assign(row_id, seen):
+        for _, address in candidates_by_row[row_id]:
+            if address in seen:
+                continue
+            seen.add(address)
+            previous_row = address_to_row.get(address)
+            if previous_row is None or assign(previous_row, seen):
+                address_to_row[address] = row_id
+                return True
         return False
-    mapped = [c for c in clients if c.get("mapped")]
-    saved_classes = {r["class"] for r in rows}
-    present_classes = {c.get("class", "") for c in mapped}
-    overlap = len(saved_classes & present_classes)
-    if len(mapped) >= len(rows) and len(saved_classes) > 0 and overlap >= 0.8 * len(saved_classes):
-        return True
+
+    ordered_rows = sorted(
+        rows,
+        key=lambda row: (len(candidates_by_row[row["id"]]), row["ord"]),
+    )
+    for row in ordered_rows:
+        assign(row["id"], set())
+    return {row_id: address for address, row_id in address_to_row.items() if row_id in rows_by_id}
+
+
+def double_restore_guard(rows, clients):
+    matches = match_windows(rows, clients, max_rank=1)
+    return bool(rows) and len(matches) == len(rows)
+
+
+def place_window(w, address, current=None):
+    if not address:
+        return False
+    win = lua_quote(f"address:{address}")
+    ok = True
+    if w.get("workspace_id") is not None:
+        ok = dispatch(
+            f"hl.dsp.window.move({{ workspace = {w['workspace_id']}, follow = false, window = {win} }})"
+        ) and ok
+    desired_floating = bool(w.get("floating"))
+    current_floating = bool(current and current.get("floating"))
+    if current is None or desired_floating != current_floating:
+        float_action = "on" if desired_floating else "off"
+        ok = dispatch(
+            f'hl.dsp.window.float({{ action = "{float_action}", window = {win} }})'
+        ) and ok
+    if w.get("floating"):
+        if w.get("size_w") is not None and w.get("size_h") is not None:
+            ok = dispatch(
+                f"hl.dsp.window.resize({{ x = {w['size_w']}, y = {w['size_h']}, window = {win} }})"
+            ) and ok
+        if w.get("at_x") is not None and w.get("at_y") is not None:
+            ok = dispatch(
+                f"hl.dsp.window.move({{ x = {w['at_x']}, y = {w['at_y']}, window = {win} }})"
+            ) and ok
+    fs = w.get("fullscreen", 0)
+    ok = dispatch(
+        f"hl.dsp.window.fullscreen_state({{ internal = {fs}, client = {fs}, window = {win} }})"
+    ) and ok
+    current_pinned = bool(current and current.get("pinned"))
+    if bool(w.get("pinned")) != current_pinned:
+        ok = dispatch(f"hl.dsp.window.pin({{ window = {win} }})") and ok
+    return ok
+
+
+def restore_was_completed(sid):
+    instance = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    if not instance:
+        return False
+    try:
+        marker = json.loads(RESTORE_MARKER_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    return (
+        marker.get("session") == sid
+        and marker.get("instance") == instance
+        and marker.get("complete") is True
+    )
+
+
+def restore_is_ready():
+    instance = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    if not instance:
+        return False
+    try:
+        marker = json.loads(RESTORE_MARKER_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    return marker.get("instance") == instance and marker.get("complete") is True
+
+
+def mark_restore_completed(sid, complete=True):
+    instance = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    if not instance:
+        return
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    RESTORE_MARKER_PATH.write_text(
+        json.dumps({"session": sid, "instance": instance, "complete": complete})
+    )
+
+
+def refresh_hyprland_instance():
+    result = subprocess.run(
+        ["systemctl", "--user", "show-environment"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return False
+    prefix = "HYPRLAND_INSTANCE_SIGNATURE="
+    for line in result.stdout.splitlines():
+        if line.startswith(prefix):
+            os.environ["HYPRLAND_INSTANCE_SIGNATURE"] = line.removeprefix(prefix)
+            return True
     return False
 
 
-def wait_for_new_window(known_addresses, cls, initial_title, workspace_id, timeout=8.0):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+def chromium_webapp_url(row):
+    cls = row.get("initial_class") or row.get("class", "")
+    initial_title = row.get("initial_title") or ""
+    match = re.fullmatch(r"([A-Za-z0-9.-]+\.[A-Za-z]{2,})_(/.*)", initial_title)
+    if not match:
+        return None
+    encoded_path = match.group(2).replace("/", "_")
+    if cls != f"chrome-{match.group(1)}_{encoded_path}-Default":
+        return None
+    return f"https://{match.group(1)}{match.group(2)}"
+
+
+def process_groups(rows):
+    groups = {}
+    for row in rows:
+        if chromium_webapp_url(row):
+            key = ("webapp", row["id"])
+        else:
+            key = ("pid", row["pid"]) if row.get("pid") is not None else ("legacy", row["id"])
+        groups.setdefault(key, []).append(row)
+    return sorted(groups.values(), key=lambda group: min(row["ord"] for row in group))
+
+
+def normalized_cmdline(cmdline):
+    try:
+        argv = shlex.split(cmdline)
+        if len(argv) == 1 and any(ch.isspace() for ch in argv[0]):
+            nested_argv = shlex.split(argv[0])
+            if nested_argv and Path(nested_argv[0]).exists():
+                argv = nested_argv
+        return shlex.join(argv)
+    except ValueError:
+        return cmdline
+
+
+def launch_command(row):
+    webapp_url = chromium_webapp_url(row)
+    if webapp_url:
+        return shlex.join(["omarchy-launch-webapp", webapp_url])
+    command = normalized_cmdline(row["cmdline"])
+    if row.get("class") in CHROMIUM_NORMAL_CLASSES:
+        try:
+            argv = shlex.split(command)
+            filtered = []
+            skip_next = False
+            for argument in argv:
+                if skip_next:
+                    skip_next = False
+                elif argument == "--app":
+                    skip_next = True
+                elif not argument.startswith("--app="):
+                    filtered.append(argument)
+            command = shlex.join(filtered)
+        except ValueError:
+            pass
+    if row.get("cwd"):
+        command = f"cd -- {shlex.quote(row['cwd'])} && {command}"
+    return command
+
+
+def launch_request(row):
+    command = launch_command(row)
+    rules = []
+    if row.get("workspace_id") is not None:
+        workspace = f"{row['workspace_id']} silent"
+        rules.append(f"workspace = {lua_quote(workspace)}")
+    if row.get("floating"):
+        rules.append("float = true")
+    rules_str = ", ".join(rules)
+    lua = f"hl.dsp.exec_cmd({lua_quote(command)}, {{ {rules_str} }})"
+    return command, rules_str, lua
+
+
+def restore_windows(rows, initial_matches, initial_clients):
+    row_by_id = {row["id"]: row for row in rows}
+    matches = dict(initial_matches)
+    used_addresses = {
+        client.get("address")
+        for client in initial_clients
+        if client.get("mapped") and client.get("address")
+    }
+    restored = 0
+    failures = 0
+    launched_processes = 0
+    handled = set()
+    client_by_address = {
+        client.get("address"): client
+        for client in initial_clients
+        if client.get("address")
+    }
+
+    for row_id, address in matches.items():
+        if place_window(row_by_id[row_id], address, client_by_address.get(address)):
+            restored += 1
+        else:
+            failures += 1
+        handled.add(row_id)
+
+    states = []
+    for group in process_groups(rows):
+        missing = [row for row in group if row["id"] not in matches]
+        if not missing:
+            continue
+        state = {
+            "rows": group,
+            "attempts": 0,
+            "max_attempts": len(missing),
+            "next_retry": time.monotonic(),
+            "launch_cmd": launch_command(missing[0]),
+        }
+        states.append(state)
+
+        # A partially restored process may still be creating its other windows.
+        if any(row["id"] in matches for row in group):
+            state["next_retry"] = time.monotonic() + RESTORE_RETRY_DELAY
+            continue
+        _, _, lua = launch_request(missing[0])
+        if dispatch(lua):
+            state["attempts"] = 1
+            state["next_retry"] = time.monotonic() + RESTORE_RETRY_DELAY
+            launched_processes += 1
+        else:
+            state["attempts"] = state["max_attempts"]
+
+    deadline = time.monotonic() + RESTORE_TIMEOUT
+    while len(handled) < len(rows) and time.monotonic() < deadline:
         clients = hyprctl_json("clients")
-        if clients:
-            for c in clients:
-                if c.get("address") in known_addresses:
-                    continue
-                if not c.get("mapped"):
-                    continue
-                if c.get("class") == cls or c.get("initialClass") == cls:
-                    return c.get("address")
-        time.sleep(0.2)
-    return None
+        if clients is None:
+            log("restore: Hyprland IPC failed while waiting for windows")
+            return restored, failures + len(rows) - len(handled), launched_processes, True
 
+        pending = [row for row in rows if row["id"] not in handled]
+        found = match_windows(pending, clients, used_addresses)
+        client_by_address = {
+            client.get("address"): client for client in clients if client.get("address")
+        }
+        for row_id, address in found.items():
+            matches[row_id] = address
+            used_addresses.add(address)
+            if place_window(row_by_id[row_id], address, client_by_address.get(address)):
+                restored += 1
+            else:
+                failures += 1
+            handled.add(row_id)
 
-def place_window(w, address):
-    if not address:
-        return
-    win = f"address:{address}"
-    if w.get("floating"):
-        dispatch(f'hl.dsp.window.float({{ action = "on", window = "{win}" }})')
-    if w.get("size_w") is not None and w.get("size_h") is not None:
-        dispatch(
-            f"hl.dsp.window.resize({{ x = {w['size_w']}, y = {w['size_h']}, window = \"{win}\" }})"
-        )
-    if w.get("at_x") is not None and w.get("at_y") is not None:
-        dispatch(f"hl.dsp.window.move({{ x = {w['at_x']}, y = {w['at_y']}, window = \"{win}\" }})")
-    if w.get("fullscreen"):
-        fs = w["fullscreen"]
-        dispatch(
-            f"hl.dsp.window.fullscreen_state({{ internal = {fs}, client = {fs}, window = \"{win}\" }})"
-        )
-    if w.get("pinned"):
-        dispatch(f"hl.dsp.window.pin({{ window = \"{win}\" }})")
+        now = time.monotonic()
+        for state in states:
+            missing = [row for row in state["rows"] if row["id"] not in handled]
+            if (
+                missing
+                and state["attempts"] < state["max_attempts"]
+                and now >= state["next_retry"]
+            ):
+                state["launch_cmd"], _, lua = launch_request(missing[0])
+                if dispatch(lua):
+                    launched_processes += 1
+                    state["attempts"] += 1
+                    state["next_retry"] = now + RESTORE_RETRY_DELAY
+                else:
+                    state["attempts"] = state["max_attempts"]
+
+        if len(handled) < len(rows):
+            time.sleep(0.2)
+
+    for row in rows:
+        if row["id"] not in handled:
+            failures += 1
+            state = next(state for state in states if row in state["rows"])
+            log(f"restore: no window appeared for {row['class']} ({state['launch_cmd']})")
+    return restored, failures, launched_processes, False
 
 
 def cmd_restore(dry_run=False):
-    conn = db_conn()
-    sess = latest_session(conn)
-    if sess is None:
-        print("no saved session to restore")
+    lock_file = acquire_operation_lock()
+    if lock_file is None:
+        print("restore deferred: another session operation is running")
+        return 75
+    try:
+        conn = db_conn()
+        sess = latest_session(conn)
+        if sess is None:
+            print("no saved session to restore")
+            conn.close()
+            mark_restore_completed(None)
+            return 0
+        sid, label, created = sess
+        if restore_was_completed(sid):
+            print("restore skipped: session already handled for this desktop")
+            conn.close()
+            return 0
+        rows = load_windows(conn, sid)
         conn.close()
-        return 0
-    sid, label, created = sess
-    rows = load_windows(conn, sid)
-    conn.close()
-    if not rows:
-        print("saved session is empty")
-        return 0
-    if double_restore_guard(rows):
-        print(f"restore aborted: session already appears restored ({len(rows)} windows)")
-        return 0
+        if not rows:
+            print("saved session is empty; nothing to restore")
+            mark_restore_completed(sid)
+            return 0
 
-    clients = hyprctl_json("clients") or []
-    known_addresses = {c.get("address") for c in clients}
-    present_classes = {c.get("class", "") for c in clients if c.get("mapped")}
-    cfg = load_config()
+        clients = hyprctl_json("clients")
+        if clients is None:
+            print("restore failed: Hyprland IPC is unavailable", file=sys.stderr)
+            return 75
+        initial_matches = match_windows(rows, clients, max_rank=2)
 
-    launched = 0
-    for w in rows:
-        cls = w["class"]
-        if cls in present_classes:
-            continue
-        present_classes.add(cls)
-        launch_cmd = w["cmdline"]
-        if w.get("cwd"):
-            launch_cmd = f"cd {shlex.quote(w['cwd'])} && {launch_cmd}"
-        ws = w.get("workspace_id")
-        rules = []
-        if ws is not None:
-            rules.append(f'workspace = "{ws} silent"')
-        if w.get("floating"):
-            rules.append("float = true")
-        rules_str = ", ".join(rules)
-        lua = f'hl.dsp.exec_cmd({shlex.quote(launch_cmd)}, {{ {rules_str} }})'
         if dry_run:
-            print(f"[dry-run] {cls}: {launch_cmd}  rules={{ {rules_str} }}")
-            launched += 1
-            continue
-        if not dispatch(lua):
-            continue
-        address = wait_for_new_window(
-            known_addresses, cls, w.get("initial_title"), w.get("workspace_id")
-        )
-        if address:
-            known_addresses.add(address)
-            place_window(w, address)
-            launched += 1
-        else:
-            log(f"restore: no window appeared for {cls} ({launch_cmd})")
+            launched_processes = 0
+            for group in process_groups(rows):
+                missing = [row for row in group if row["id"] not in initial_matches]
+                if missing:
+                    launch_cmd, rules_str, _ = launch_request(missing[0])
+                    print(
+                        f"[dry-run] {group[0]['class']}: {launch_cmd}  "
+                        f"rules={{ {rules_str} }}  launches<= {len(missing)}"
+                    )
+                    launched_processes += len(missing)
+            print(f"would launch up to {launched_processes} processes for {len(rows)} windows")
+            return 0
 
-    print(f"restored {launched} windows")
-    log(f"restore: launched {launched}/{len(rows)} windows")
-    return 0
+        restored, failures, launched_processes, ipc_failed = restore_windows(
+            rows, initial_matches, clients
+        )
+        print(f"restored {restored}/{len(rows)} windows")
+        log(
+            f"restore: restored {restored}/{len(rows)} windows from "
+            f"{launched_processes} launched processes"
+        )
+        if not failures:
+            mark_restore_completed(sid)
+        if ipc_failed:
+            return 75
+        if failures:
+            mark_restore_completed(sid, complete=False)
+        return 1 if failures else 0
+    finally:
+        lock_file.close()
 
 
 def cmd_autosave(interval=None):
     cfg = load_config()
     interval = interval or cfg.get("autosave_seconds", 60)
     while True:
+        time.sleep(interval)
+        refresh_hyprland_instance()
+        if not restore_is_ready():
+            log("autosave: waiting for startup restore to complete")
+            continue
         try:
             cmd_save("periodic")
         except Exception as e:
             log(f"autosave error: {e}")
-        time.sleep(interval)
 
 
 def cmd_status():
     conn = db_conn()
-    for sid, label, created in conn.execute(
-        "SELECT id, label, created_at FROM sessions ORDER BY id DESC LIMIT 5"
+    for sid, label, created, capture_status in conn.execute(
+        "SELECT id, label, created_at, capture_status FROM sessions ORDER BY id DESC LIMIT 5"
     ):
         n = conn.execute("SELECT COUNT(*) FROM windows WHERE session = ?", (sid,)).fetchone()[0]
-        print(f"session {sid} [{label}] {created}: {n} windows")
+        print(f"session {sid} [{label}] {created}: {n} windows ({capture_status})")
     conn.close()
+
+
+def cmd_mode(mode=None):
+    if mode is None:
+        result = subprocess.run(
+            ["systemctl", "--user", "is-enabled", AUTOSAVE_UNIT],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            print("active")
+            return 0
+        if result.stdout.strip() == "disabled":
+            print("manual")
+            return 0
+        print(result.stderr.strip() or "autosave service is not installed", file=sys.stderr)
+        return result.returncode or 1
+
+    if mode == "active" and not restore_is_ready():
+        result = cmd_save("manual", wait=True)
+        if result != 0:
+            print("failed to capture the current session before enabling autosave", file=sys.stderr)
+            return result
+        if not restore_is_ready():
+            print("failed to establish the current Hyprland session", file=sys.stderr)
+            return 1
+
+    action = "enable" if mode == "active" else "disable"
+    result = subprocess.run(
+        ["systemctl", "--user", action, "--now", AUTOSAVE_UNIT],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        print(result.stderr.strip() or f"failed to set {mode} mode", file=sys.stderr)
+        return result.returncode
+    print(mode)
+    return 0
 
 
 def main():
@@ -332,6 +777,8 @@ def main():
 
     p_save = sub.add_parser("save", help="snapshot current windows")
     p_save.add_argument("--label", default="manual")
+    p_save.add_argument("--teardown", action="store_true")
+    p_save.add_argument("--wait", action="store_true")
 
     p_restore = sub.add_parser("restore", help="restore latest snapshot")
     p_restore.add_argument("--dry-run", action="store_true")
@@ -341,15 +788,20 @@ def main():
 
     sub.add_parser("status", help="list saved sessions")
 
+    p_mode = sub.add_parser("mode", help="get or set autosave mode")
+    p_mode.add_argument("mode", nargs="?", choices=("active", "manual"))
+
     args = parser.parse_args()
     if args.command == "save":
-        return cmd_save(args.label)
+        return cmd_save(args.label, teardown=args.teardown, wait=args.wait)
     if args.command == "restore":
         return cmd_restore(dry_run=args.dry_run)
     if args.command == "autosave":
         return cmd_autosave(args.interval)
     if args.command == "status":
         return cmd_status()
+    if args.command == "mode":
+        return cmd_mode(args.mode)
     parser.print_help()
     return 1
 
