@@ -1,0 +1,16 @@
+[Unit]
+Description=Omarchy session periodic save
+# Runs the autosave daemon for the whole graphical session so window moves are
+# captured every few minutes even if the machine is powered off without logout.
+After=graphical-session.target
+PartOf=graphical-session.target
+ConditionEnvironment=WAYLAND_DISPLAY
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/omarchy-sesh autosave
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

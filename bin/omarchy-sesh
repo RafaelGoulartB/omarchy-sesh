@@ -1,0 +1,358 @@
+#!/usr/bin/env python3
+
+import argparse
+import json
+import os
+import shlex
+import sqlite3
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state"))) / "omarchy"
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))) / "omarchy" / "sesh"
+DB_PATH = STATE_DIR / "session.db"
+CONFIG_PATH = CONFIG_DIR / "config.json"
+LOG_PATH = STATE_DIR / "log" / "omarchy-sesh.log"
+
+DEFAULT_CONFIG = {
+    "exclude_classes": [
+        "polkit-gnome-authentication-agent-1",
+        "xdg-desktop-portal",
+        "org.freedesktop.impl.portal.Polkit",
+    ],
+    "autosave_seconds": 60,
+}
+
+DEFAULT_EXCLUDE = set(DEFAULT_CONFIG["exclude_classes"])
+
+
+def log(msg):
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(LOG_PATH, "a") as f:
+        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+
+
+def hyprctl_json(*args):
+    out = subprocess.run(["hyprctl", "-j", *args], capture_output=True, text=True)
+    if out.returncode != 0:
+        log(f"hyprctl -j {' '.join(args)} failed: {out.stderr.strip()}")
+        return None
+    try:
+        return json.loads(out.stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+def dispatch(lua):
+    out = subprocess.run(["hyprctl", "dispatch", lua], capture_output=True, text=True)
+    if out.returncode != 0:
+        log(f"dispatch failed ({lua}): {out.stderr.strip()}")
+        return False
+    return "error" not in out.stderr
+
+
+def load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    if CONFIG_PATH.exists():
+        try:
+            cfg.update(json.loads(CONFIG_PATH.read_text()))
+        except (json.JSONDecodeError, OSError):
+            pass
+    return cfg
+
+
+def db_conn():
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS sessions (
+            id INTEGER PRIMARY KEY,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            label TEXT
+        );
+        CREATE TABLE IF NOT EXISTS windows (
+            id INTEGER PRIMARY KEY,
+            session INTEGER NOT NULL,
+            ord INTEGER NOT NULL,
+            class TEXT NOT NULL,
+            initial_class TEXT,
+            title TEXT,
+            initial_title TEXT,
+            cmdline TEXT NOT NULL,
+            cwd TEXT,
+            workspace_id INTEGER,
+            workspace_name TEXT,
+            monitor_name TEXT,
+            at_x INTEGER, at_y INTEGER,
+            size_w INTEGER, size_h INTEGER,
+            floating INTEGER NOT NULL DEFAULT 0,
+            fullscreen INTEGER NOT NULL DEFAULT 0,
+            pinned INTEGER NOT NULL DEFAULT 0,
+            xwayland INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY (session) REFERENCES sessions(id)
+        );
+        """
+    )
+    return conn
+
+
+def read_proc(pid):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            argv = [a.decode(errors="replace") for a in f.read().split(b"\0") if a]
+        cmdline = shlex.join(argv) if argv else ""
+        cwd = os.readlink(f"/proc/{pid}/cwd")
+    except (OSError, FileNotFoundError):
+        return "", ""
+    return cmdline, cwd
+
+
+def cmd_save(label="manual"):
+    clients = hyprctl_json("clients")
+    monitors = hyprctl_json("monitors")
+    if clients is None or monitors is None:
+        return 1
+    cfg = load_config()
+    exclude = DEFAULT_EXCLUDE | set(cfg.get("exclude_classes", []))
+    monitor_by_id = {m["id"]: m["name"] for m in monitors}
+    rows = []
+    for w in clients:
+        if not w.get("mapped"):
+            continue
+        cls = w.get("class", "")
+        if cls in exclude or not cls:
+            continue
+        cmdline, cwd = read_proc(w.get("pid", 0))
+        if not cmdline:
+            continue
+        ws = w.get("workspace") or {}
+        at = w.get("at") or []
+        size = w.get("size") or []
+        rows.append(
+            {
+                "class": cls,
+                "initial_class": w.get("initialClass", cls),
+                "title": w.get("title", ""),
+                "initial_title": w.get("initialTitle", ""),
+                "cmdline": cmdline,
+                "cwd": cwd,
+                "workspace_id": ws.get("id"),
+                "workspace_name": ws.get("name"),
+                "monitor_name": monitor_by_id.get(w.get("monitor")),
+                "at_x": at[0] if len(at) > 0 else None,
+                "at_y": at[1] if len(at) > 1 else None,
+                "size_w": size[0] if len(size) > 0 else None,
+                "size_h": size[1] if len(size) > 1 else None,
+                "floating": 1 if w.get("floating") else 0,
+                "fullscreen": w.get("fullscreen", 0),
+                "pinned": 1 if w.get("pinned") else 0,
+                "xwayland": 1 if w.get("xwayland") else 0,
+            }
+        )
+    conn = db_conn()
+    with conn:
+        cur = conn.execute("INSERT INTO sessions (label) VALUES (?)", (label,))
+        sid = cur.lastrowid
+        conn.executemany(
+            "INSERT INTO windows (session, ord, class, initial_class, title, initial_title, "
+            "cmdline, cwd, workspace_id, workspace_name, monitor_name, at_x, at_y, size_w, "
+            "size_h, floating, fullscreen, pinned, xwayland) "
+            "VALUES (:session, :ord, :class, :initial_class, :title, :initial_title, "
+            ":cmdline, :cwd, :workspace_id, :workspace_name, :monitor_name, :at_x, :at_y, "
+            ":size_w, :size_h, :floating, :fullscreen, :pinned, :xwayland)",
+            [dict(r, session=sid, ord=i) for i, r in enumerate(rows)],
+        )
+        prune_ids = [
+            r[0]
+            for r in conn.execute(
+                "SELECT id FROM sessions WHERE id NOT IN "
+                "(SELECT id FROM sessions ORDER BY id DESC LIMIT 5)"
+            )
+        ]
+        for pid in prune_ids:
+            conn.execute("DELETE FROM windows WHERE session = ?", (pid,))
+        conn.executemany("DELETE FROM sessions WHERE id = ?", [(p,) for p in prune_ids])
+    conn.close()
+    log(f"save[{label}]: {len(rows)} windows -> session {sid}")
+    print(f"saved {len(rows)} windows (session {sid})")
+    return 0
+
+
+def latest_session(conn):
+    cur = conn.execute("SELECT id, label, created_at FROM sessions ORDER BY id DESC LIMIT 1")
+    row = cur.fetchone()
+    return row
+
+
+def load_windows(conn, sid):
+    cur = conn.execute(
+        "SELECT * FROM windows WHERE session = ? ORDER BY ord", (sid,)
+    )
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+def double_restore_guard(rows):
+    clients = hyprctl_json("clients")
+    if clients is None:
+        return False
+    mapped = [c for c in clients if c.get("mapped")]
+    saved_classes = {r["class"] for r in rows}
+    present_classes = {c.get("class", "") for c in mapped}
+    overlap = len(saved_classes & present_classes)
+    if len(mapped) >= len(rows) and len(saved_classes) > 0 and overlap >= 0.8 * len(saved_classes):
+        return True
+    return False
+
+
+def wait_for_new_window(known_addresses, cls, initial_title, workspace_id, timeout=8.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        clients = hyprctl_json("clients")
+        if clients:
+            for c in clients:
+                if c.get("address") in known_addresses:
+                    continue
+                if not c.get("mapped"):
+                    continue
+                if c.get("class") == cls or c.get("initialClass") == cls:
+                    return c.get("address")
+        time.sleep(0.2)
+    return None
+
+
+def place_window(w, address):
+    if not address:
+        return
+    win = f"address:{address}"
+    if w.get("floating"):
+        dispatch(f'hl.dsp.window.float({{ action = "on", window = "{win}" }})')
+    if w.get("size_w") is not None and w.get("size_h") is not None:
+        dispatch(
+            f"hl.dsp.window.resize({{ x = {w['size_w']}, y = {w['size_h']}, window = \"{win}\" }})"
+        )
+    if w.get("at_x") is not None and w.get("at_y") is not None:
+        dispatch(f"hl.dsp.window.move({{ x = {w['at_x']}, y = {w['at_y']}, window = \"{win}\" }})")
+    if w.get("fullscreen"):
+        fs = w["fullscreen"]
+        dispatch(
+            f"hl.dsp.window.fullscreen_state({{ internal = {fs}, client = {fs}, window = \"{win}\" }})"
+        )
+    if w.get("pinned"):
+        dispatch(f"hl.dsp.window.pin({{ window = \"{win}\" }})")
+
+
+def cmd_restore(dry_run=False):
+    conn = db_conn()
+    sess = latest_session(conn)
+    if sess is None:
+        print("no saved session to restore")
+        conn.close()
+        return 0
+    sid, label, created = sess
+    rows = load_windows(conn, sid)
+    conn.close()
+    if not rows:
+        print("saved session is empty")
+        return 0
+    if double_restore_guard(rows):
+        print(f"restore aborted: session already appears restored ({len(rows)} windows)")
+        return 0
+
+    clients = hyprctl_json("clients") or []
+    known_addresses = {c.get("address") for c in clients}
+    present_classes = {c.get("class", "") for c in clients if c.get("mapped")}
+    cfg = load_config()
+
+    launched = 0
+    for w in rows:
+        cls = w["class"]
+        if cls in present_classes:
+            continue
+        present_classes.add(cls)
+        launch_cmd = w["cmdline"]
+        if w.get("cwd"):
+            launch_cmd = f"cd {shlex.quote(w['cwd'])} && {launch_cmd}"
+        ws = w.get("workspace_id")
+        rules = []
+        if ws is not None:
+            rules.append(f'workspace = "{ws} silent"')
+        if w.get("floating"):
+            rules.append("float = true")
+        rules_str = ", ".join(rules)
+        lua = f'hl.dsp.exec_cmd({shlex.quote(launch_cmd)}, {{ {rules_str} }})'
+        if dry_run:
+            print(f"[dry-run] {cls}: {launch_cmd}  rules={{ {rules_str} }}")
+            launched += 1
+            continue
+        if not dispatch(lua):
+            continue
+        address = wait_for_new_window(
+            known_addresses, cls, w.get("initial_title"), w.get("workspace_id")
+        )
+        if address:
+            known_addresses.add(address)
+            place_window(w, address)
+            launched += 1
+        else:
+            log(f"restore: no window appeared for {cls} ({launch_cmd})")
+
+    print(f"restored {launched} windows")
+    log(f"restore: launched {launched}/{len(rows)} windows")
+    return 0
+
+
+def cmd_autosave(interval=None):
+    cfg = load_config()
+    interval = interval or cfg.get("autosave_seconds", 60)
+    while True:
+        try:
+            cmd_save("periodic")
+        except Exception as e:
+            log(f"autosave error: {e}")
+        time.sleep(interval)
+
+
+def cmd_status():
+    conn = db_conn()
+    for sid, label, created in conn.execute(
+        "SELECT id, label, created_at FROM sessions ORDER BY id DESC LIMIT 5"
+    ):
+        n = conn.execute("SELECT COUNT(*) FROM windows WHERE session = ?", (sid,)).fetchone()[0]
+        print(f"session {sid} [{label}] {created}: {n} windows")
+    conn.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="omarchy-sesh")
+    sub = parser.add_subparsers(dest="command")
+
+    p_save = sub.add_parser("save", help="snapshot current windows")
+    p_save.add_argument("--label", default="manual")
+
+    p_restore = sub.add_parser("restore", help="restore latest snapshot")
+    p_restore.add_argument("--dry-run", action="store_true")
+
+    p_auto = sub.add_parser("autosave", help="periodically save")
+    p_auto.add_argument("--interval", type=int, default=None)
+
+    sub.add_parser("status", help="list saved sessions")
+
+    args = parser.parse_args()
+    if args.command == "save":
+        return cmd_save(args.label)
+    if args.command == "restore":
+        return cmd_restore(dry_run=args.dry_run)
+    if args.command == "autosave":
+        return cmd_autosave(args.interval)
+    if args.command == "status":
+        return cmd_status()
+    parser.print_help()
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
