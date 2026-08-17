@@ -17,18 +17,14 @@ application-owned. See `docs/session-restore-spec.md`.
 ## Install
 
 ```sh
-./bin/omarchy-sesh --help        # sanity check
-install -m 755 bin/omarchy-sesh ~/.local/bin/omarchy-sesh
-cp systemd/user/omarchy-sesh.service systemd/user/omarchy-sesh-autosave.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now omarchy-sesh.service omarchy-sesh-autosave.service
+./install.sh
 ```
 
-Then add the restore hook to `~/.config/hypr/autostart.lua`:
+Installs (user-level, no sudo needed) and is idempotent:
 
-```lua
-hl.exec_cmd("sleep 2 && omarchy-sesh restore")
-```
+- binary → `~/.local/bin/omarchy-sesh`
+- both systemd user units → `~/.config/systemd/user/` (enable + start)
+- restore hook appended to `~/.config/hypr/autostart.lua` (skipped if already present)
 
 `omarchy-sesh.service` restores on `graphical-session.target` and saves on
 teardown (`ExecStop`); the autostart hook is a second restore trigger — the
@@ -64,4 +60,10 @@ Config (optional): `~/.config/omarchy/sesh/config.json`
 Removes every trace: the `~/.local/bin/omarchy-sesh` binary, both systemd user
 units and their enablement, the Hyprland autostart hook line, the session DB,
 config, and logs. Idempotent and safe to rerun.
+
+## Development roadmap
+
+See `tasks/next-steps.md` for the full roadmap: reboot acceptance test,
+workspace→monitor remap, `stableId` matching, toggle, config surface, and a
+system-level `/usr/bin` install variant.
 # omarchy-sesh

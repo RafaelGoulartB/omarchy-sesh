@@ -19,8 +19,11 @@
 
 - [x] Prototype `omarchy-sesh save`/`restore` script per spec (bin/omarchy-sesh).
 - [x] Verify Hyprland 0.56 Lua dispatch API live; placement verified end-to-end (resize center-anchored → resize-then-move).
-- [x] Ship systemd unit + autostart snippet.
+- [x] Ship systemd units (restore + autosave) and autostart snippet.
+- [x] Add idempotent `install.sh` / `uninstall.sh` (user-level, no sudo).
 - [ ] Decide save triggers: ExecStop on graphical-session.target vs power-menu wiring.
 - [ ] Workspace→monitor remap on restore (monitor layout changes across reboots).
 - [ ] Test `stableId` stability across compositor restarts as a match key.
 - [ ] Wire into Omarchy provisioning (install/user/first-run/enable-user-units.sh + autostart.lua).
+
+Full roadmap with acceptance criteria: `tasks/next-steps.md`.
