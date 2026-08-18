@@ -16,6 +16,14 @@ tagged prerelease, `alpha`; changes after that tag are listed as unreleased.
   and swaps uniquely identified windows into compatible saved slots.
 - Database schema version 3 migrates existing snapshots to include monitor
   descriptions.
+- Database schema version 4 migrates existing snapshots to store nullable,
+  snapshot-local window group membership and order.
+- Database schema version 5 stores complete workspace layout type and bounds for
+  guarded nested tiled replay; legacy snapshots continue using the fallback.
+- Complete, uniquely matched and unambiguous nested dwindle layouts are rebuilt
+  through staged public Lua dispatches and verified against saved rectangles.
+- Hyprland 0.56+ restores complete, uniquely matched window groups in saved
+  order after placement while preserving unrelated current groups.
 - Regression coverage now includes monitor identity conflicts and fallbacks,
   tiled split sizing and slot correction, Chromium profiles, global matching,
   restore markers, XDG paths, and installer recovery.
@@ -24,6 +32,8 @@ tagged prerelease, `alpha`; changes after that tag are listed as unreleased.
 
 - Window discovery uses ranked one-to-one assignment instead of greedy class
   matching, reducing incorrect matches between similar windows.
+- Hyprland 0.55 remains supported and restores grouped windows independently;
+  direct group reconstruction is capability-gated to 0.56 or newer.
 - Restore dispatches all initially missing process groups before polling and
   places fast windows without waiting for slower applications.
 - Chromium app-mode identity validation accepts supported profile suffix
@@ -46,12 +56,15 @@ tagged prerelease, `alpha`; changes after that tag are listed as unreleased.
 - Existing restore markers no longer bypass live compositor IPC checks.
 - Autosave refreshes the Hyprland instance before every capture and clears
   stale compositor environment values.
+- Synchronous power-action saves close the autosave gate under the operation
+  lock so a periodic capture cannot supersede them during graphical teardown.
 - Empty XDG environment variables no longer create relative state paths, and
   state accidentally written to those paths is migrated.
 - Uninstall removes legacy and dangling artifacts and stops safely when service
   state cannot be verified.
-- Tiled restore skips incomplete, ambiguous, nested, differently oriented, or
-  differently bounded layouts instead of modifying an uncertain split tree.
+- Tiled restore skips incomplete, ambiguous, differently oriented, differently
+  bounded, or unsupported layouts instead of modifying an uncertain split tree,
+  and recovers staged windows if nested replay verification fails.
 
 ## 0.1.0 (alpha) - 2026-08-17
 

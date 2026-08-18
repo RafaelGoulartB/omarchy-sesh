@@ -11,7 +11,7 @@ window back where it was.
 |---|---|
 | App relaunch | Exact — reconstruct launch command from `/proc/<pid>/cmdline` + cwd |
 | Floating window geometry | Exact — Hyprland dispatchers place/resize by pixel |
-| Tiled window placement | Best-effort — complete, uniquely matched two-window splits with the same axis and bounds are arranged and resized toward saved dimensions; compatible multi-window slots receive occupant correction only. The dwindle/master split tree is not exposed via IPC, so missing and nested splits cannot be reconstructed reliably |
+| Tiled window placement | Best-effort — complete, uniquely matched and unambiguous nested dwindle layouts are rebuilt from inferred rectangle splits and verified. Simple two-window sizing and compatible-slot correction remain the fallback. Hyprland still exposes no split-tree import/export API |
 | Workspace assignment | Yes — launch into the saved workspace and move the matched window there |
 | Monitor remapping | Yes — connector name, physical description, then deterministic fallback |
 | Window flags (float/fullscreen/pinned) | Yes — `setfloating`, `fullscreenstate`, `pin` |
@@ -108,6 +108,8 @@ CREATE TABLE windows (
     pinned        INTEGER NOT NULL DEFAULT 0,
     xwayland      INTEGER NOT NULL DEFAULT 0,
     pid           INTEGER,                  -- groups windows from one process
+    group_id      INTEGER,                  -- snapshot-local Hyprland group
+    group_ord     INTEGER,                  -- zero-based saved member order
     FOREIGN KEY (session) REFERENCES sessions(id)
 );
 
@@ -119,7 +121,22 @@ CREATE TABLE sessions (
     capture_error TEXT
 );
 
-PRAGMA user_version = 3;
+CREATE TABLE workspace_layouts (
+    session      INTEGER NOT NULL,
+    workspace_id INTEGER NOT NULL,
+    layout       TEXT,
+    at_x         INTEGER, at_y INTEGER,
+    size_w       INTEGER, size_h INTEGER,
+    work_x       INTEGER, work_y INTEGER,
+    work_w       INTEGER, work_h INTEGER,
+    gap_top      INTEGER, gap_right INTEGER,
+    gap_bottom   INTEGER, gap_left INTEGER,
+    complete     INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (session, workspace_id),
+    FOREIGN KEY (session) REFERENCES sessions(id)
+);
+
+PRAGMA user_version = 5;
 ```
 
 Rules:
@@ -132,10 +149,20 @@ Rules:
 - A window address is never persisted as a lookup key. Saved PIDs group launch
   commands only; restore-time windows are matched one-to-one by class, title,
   initial metadata, and workspace.
+- `clients[].grouped` addresses are translated to nullable snapshot-local
+  `group_id` and `group_ord` values only when every ordered member was captured
+  and every member reports the same group. Incomplete or malformed groups are
+  saved as ordinary ungrouped windows.
+- Workspace layout rows exist only when at least two ordinary tiled windows have
+  complete geometry. They retain client bounds, the logical work area after
+  global outer gaps, and directional inner gaps so inferred ratios account for
+  visible spacing. `complete` requires every mapped, non-fullscreen tiled client
+  on that workspace to be captured. Legacy snapshots and snapshots with
+  workspace-specific rules remain valid but are ineligible for nested replay.
 
 ## 4. Save path (`omarchy-sesh save`)
 
-1. `hyprctl -j clients` → list of mapped windows.
+1. Query `hyprctl -j clients`, `monitors`, and `workspaces`.
 2. For each, read `/proc/<pid>/cmdline` and `/proc/<pid>/cwd` (resolve cwd
    symlink). Skip windows whose cmdline is empty, is `hyprctl`, or is in the
    exclude list.
@@ -143,7 +170,9 @@ Rules:
    monitor connector name and description via `hyprctl -j monitors` (map
    `monitor` id to its monitor record). Retain `at` and `size` for tiled windows
    as slot identity metadata and inputs to guarded post-launch sizing.
-4. `INSERT` into a new session row in one transaction.
+4. Record the tiled layout name, tiled client bounds, and per-workspace capture
+   completeness, then insert the session, window, and workspace-layout rows in
+   one transaction.
 
 Triggers (any one fires a save):
 
@@ -163,10 +192,11 @@ the service retries after two seconds.
    one-to-one and compare class multiplicities for the already-restored guard.
 2. Build saved PID groups in window order and dispatch every missing group
    immediately, without waiting for an earlier application to start. Then poll
-   all outstanding rows together within one shared 20-second deadline, placing
-   each window as soon as it is matched. If one launch does not recreate every
-   saved window, retry that group independently after a short grace period, up
-   to the number of windows initially missing from the group.
+   all outstanding rows together every 50 ms within one shared 20-second
+   deadline, placing each window as soon as it is matched. If one launch does
+   not recreate every saved window, retry that group independently after a
+   short grace period, up to the number of windows initially missing from the
+   group.
    - Chromium app-mode windows reconstruct their URL from strict class metadata
      validated against either the initial title or saved `--app` argument and
      launch each through `omarchy-launch-webapp`, because the base Chromium
@@ -186,21 +216,42 @@ the service retries after two seconds.
       workspace, set floating state, resize before moving floating windows,
       then restore fullscreen and pinned state. Monitor remapping happens first
       so it cannot invalidate restored geometry or pinned state.
-    - After discovery, compare saved and current tiled geometries per workspace.
-      For a complete, uniquely matched two-window split whose saved and current
-      axis and workspace bounds agree, first swap occupants onto the correct
-      sides, refresh geometry, resize one mismatched split anchor, and refresh
-      again. Then swap occupants by address into any exact compatible saved
-      slots, including compatible multi-window layouts. Skip inferred sizing
-      for missing, extra, fullscreen, ambiguous, differently oriented,
-      differently bounded, or nested layouts rather than altering an uncertain
-      split tree. A required refresh failure is retryable.
-3. Correct tiled sizing and slot occupants only after monitor remapping and
-   window placement complete. The sizing pass can recover simple split ratios
-   but cannot recreate Hyprland's unexposed split tree. If a missing display
-   falls back to a monitor with a different origin, scale, or dimensions, saved
-   floating coordinates may not fit the replacement display and remain
-   best-effort.
+    - After discovery, infer a binary guillotine split tree from each saved
+      workspace's tiled rectangles. Nested replay requires schema-v5 metadata,
+      the saved and current dwindle layout, `use_active_for_splits` and
+      `preserve_split`, disabled `permanent_direction_override`, complete
+      bidirectionally unique matching, no unrelated or currently grouped tiled
+      occupants, unchanged logical work-area dimensions, no saved
+      groups/fullscreen/pinned members, no workspace-specific rules, at most 16
+      leaves, and exactly one recursive decomposition.
+    - Keep one seed leaf on the target workspace so its monitor assignment and
+      lifetime remain stable. In one Lua evaluation, move the other leaves to a
+      collision-resistant named staging workspace, focus each insertion leaf,
+      preselect right or down, reinsert the corresponding child, set its
+      immediate parent ratio, and restore the previously focused window or empty
+      workspace. Every mutation dispatch result is asserted; final focus is
+      separately restored and verified, including active special workspaces.
+      Query clients afterward and require every work-area-relative rectangle to
+      match within rounding tolerance. Recover staged leaves to the target
+      workspace after a failed mutation; IPC loss remains retryable.
+    - For ineligible workspaces, retain the existing guarded two-window sizing
+      and exact compatible-slot swaps. A monitor-origin change alone does not
+      prevent either path.
+3. Rebuild or correct tiled layouts only after monitor remapping and ordinary
+   placement complete. Equivalent but geometrically ambiguous trees, master and
+   other layouts, changed workspace dimensions, incomplete snapshots, and
+   grouped tiled leaves retain fallback behavior. If a missing display falls
+   back to a monitor with different dimensions, saved floating coordinates may
+   not fit and remain best-effort.
+4. On Hyprland 0.56+, re-form each complete, uniquely matched saved group after
+   tiled correction. Require every member to be currently ungrouped, create the
+   group through the public Lua API, append members in saved order, select the
+   first saved member, and verify the ordered address list from a fresh clients
+   query. Skip partial or ambiguous groups, unrelated current groups,
+   inconsistent placement, and groups containing fullscreen or pinned windows.
+   Hyprland 0.55 keeps ordinary window restoration and skips group formation.
+   IPC loss is retryable; a requested mutation or verification failure is an
+   application failure.
 
 Restore failures return nonzero so systemd can retry startup IPC failures. Log
 details to `${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/log/omarchy-sesh.log`.
@@ -237,8 +288,12 @@ All confirmed against the installed Omarchy defaults.
 
 3. **Power-menu / logout wiring** — marker-delimited user menu overrides save
    synchronously, then invoke `omarchy-system-logout`, `omarchy-system-reboot`,
-   or `omarchy-system-shutdown`. Direct power commands bypass these overrides
-   and rely on the latest periodic snapshot.
+   or `omarchy-system-shutdown`. The save closes the current compositor's
+   autosave gate while holding the operation lock and before querying Hyprland;
+   periodic saves recheck that gate after acquiring the same lock. This ordering
+   prevents a timer firing during teardown from superseding the power snapshot.
+   Direct power commands bypass these overrides and rely on the latest periodic
+   snapshot.
 
 4. **Hook mechanism** — Omarchy has no pre-logout hook. Do not add another
    startup hook because that recreates the duplicate-restore race.
@@ -260,9 +315,10 @@ All confirmed against the installed Omarchy defaults.
   collision-free long strings.
 - `autosave [--interval N]` — periodic save loop (crash cover). It refreshes
   the current Hyprland instance from the systemd user manager before each
-  capture so a startup restore retry cannot leave it on a stale compositor.
-  Failed restore markers keep autosave gated until restore succeeds or the user
-  explicitly establishes a new baseline through manual/Active mode.
+  capture so a startup restore retry cannot leave it on a stale compositor, and
+  rechecks the completion gate under the operation lock. Failed restore and
+  synchronous shutdown markers keep autosave gated until restore succeeds or
+  the user explicitly establishes a new baseline through manual/Active mode.
 - `status` — lists recent sessions.
 
 Verified end-to-end: save → close app → `restore` relaunched Nautilus and
@@ -275,22 +331,35 @@ automatically relaunched in a loop. Autosave waits one interval and remains
 gated while startup restore is retryable. Saves retain the latest five complete
 and five diagnostic snapshots.
 
-Not yet implemented: tab-group re-formation and `stableId` matching.
+Window group membership and order are implemented for Hyprland 0.56+, pending
+controlled live acceptance. Active-tab and lock/deny state are not restored
+because clients JSON does not expose reliable saved values. `stableId` matching
+was investigated and rejected because the value does not survive window
+recreation or a Hyprland restart.
 
-## 7. Open decisions
+Schema-v5 nested dwindle replay is implemented with pure geometry inference,
+staged public-dispatch reconstruction, focus restoration, and final rectangle
+verification. Controlled reboot acceptance remains pending; legacy snapshots
+use the existing tiled fallback until a new capture stores workspace metadata.
+
+## 7. Decisions And Open Questions
 
 - **Language:** bash + `sqlite3` CLI (matches Omarchy script style) vs a
   single python3 script with stdlib `sqlite3`/`json` (cleaner JSON + SQL,
   still zero deps). Recommend python3 for parse robustness; bash wrapper for
   the omarchy-* command surface.
-- **`stableId`:** Hyprland 0.56 clients expose `stableId`. Whether it is
-  stable across compositor restarts (vs. per-run `address`) is unverified —
-  worth testing as a more robust restore-time match key than class+title.
+- **`stableId`:** Hyprland clients expose `stableId`, but upstream commit
+  [`68456a5`](https://github.com/hyprwm/Hyprland/commit/68456a5d9a54f34b70a8261153dc7d35c17f2bf0)
+  generates it from a process-static counter for each new Wayland or XWayland
+  window object. It changes on window recreation and the counter resets with
+  Hyprland, so it is useful only as a live selector and must not outrank
+  class/title matching for reboot restoration.
 - **Manual vs automatic restore:** default restore on every login, with a
   "don't restore" toggle (`${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/toggles/…`, matching
   omarchy-crash-watch's toggle pattern).
-- **Groups (tab groups):** `grouped` is saved but re-forming groups is not
-  spec'd; first version restores members without grouping.
+- **Groups (tab groups):** membership and order are restored only for complete,
+  uniquely identified groups. Active-tab and lock/deny capture remain open only
+  if Hyprland exposes stable public state for them.
 
 ## 8. Verification plan
 

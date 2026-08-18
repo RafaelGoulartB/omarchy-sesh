@@ -50,6 +50,8 @@ def window(row_id, ord_, cls, pid, title="", initial_title=""):
         "pinned": 0,
         "xwayland": 0,
         "pid": pid,
+        "group_id": None,
+        "group_ord": None,
     }
 
 
@@ -69,6 +71,75 @@ def tiled_client(row, address, at, size):
     }
 
 
+def group_client(row, address, grouped):
+    return {
+        "mapped": True,
+        "address": address,
+        "class": row["class"],
+        "initialClass": row["initial_class"],
+        "title": row["title"],
+        "initialTitle": row["initial_title"],
+        "workspace": {"id": row["workspace_id"]},
+        "grouped": grouped,
+    }
+
+
+def workspace_layout(workspace_id=1, width=1000, height=1000, complete=1):
+    return {
+        "workspace_id": workspace_id,
+        "layout": "dwindle",
+        "at_x": 0,
+        "at_y": 0,
+        "size_w": width,
+        "size_h": height,
+        "work_x": 0,
+        "work_y": 0,
+        "work_w": width,
+        "work_h": height,
+        "gap_top": 0,
+        "gap_right": 0,
+        "gap_bottom": 0,
+        "gap_left": 0,
+        "complete": complete,
+    }
+
+
+def live_workspace_context(workspace_id=1, width=1000, height=1000):
+    return (
+        [{"id": workspace_id, "monitor": "DP-1", "tiledLayout": "dwindle"}],
+        [
+            {
+                "id": 0,
+                "name": "DP-1",
+                "x": 0,
+                "y": 0,
+                "width": width,
+                "height": height,
+                "scale": 1,
+                "transform": 0,
+                "reserved": [0, 0, 0, 0],
+            }
+        ],
+    )
+
+
+def layout_ipc_response(workspaces, monitors, clients=None, rules=None):
+    def response(endpoint, *_args):
+        if endpoint == "workspaces":
+            return workspaces
+        if endpoint == "monitors":
+            return monitors
+        if endpoint == "getoption":
+            return {"css": "0 0 0 0"}
+        if endpoint == "workspacerules":
+            return rules or []
+        if endpoint == "clients":
+            return clients
+        raise AssertionError(f"unexpected endpoint: {endpoint}")
+
+    return response
+
+
 class OmarchySeshTests(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
@@ -83,6 +154,26 @@ class OmarchySeshTests(unittest.TestCase):
         self.assertTrue(quoted.startswith("[==["))
         self.assertTrue(quoted.endswith("]==]"))
         self.assertIn(value, quoted)
+
+    def test_eval_lua_requires_exact_ok_response(self):
+        result = mock.Mock(returncode=0, stdout="eval unavailable\n", stderr="")
+        with (
+            mock.patch.object(self.module.subprocess, "run", return_value=result),
+            mock.patch.object(self.module, "log"),
+        ):
+            self.assertFalse(self.module.eval_lua("return true"))
+
+        result.stdout = "ok\n"
+        with mock.patch.object(self.module.subprocess, "run", return_value=result):
+            self.assertTrue(self.module.eval_lua("return true"))
+
+        result.returncode = 1
+        result.stdout = ""
+        with (
+            mock.patch.object(self.module.subprocess, "run", return_value=result),
+            mock.patch.object(self.module, "log"),
+        ):
+            self.assertIsNone(self.module.eval_lua("return true"))
 
     def test_migration_marks_historical_empty_session_unknown(self):
         self.module.STATE_DIR.mkdir(parents=True)
@@ -104,6 +195,11 @@ class OmarchySeshTests(unittest.TestCase):
                 xwayland INTEGER NOT NULL DEFAULT 0
             );
             INSERT INTO sessions (id, label) VALUES (1, 'legacy');
+            INSERT INTO sessions (id, label) VALUES (2, 'populated');
+            INSERT INTO windows (
+                id, session, ord, class, cmdline, floating, fullscreen, pinned,
+                xwayland
+            ) VALUES (1, 2, 0, 'terminal', '/usr/bin/terminal', 0, 0, 0, 0);
             """
         )
         conn.close()
@@ -113,13 +209,26 @@ class OmarchySeshTests(unittest.TestCase):
             "SELECT capture_status FROM sessions WHERE id = 1"
         ).fetchone()[0]
         columns = {row[1] for row in conn.execute("PRAGMA table_info(windows)")}
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
         version = conn.execute("PRAGMA user_version").fetchone()[0]
+        migrated = conn.execute(
+            "SELECT class, group_id, group_ord FROM windows WHERE id = 1"
+        ).fetchone()
         conn.close()
 
         self.assertEqual("legacy_unknown", status)
         self.assertIn("pid", columns)
         self.assertIn("monitor_description", columns)
-        self.assertEqual(3, version)
+        self.assertIn("group_id", columns)
+        self.assertIn("group_ord", columns)
+        self.assertIn("workspace_layouts", tables)
+        self.assertEqual(5, version)
+        self.assertEqual(("terminal", None, None), migrated)
 
     def test_empty_xdg_paths_migrate_relative_state_and_config(self):
         legacy = Path(self.tempdir.name) / "legacy" / "omarchy"
@@ -182,12 +291,102 @@ class OmarchySeshTests(unittest.TestCase):
 
         self.assertEqual(complete_id, session[0])
 
+    def test_group_metadata_persists_round_trip(self):
+        row = window(1, 0, "terminal", 10)
+        row.update(group_id=1, group_ord=0)
+        sid = self.module.persist_snapshot("periodic", "complete", "", [row])
+        conn = self.module.db_conn()
+        loaded = self.module.load_windows(conn, sid)
+        conn.close()
+        self.assertEqual((1, 0), (loaded[0]["group_id"], loaded[0]["group_ord"]))
+
+    def test_workspace_layout_metadata_persists_round_trip(self):
+        layout = workspace_layout()
+        sid = self.module.persist_snapshot(
+            "periodic", "complete", "", [window(1, 0, "terminal", 10)], [layout]
+        )
+        conn = self.module.db_conn()
+        loaded = self.module.load_workspace_layouts(conn, sid)
+        conn.close()
+        self.assertEqual(layout, loaded[1])
+
+    def test_pruning_removes_workspace_layout_metadata(self):
+        session_ids = []
+        for index in range(6):
+            session_ids.append(
+                self.module.persist_snapshot(
+                    "periodic",
+                    "complete",
+                    "",
+                    [window(index + 1, 0, f"app-{index}", index)],
+                    [workspace_layout()],
+                )
+            )
+        conn = self.module.db_conn()
+        retained = {
+            row[0]
+            for row in conn.execute("SELECT session FROM workspace_layouts")
+        }
+        conn.close()
+        self.assertNotIn(session_ids[0], retained)
+        self.assertEqual(set(session_ids[1:]), retained)
+
     def test_manual_snapshot_opens_autosave_gate(self):
         with mock.patch.dict(os.environ, {"HYPRLAND_INSTANCE_SIGNATURE": "instance-1"}):
             self.assertEqual(
                 0, self.module._save_clients("manual", [], [], "complete", [])
             )
             self.assertTrue(self.module.restore_is_ready())
+
+    def test_logout_save_closes_autosave_gate_before_capture(self):
+        responses = {
+            "clients": [],
+            "monitors": [],
+            "workspaces": [],
+            "getoption": {"css": "0"},
+            "workspacerules": [],
+        }
+        with (
+            mock.patch.dict(
+                os.environ, {"HYPRLAND_INSTANCE_SIGNATURE": "instance-1"}
+            ),
+            mock.patch.object(
+                self.module,
+                "hyprctl_json",
+                side_effect=lambda endpoint, *_: responses[endpoint],
+            ),
+        ):
+            self.module.mark_restore_completed(7)
+            self.assertEqual(0, self.module.cmd_save("logout"))
+            self.assertFalse(self.module.restore_is_ready())
+
+    def test_logout_save_requires_autosave_gate(self):
+        lock_file = mock.Mock()
+        with (
+            mock.patch.object(
+                self.module, "acquire_operation_lock", return_value=lock_file
+            ),
+            mock.patch.object(
+                self.module, "mark_restore_completed", return_value=False
+            ),
+            mock.patch.object(self.module, "hyprctl_json") as hyprctl,
+        ):
+            self.assertEqual(75, self.module.cmd_save("logout"))
+        hyprctl.assert_not_called()
+        lock_file.close.assert_called_once_with()
+
+    def test_periodic_save_rechecks_autosave_gate_under_lock(self):
+        lock_file = mock.Mock()
+        with (
+            mock.patch.object(
+                self.module, "acquire_operation_lock", return_value=lock_file
+            ),
+            mock.patch.object(self.module, "restore_is_ready", return_value=False),
+            mock.patch.object(self.module, "hyprctl_json") as hyprctl,
+        ):
+            self.assertEqual(75, self.module.cmd_save("periodic"))
+        hyprctl.assert_not_called()
+        lock_file.close.assert_called_once_with()
 
     def test_save_captures_tiled_geometry_as_slot_metadata(self):
         client = {
@@ -218,9 +417,25 @@ class OmarchySeshTests(unittest.TestCase):
                 self.module._save_clients(
                     "periodic",
                     [client],
-                    [{"id": 0, "name": "DP-1", "description": "Dell Display"}],
+                    [
+                        {
+                            "id": 0,
+                            "name": "DP-1",
+                            "description": "Dell Display",
+                            "x": 0,
+                            "y": 0,
+                            "width": 1000,
+                            "height": 1000,
+                            "scale": 1,
+                            "transform": 0,
+                            "reserved": [0, 0, 0, 0],
+                        }
+                    ],
                     "complete",
                     [],
+                    workspaces=[{"id": 1, "tiledLayout": "dwindle"}],
+                    gaps_out=[0, 0, 0, 0],
+                    gaps_in=[0, 0, 0, 0],
                 ),
             )
 
@@ -233,6 +448,141 @@ class OmarchySeshTests(unittest.TestCase):
             ("DP-1", "Dell Display"),
             (saved["monitor_name"], saved["monitor_description"]),
         )
+
+    def test_save_captures_complete_nested_workspace_metadata(self):
+        clients = []
+        geometries = ((0, 0, 300, 1000), (300, 0, 700, 500), (300, 500, 700, 500))
+        for index, geometry in enumerate(geometries, start=1):
+            clients.append(
+                {
+                    "mapped": True,
+                    "address": f"0x{index}",
+                    "class": f"app-{index}",
+                    "pid": index,
+                    "workspace": {"id": 1, "name": "1"},
+                    "monitor": 0,
+                    "at": list(geometry[:2]),
+                    "size": list(geometry[2:]),
+                    "floating": False,
+                }
+            )
+        with (
+            mock.patch.object(
+                self.module, "read_proc", return_value=("/usr/bin/example", "/tmp", "")
+            ),
+            mock.patch.object(
+                self.module, "persist_snapshot", return_value=7
+            ) as persist,
+            mock.patch.object(self.module, "log"),
+        ):
+            self.assertEqual(
+                0,
+                self.module._save_clients(
+                    "periodic",
+                    clients,
+                    [
+                        dict(
+                            live_workspace_context()[1][0],
+                            description="Dell Display",
+                        )
+                    ],
+                    "complete",
+                    [],
+                    workspaces=[{"id": 1, "tiledLayout": "dwindle"}],
+                    gaps_out=[0, 0, 0, 0],
+                    gaps_in=[0, 0, 0, 0],
+                ),
+            )
+
+        self.assertEqual([workspace_layout()], persist.call_args.args[4])
+
+    def test_workspace_layout_is_incomplete_when_tiled_client_is_not_captured(self):
+        clients = [
+            {
+                "mapped": True,
+                "address": "0xa",
+                "workspace": {"id": 1},
+                "monitor": 0,
+                "floating": False,
+            },
+            {
+                "mapped": True,
+                "address": "0xb",
+                "workspace": {"id": 1},
+                "monitor": 0,
+                "floating": False,
+            },
+            {
+                "mapped": True,
+                "address": "0xexcluded",
+                "workspace": {"id": 1},
+                "monitor": 0,
+                "floating": False,
+            },
+        ]
+        first = window(1, 0, "first", 10)
+        second = window(2, 1, "second", 20)
+        first.update(at_x=0, at_y=0, size_w=500, size_h=1000)
+        second.update(at_x=500, at_y=0, size_w=500, size_h=1000)
+        layouts = self.module.captured_workspace_layouts(
+            clients,
+            [(first, "0xa", []), (second, "0xb", [])],
+            live_workspace_context()[1],
+            [{"id": 1, "tiledLayout": "dwindle"}],
+            [0, 0, 0, 0],
+            [0, 0, 0, 0],
+        )
+        self.assertEqual(0, layouts[0]["complete"])
+
+    def test_save_captures_complete_group_membership_and_order(self):
+        clients = []
+        for address, title in (("0xa", "A"), ("0xb", "B")):
+            clients.append(
+                {
+                    "mapped": True,
+                    "address": address,
+                    "class": "terminal",
+                    "initialClass": "terminal",
+                    "title": title,
+                    "initialTitle": title,
+                    "pid": 10,
+                    "workspace": {"id": 1, "name": "1"},
+                    "monitor": 0,
+                    "at": [0, 0],
+                    "size": [1000, 1000],
+                    "floating": False,
+                    "grouped": ["0xb", "0xa"],
+                }
+            )
+        with (
+            mock.patch.object(
+                self.module, "read_proc", return_value=("/usr/bin/terminal", "/tmp", "")
+            ),
+            mock.patch.object(
+                self.module, "persist_snapshot", return_value=7
+            ) as persist,
+            mock.patch.object(self.module, "log"),
+        ):
+            self.assertEqual(
+                0,
+                self.module._save_clients(
+                    "periodic",
+                    clients,
+                    [{"id": 0, "name": "DP-1", "description": "Dell Display"}],
+                    "complete",
+                    [],
+                ),
+            )
+
+        saved = persist.call_args.args[3]
+        self.assertEqual([(1, 1), (1, 0)], [(r["group_id"], r["group_ord"]) for r in saved])
+
+    def test_save_drops_incomplete_group_metadata(self):
+        first = {"class": "terminal"}
+        self.module.assign_snapshot_groups(
+            [(first, "0xa", ["0xa", "0xb"])]
+        )
+        self.assertEqual((None, None), (first["group_id"], first["group_ord"]))
 
     def test_process_groups_share_pid_but_not_class(self):
         rows = [
@@ -719,6 +1069,332 @@ class OmarchySeshTests(unittest.TestCase):
         }
         self.assertEqual({1: "0x1"}, self.module.match_windows([row], [client]))
 
+    def test_window_group_restore_preserves_saved_order(self):
+        first = window(1, 0, "terminal", 10, title="First")
+        second = window(2, 1, "terminal", 20, title="Second")
+        third = window(3, 2, "terminal", 30, title="Third")
+        first.update(group_id=1, group_ord=0)
+        second.update(group_id=1, group_ord=1)
+        third.update(group_id=1, group_ord=2)
+        before = [
+            group_client(first, "0xa", []),
+            group_client(second, "0xb", []),
+            group_client(third, "0xc", []),
+        ]
+        after = [
+            group_client(first, "0xa", ["0xa", "0xb", "0xc"]),
+            group_client(second, "0xb", ["0xa", "0xb", "0xc"]),
+            group_client(third, "0xc", ["0xa", "0xb", "0xc"]),
+        ]
+        with (
+            mock.patch.object(
+                self.module,
+                "hyprctl_json",
+                side_effect=[{"version": "0.56.2"}, before, after],
+            ),
+            mock.patch.object(self.module, "eval_lua", return_value=True) as evaluate,
+            mock.patch.object(self.module, "log"),
+        ):
+            self.assertTrue(
+                self.module.restore_window_groups(
+                    [first, second, third], {1: "0xa", 2: "0xb", 3: "0xc"}
+                )
+            )
+
+        lua = evaluate.call_args.args[0]
+        self.assertIn("hl.dsp.group.toggle", lua)
+        self.assertIn("g:add(w2, g.size + 1)", lua)
+        self.assertIn("g:add(w3, g.size + 1)", lua)
+        self.assertIn("hl.dsp.group.active({ index = 1", lua)
+        self.assertIn("g.members[2] == w2", lua)
+        self.assertIn("g.members[3] == w3", lua)
+
+    def test_window_group_restore_is_gated_on_hyprland_056(self):
+        first = window(1, 0, "terminal", 10)
+        second = window(2, 1, "terminal", 20)
+        first.update(group_id=1, group_ord=0)
+        second.update(group_id=1, group_ord=1)
+        with (
+            mock.patch.object(
+                self.module, "hyprctl_json", return_value={"version": "0.55.0"}
+            ) as hyprctl,
+            mock.patch.object(self.module, "eval_lua") as evaluate,
+            mock.patch.object(self.module, "log"),
+        ):
+            self.assertTrue(
+                self.module.restore_window_groups(
+                    [first, second], {1: "0xa", 2: "0xb"}
+                )
+            )
+        hyprctl.assert_called_once_with("version")
+        evaluate.assert_not_called()
+
+    def test_window_group_restore_skips_partial_group(self):
+        first = window(1, 0, "terminal", 10)
+        second = window(2, 1, "terminal", 20)
+        first.update(group_id=1, group_ord=0)
+        second.update(group_id=1, group_ord=1)
+        with (
+            mock.patch.object(self.module, "hyprctl_json") as hyprctl,
+            mock.patch.object(self.module, "eval_lua") as evaluate,
+            mock.patch.object(self.module, "log"),
+        ):
+            self.assertTrue(
+                self.module.restore_window_groups([first, second], {1: "0xa"})
+            )
+        hyprctl.assert_not_called()
+        evaluate.assert_not_called()
+
+    def test_window_group_restore_skips_unrelated_existing_group(self):
+        first = window(1, 0, "terminal", 10, title="First")
+        second = window(2, 1, "terminal", 20, title="Second")
+        first.update(group_id=1, group_ord=0)
+        second.update(group_id=1, group_ord=1)
+        clients = [
+            group_client(first, "0xa", ["0xa", "0xunrelated"]),
+            group_client(second, "0xb", []),
+        ]
+        with (
+            mock.patch.object(
+                self.module,
+                "hyprctl_json",
+                side_effect=[{"version": "0.56.2"}, clients],
+            ),
+            mock.patch.object(self.module, "eval_lua") as evaluate,
+            mock.patch.object(self.module, "log"),
+        ):
+            self.assertTrue(
+                self.module.restore_window_groups(
+                    [first, second], {1: "0xa", 2: "0xb"}
+                )
+            )
+        evaluate.assert_not_called()
+
+    def test_window_group_restore_preserves_complete_existing_group(self):
+        first = window(1, 0, "terminal", 10, title="First")
+        second = window(2, 1, "terminal", 20, title="Second")
+        first.update(group_id=1, group_ord=0)
+        second.update(group_id=1, group_ord=1)
+        clients = [
+            group_client(first, "0xa", ["0xa", "0xb"]),
+            group_client(second, "0xb", ["0xa", "0xb"]),
+        ]
+        with (
+            mock.patch.object(
+                self.module,
+                "hyprctl_json",
+                side_effect=[{"version": "0.56.2"}, clients],
+            ),
+            mock.patch.object(self.module, "eval_lua") as evaluate,
+            mock.patch.object(self.module, "log"),
+        ):
+            self.assertTrue(
+                self.module.restore_window_groups(
+                    [first, second], {1: "0xa", 2: "0xb"}
+                )
+            )
+        evaluate.assert_not_called()
+
+    def test_window_group_restore_skips_fullscreen_group(self):
+        first = window(1, 0, "terminal", 10, title="First")
+        second = window(2, 1, "terminal", 20, title="Second")
+        first.update(group_id=1, group_ord=0, fullscreen=2)
+        second.update(group_id=1, group_ord=1)
+        with (
+            mock.patch.object(self.module, "hyprctl_json") as hyprctl,
+            mock.patch.object(self.module, "eval_lua") as evaluate,
+            mock.patch.object(self.module, "log"),
+        ):
+            self.assertTrue(
+                self.module.restore_window_groups(
+                    [first, second], {1: "0xa", 2: "0xb"}
+                )
+            )
+        hyprctl.assert_not_called()
+        evaluate.assert_not_called()
+
+    def test_window_group_verification_failure_marks_restore_failed(self):
+        first = window(1, 0, "terminal", 10, title="First")
+        second = window(2, 1, "terminal", 20, title="Second")
+        first.update(group_id=1, group_ord=0)
+        second.update(group_id=1, group_ord=1)
+        clients = [group_client(first, "0xa", []), group_client(second, "0xb", [])]
+        with (
+            mock.patch.object(
+                self.module,
+                "hyprctl_json",
+                side_effect=[{"version": "0.56.2"}, clients, clients],
+            ),
+            mock.patch.object(self.module, "eval_lua", return_value=True),
+            mock.patch.object(self.module, "log"),
+        ):
+            self.assertFalse(
+                self.module.restore_window_groups(
+                    [first, second], {1: "0xa", 2: "0xb"}
+                )
+            )
+
+    def test_window_group_restore_skips_ambiguous_members(self):
+        first = window(1, 0, "terminal", 10)
+        second = window(2, 1, "terminal", 20)
+        unrelated = window(3, 2, "terminal", 30)
+        first.update(group_id=1, group_ord=0)
+        second.update(group_id=1, group_ord=1)
+        clients = [
+            group_client(first, "0xa", []),
+            group_client(second, "0xb", []),
+            group_client(unrelated, "0xc", []),
+        ]
+        with (
+            mock.patch.object(
+                self.module,
+                "hyprctl_json",
+                side_effect=[{"version": "0.56.2"}, clients],
+            ),
+            mock.patch.object(self.module, "eval_lua") as evaluate,
+            mock.patch.object(self.module, "log"),
+        ):
+            self.assertTrue(
+                self.module.restore_window_groups(
+                    [first, second, unrelated],
+                    {1: "0xa", 2: "0xb", 3: "0xc"},
+                )
+            )
+        evaluate.assert_not_called()
+
+    def test_window_group_restore_skips_row_with_duplicate_live_matches(self):
+        first = window(1, 0, "terminal", 10, title="First")
+        second = window(2, 1, "terminal", 20, title="Second")
+        first.update(group_id=1, group_ord=0)
+        second.update(group_id=1, group_ord=1)
+        clients = [
+            group_client(first, "0xa", []),
+            group_client(second, "0xb", []),
+            group_client(first, "0xc", []),
+        ]
+        with (
+            mock.patch.object(
+                self.module,
+                "hyprctl_json",
+                side_effect=[{"version": "0.56.2"}, clients],
+            ),
+            mock.patch.object(self.module, "eval_lua") as evaluate,
+            mock.patch.object(self.module, "log"),
+        ):
+            self.assertTrue(
+                self.module.restore_window_groups(
+                    [first, second], {1: "0xa", 2: "0xb"}
+                )
+            )
+        evaluate.assert_not_called()
+
+    def test_window_group_restore_supports_singleton_group(self):
+        row = window(1, 0, "terminal", 10, title="Only")
+        row.update(group_id=1, group_ord=0)
+        before = [group_client(row, "0xa", [])]
+        after = [group_client(row, "0xa", ["0xa"])]
+        with (
+            mock.patch.object(
+                self.module,
+                "hyprctl_json",
+                side_effect=[{"version": "0.56.2"}, before, after],
+            ),
+            mock.patch.object(self.module, "eval_lua", return_value=True) as evaluate,
+            mock.patch.object(self.module, "log"),
+        ):
+            self.assertTrue(self.module.restore_window_groups([row], {1: "0xa"}))
+        lua = evaluate.call_args.args[0]
+        self.assertIn("hl.dsp.group.toggle", lua)
+        self.assertNotIn("hl.dsp.group.active", lua)
+
+    def test_window_group_eval_transport_failure_is_retryable(self):
+        first = window(1, 0, "terminal", 10, title="First")
+        second = window(2, 1, "terminal", 20, title="Second")
+        first.update(group_id=1, group_ord=0)
+        second.update(group_id=1, group_ord=1)
+        clients = [group_client(first, "0xa", []), group_client(second, "0xb", [])]
+        with (
+            mock.patch.object(
+                self.module,
+                "hyprctl_json",
+                side_effect=[{"version": "0.56.2"}, clients],
+            ),
+            mock.patch.object(self.module, "eval_lua", return_value=None),
+            mock.patch.object(self.module, "log"),
+        ):
+            self.assertIsNone(
+                self.module.restore_window_groups(
+                    [first, second], {1: "0xa", 2: "0xb"}
+                )
+            )
+
+    def test_window_group_eval_failure_marks_restore_failed(self):
+        first = window(1, 0, "terminal", 10, title="First")
+        second = window(2, 1, "terminal", 20, title="Second")
+        first.update(group_id=1, group_ord=0)
+        second.update(group_id=1, group_ord=1)
+        clients = [group_client(first, "0xa", []), group_client(second, "0xb", [])]
+        with (
+            mock.patch.object(
+                self.module,
+                "hyprctl_json",
+                side_effect=[{"version": "0.56.2"}, clients],
+            ),
+            mock.patch.object(self.module, "eval_lua", return_value=False),
+            mock.patch.object(self.module, "log"),
+        ):
+            self.assertFalse(
+                self.module.restore_window_groups(
+                    [first, second], {1: "0xa", 2: "0xb"}
+                )
+            )
+
+    def test_window_groups_restore_after_tiled_correction(self):
+        first = window(1, 0, "first", 10)
+        second = window(2, 1, "second", 20)
+        first.update(at_x=0, at_y=0, size_w=500, size_h=1000, group_id=1, group_ord=0)
+        second.update(at_x=0, at_y=0, size_w=500, size_h=1000, group_id=1, group_ord=1)
+        events = []
+        clients = [
+            {"mapped": True, "address": "0xa"},
+            {"mapped": True, "address": "0xb"},
+        ]
+        with (
+            mock.patch.object(
+                self.module,
+                "load_workspace_monitor_context",
+                return_value=({}, {}, False),
+            ),
+            mock.patch.object(
+                self.module, "prepare_workspace_monitor", return_value=True
+            ),
+            mock.patch.object(self.module, "place_window", return_value=True),
+            mock.patch.object(
+                self.module,
+                "restore_tiled_slots",
+                side_effect=lambda *_args: events.append("tiled") or True,
+            ),
+            mock.patch.object(self.module, "hyprctl_json", return_value=clients),
+            mock.patch.object(
+                self.module,
+                "restore_window_groups",
+                side_effect=lambda *_args: events.append("groups") or True,
+            ),
+            mock.patch.object(
+                self.module,
+                "load_focus_context",
+                return_value={"address": "0xa", "workspace_id": 1},
+            ),
+            mock.patch.object(
+                self.module, "restore_focus_context", return_value=True
+            ),
+        ):
+            result = self.module.restore_windows(
+                [first, second], {1: "0xa", 2: "0xb"}, clients
+            )
+        self.assertEqual((2, 0, 0, False), result)
+        self.assertEqual(["tiled", "groups"], events)
+
     def run_restore(
         self,
         rows,
@@ -734,6 +1410,8 @@ class OmarchySeshTests(unittest.TestCase):
         track_monitor=False,
         tiled_matches=None,
         tiled_result=True,
+        group_result=True,
+        sleep_intervals=None,
     ):
         connection = mock.Mock()
         connection.close = mock.Mock()
@@ -780,6 +1458,8 @@ class OmarchySeshTests(unittest.TestCase):
             return place_result
 
         def advance(seconds):
+            if sleep_intervals is not None:
+                sleep_intervals.append(seconds)
             clock[0] += seconds
 
         def run_monitor_prepare(*args):
@@ -810,6 +1490,9 @@ class OmarchySeshTests(unittest.TestCase):
             ),
             mock.patch.object(self.module, "load_windows", return_value=rows),
             mock.patch.object(
+                self.module, "load_workspace_layouts", return_value={}
+            ),
+            mock.patch.object(
                 self.module,
                 "hyprctl_json",
                 side_effect=current_clients,
@@ -838,6 +1521,17 @@ class OmarchySeshTests(unittest.TestCase):
             mock.patch.object(
                 self.module, "restore_tiled_slots", side_effect=run_tiled_restore
             ),
+            mock.patch.object(
+                self.module, "restore_window_groups", return_value=group_result
+            ),
+            mock.patch.object(
+                self.module,
+                "load_focus_context",
+                return_value={"address": "0xfocused", "workspace_id": 1},
+            ),
+            mock.patch.object(
+                self.module, "restore_focus_context", return_value=True
+            ),
         ):
             result = self.module.cmd_restore()
         return result, dispatch, place
@@ -851,14 +1545,21 @@ class OmarchySeshTests(unittest.TestCase):
 
     def test_process_group_relaunches_for_a_still_missing_window(self):
         rows = [window(1, 0, "files", 10), window(2, 1, "files", 10)]
+        sleep_intervals = []
         result, dispatch, place = self.run_restore(
             rows,
             {1: "0x1", 2: "0x2"},
             appearances={1: 1, 2: 2},
+            sleep_intervals=sleep_intervals,
         )
         self.assertEqual(0, result)
         self.assertEqual(2, dispatch.call_count)
         self.assertEqual(2, place.call_count)
+        self.assertTrue(sleep_intervals)
+        self.assertEqual(
+            {self.module.RESTORE_POLL_INTERVAL}, set(sleep_intervals)
+        )
+        self.assertEqual(0.05, self.module.RESTORE_POLL_INTERVAL)
 
     def test_existing_workspace_match_avoids_duplicate_launch(self):
         row = window(1, 0, "terminal", 10, title="Saved")
@@ -914,6 +1615,398 @@ class OmarchySeshTests(unittest.TestCase):
         self.assertEqual(0, result)
         self.assertEqual(1, dispatch.call_count)
         place.assert_called_once()
+
+    def nested_workspace(self):
+        left = window(1, 0, "left", 10)
+        top_right = window(2, 1, "top-right", 20)
+        bottom_right = window(3, 2, "bottom-right", 30)
+        left.update(at_x=0, at_y=0, size_w=300, size_h=1000)
+        top_right.update(at_x=300, at_y=0, size_w=700, size_h=500)
+        bottom_right.update(at_x=300, at_y=500, size_w=700, size_h=500)
+        return [left, top_right, bottom_right]
+
+    def test_split_tree_infers_nested_three_window_layout(self):
+        rows = self.nested_workspace()
+        tree = self.module.infer_split_tree(
+            [(row["id"], self.module.saved_geometry(row)) for row in rows]
+        )
+        self.assertEqual("x", tree[1])
+        self.assertEqual(("leaf", 1), tree[3])
+        self.assertEqual("y", tree[4][1])
+        self.assertEqual(
+            [1, 2, 3],
+            [self.module.split_tree_seed(tree), tree[4][3][1], tree[4][4][1]],
+        )
+
+    def test_split_tree_uses_workarea_to_account_for_gaps(self):
+        items = [
+            (1, (12, 38, 849, 1300)),
+            (2, (875, 38, 1513, 643)),
+            (3, (875, 695, 1513, 643)),
+        ]
+        tree = self.module.infer_split_tree(
+            items, (10, 36, 2380, 1304), (5, 5, 5, 5)
+        )
+        self.assertAlmostEqual((868 - 10) / 2380, tree[2])
+        self.assertAlmostEqual(0.5, tree[4][2])
+
+    def test_split_tree_rejects_ambiguous_grid_and_overlaps(self):
+        grid = [
+            (1, (0, 0, 500, 500)),
+            (2, (500, 0, 500, 500)),
+            (3, (0, 500, 500, 500)),
+            (4, (500, 500, 500, 500)),
+        ]
+        overlapping = [(1, (0, 0, 600, 1000)), (2, (500, 0, 500, 1000))]
+        self.assertIsNone(self.module.infer_split_tree(grid))
+        self.assertIsNone(self.module.infer_split_tree(overlapping))
+        self.assertIsNone(
+            self.module.infer_split_tree(
+                [(index, (index * 250, 0, 250, 1000)) for index in range(4)]
+            )
+        )
+
+    def test_replay_lua_stages_nonseed_and_rebuilds_tree_in_order(self):
+        rows = self.nested_workspace()
+        matches = {1: "0xleft", 2: "0xtop", 3: "0xbottom"}
+        tree = self.module.infer_split_tree(
+            [(row["id"], self.module.saved_geometry(row)) for row in rows]
+        )
+        with mock.patch.object(self.module, "eval_lua", return_value=True) as evaluate:
+            result, addresses = self.module.replay_workspace_tree(
+                1,
+                rows,
+                matches,
+                tree,
+                {"address": "0xfocused", "workspace_id": 2},
+            )
+
+        self.assertTrue(result)
+        self.assertEqual(["0xleft", "0xtop", "0xbottom"], addresses)
+        lua = evaluate.call_args.args[0]
+        self.assertIn("local function run(result)", lua)
+        self.assertIn("local ok,err=pcall", lua)
+        self.assertEqual(2, lua.count("name:omarchy-sesh-stage"))
+        self.assertIn("preselect right", lua)
+        self.assertIn("preselect down", lua)
+        self.assertIn("splitratio 0.6 exact", lua)
+        self.assertIn("splitratio 1 exact", lua)
+        self.assertIn("window = [[address:0xfocused]]", lua)
+
+    def test_nested_replay_restores_observed_layout_and_verifies(self):
+        rows = self.nested_workspace()
+        matches = {1: "0xleft", 2: "0xtop", 3: "0xbottom"}
+        current = [
+            tiled_client(rows[0], "0xleft", [0, 0], [500, 1000]),
+            tiled_client(rows[1], "0xtop", [500, 0], [500, 500]),
+            tiled_client(rows[2], "0xbottom", [500, 500], [500, 500]),
+        ]
+        restored = [
+            tiled_client(rows[0], "0xleft", [0, 0], [300, 1000]),
+            tiled_client(rows[1], "0xtop", [300, 0], [700, 500]),
+            tiled_client(rows[2], "0xbottom", [300, 500], [700, 500]),
+        ]
+        workspaces, monitors = live_workspace_context()
+        focus = {"address": "0xfocused", "workspace_id": 2}
+        with (
+            mock.patch.object(
+                self.module, "nested_replay_supported", return_value=True
+            ),
+            mock.patch.object(
+                self.module,
+                "hyprctl_json",
+                side_effect=layout_ipc_response(workspaces, monitors, restored),
+            ),
+            mock.patch.object(
+                self.module,
+                "replay_workspace_tree",
+                return_value=(True, list(matches.values())),
+            ) as replay,
+        ):
+            self.assertTrue(
+                self.module.restore_nested_tiled_layouts(
+                    rows, matches, current, {1: workspace_layout()}, focus
+                )
+            )
+        replay.assert_called_once()
+
+    def test_nested_replay_skips_incomplete_or_incompatible_workspace(self):
+        rows = self.nested_workspace()
+        matches = {1: "0xleft", 2: "0xtop", 3: "0xbottom"}
+        clients = [
+            tiled_client(rows[0], "0xleft", [0, 0], [500, 1000]),
+            tiled_client(rows[1], "0xtop", [500, 0], [500, 500]),
+            tiled_client(rows[2], "0xbottom", [500, 500], [500, 500]),
+        ]
+        unrelated = tiled_client(window(4, 3, "other", 40), "0xother", [0, 0], [100, 100])
+        unrelated["workspace"] = {"id": 1}
+        workspaces, monitors = live_workspace_context()
+        with (
+            mock.patch.object(
+                self.module,
+                "hyprctl_json",
+                side_effect=layout_ipc_response(workspaces, monitors),
+            ),
+            mock.patch.object(self.module, "replay_workspace_tree") as replay,
+        ):
+            self.assertTrue(
+                self.module.restore_nested_tiled_layouts(
+                    rows,
+                    matches,
+                    clients,
+                    {1: workspace_layout(complete=0)},
+                    {"address": "0xfocused", "workspace_id": 2},
+                )
+            )
+            self.assertTrue(
+                self.module.restore_nested_tiled_layouts(
+                    rows,
+                    matches,
+                    clients,
+                    {1: workspace_layout(width=1200)},
+                    {"address": "0xfocused", "workspace_id": 2},
+                )
+            )
+            self.assertTrue(
+                self.module.restore_nested_tiled_layouts(
+                    rows,
+                    matches,
+                    clients + [unrelated],
+                    {1: workspace_layout()},
+                    {"address": "0xfocused", "workspace_id": 2},
+                )
+            )
+        replay.assert_not_called()
+
+    def test_nested_replay_skips_live_master_layout_and_current_group(self):
+        rows = self.nested_workspace()
+        matches = {1: "0xleft", 2: "0xtop", 3: "0xbottom"}
+        clients = [
+            tiled_client(rows[0], "0xleft", [0, 0], [500, 1000]),
+            tiled_client(rows[1], "0xtop", [500, 0], [500, 500]),
+            tiled_client(rows[2], "0xbottom", [500, 500], [500, 500]),
+        ]
+        workspaces, monitors = live_workspace_context()
+        workspaces[0]["tiledLayout"] = "master"
+        with (
+            mock.patch.object(
+                self.module,
+                "hyprctl_json",
+                side_effect=layout_ipc_response(workspaces, monitors),
+            ),
+            mock.patch.object(self.module, "replay_workspace_tree") as replay,
+        ):
+            self.assertTrue(
+                self.module.restore_nested_tiled_layouts(
+                    rows,
+                    matches,
+                    clients,
+                    {1: workspace_layout()},
+                    {"address": "0xfocused", "workspace_id": 2},
+                )
+            )
+        replay.assert_not_called()
+
+        workspaces[0]["tiledLayout"] = "dwindle"
+        clients[0]["grouped"] = ["0xleft", "0xtop"]
+        with (
+            mock.patch.object(
+                self.module,
+                "hyprctl_json",
+                side_effect=layout_ipc_response(workspaces, monitors),
+            ),
+            mock.patch.object(self.module, "replay_workspace_tree") as replay,
+        ):
+            self.assertTrue(
+                self.module.restore_nested_tiled_layouts(
+                    rows,
+                    matches,
+                    clients,
+                    {1: workspace_layout()},
+                    {"address": "0xfocused", "workspace_id": 2},
+                )
+            )
+        replay.assert_not_called()
+
+    def test_nested_replay_failure_recovers_staged_windows(self):
+        rows = self.nested_workspace()
+        matches = {1: "0xleft", 2: "0xtop", 3: "0xbottom"}
+        clients = [
+            tiled_client(rows[0], "0xleft", [0, 0], [500, 1000]),
+            tiled_client(rows[1], "0xtop", [500, 0], [500, 500]),
+            tiled_client(rows[2], "0xbottom", [500, 500], [500, 500]),
+        ]
+        workspaces, monitors = live_workspace_context()
+        focus = {"address": "0xfocused", "workspace_id": 2}
+        with (
+            mock.patch.object(
+                self.module, "nested_replay_supported", return_value=True
+            ),
+            mock.patch.object(
+                self.module,
+                "hyprctl_json",
+                side_effect=layout_ipc_response(workspaces, monitors, clients),
+            ),
+            mock.patch.object(
+                self.module,
+                "replay_workspace_tree",
+                return_value=(False, list(matches.values())),
+            ),
+            mock.patch.object(
+                self.module, "recover_replay_workspace", return_value=True
+            ) as recover,
+            mock.patch.object(self.module, "log"),
+        ):
+            self.assertFalse(
+                self.module.restore_nested_tiled_layouts(
+                    rows, matches, clients, {1: workspace_layout()}, focus
+                )
+            )
+        recover.assert_called_once_with(
+            1, ["0xleft", "0xtop", "0xbottom"], focus
+        )
+
+    def test_nested_replay_ipc_failure_is_retryable(self):
+        rows = self.nested_workspace()
+        matches = {1: "0xleft", 2: "0xtop", 3: "0xbottom"}
+        clients = [
+            tiled_client(rows[0], "0xleft", [0, 0], [500, 1000]),
+            tiled_client(rows[1], "0xtop", [500, 0], [500, 500]),
+            tiled_client(rows[2], "0xbottom", [500, 500], [500, 500]),
+        ]
+        workspaces, monitors = live_workspace_context()
+        with (
+            mock.patch.object(
+                self.module, "nested_replay_supported", return_value=None
+            ),
+            mock.patch.object(
+                self.module,
+                "hyprctl_json",
+                side_effect=layout_ipc_response(workspaces, monitors),
+            ),
+            mock.patch.object(self.module, "replay_workspace_tree") as replay,
+        ):
+            self.assertIsNone(
+                self.module.restore_nested_tiled_layouts(
+                    rows,
+                    matches,
+                    clients,
+                    {1: workspace_layout()},
+                    {"address": "0xfocused", "workspace_id": 2},
+                )
+            )
+        replay.assert_not_called()
+
+    def test_replay_recovery_preserves_mid_dispatch_ipc_failure(self):
+        clients = [
+            {
+                "mapped": True,
+                "address": "0xa",
+                "workspace": {"id": 99},
+            }
+        ]
+        with (
+            mock.patch.object(
+                self.module, "hyprctl_json", side_effect=[clients, None]
+            ),
+            mock.patch.object(self.module, "dispatch", return_value=False),
+        ):
+            self.assertIsNone(
+                self.module.recover_replay_workspace(
+                    1,
+                    ["0xa"],
+                    {"address": "0xfocused", "workspace_id": 2},
+                )
+            )
+
+    def test_focus_restore_returns_to_empty_workspace(self):
+        with (
+            mock.patch.object(self.module, "dispatch", return_value=True) as dispatch,
+            mock.patch.object(
+                self.module, "hyprctl_json", return_value={"id": 5}
+            ),
+        ):
+            self.assertTrue(
+                self.module.restore_focus_context(
+                    {"address": "", "workspace_id": 5}
+                )
+            )
+        dispatch.assert_called_once_with("hl.dsp.focus({ workspace = 5 })")
+
+    def test_focus_restore_reopens_special_workspace_on_saved_monitor(self):
+        before = [
+            {
+                "name": "DP-1",
+                "focused": False,
+                "specialWorkspace": {"id": 0, "name": ""},
+            },
+            {
+                "name": "DP-2",
+                "focused": True,
+                "specialWorkspace": {"id": 9, "name": "special:scratch"},
+            },
+        ]
+        focused = [
+            {
+                "name": "DP-1",
+                "focused": True,
+                "specialWorkspace": {"id": 0, "name": ""},
+            }
+        ]
+        restored = [
+            {
+                "name": "DP-1",
+                "focused": True,
+                "specialWorkspace": {"id": 9, "name": "special:scratch"},
+            }
+        ]
+        with (
+            mock.patch.object(self.module, "dispatch", return_value=True) as dispatch,
+            mock.patch.object(
+                self.module,
+                "hyprctl_json",
+                side_effect=[before, focused, restored],
+            ),
+        ):
+            self.assertTrue(
+                self.module.restore_focus_context(
+                    {
+                        "address": "",
+                        "workspace_id": 1,
+                        "monitor_name": "DP-1",
+                        "special_workspace": "special:scratch",
+                    }
+                )
+            )
+        self.assertEqual(
+            [
+                "hl.dsp.focus({ monitor = [[DP-1]] })",
+                "hl.dsp.workspace.toggle_special([[scratch]])",
+            ],
+            [call.args[0] for call in dispatch.call_args_list],
+        )
+
+    def test_nested_replay_capability_checks_version_and_dwindle_options(self):
+        enabled = [
+            {"version": "0.56.2"},
+            {"bool": True},
+            {"bool": True},
+            {"bool": False},
+        ]
+        with mock.patch.object(self.module, "hyprctl_json", side_effect=enabled):
+            self.assertTrue(self.module.nested_replay_supported())
+
+        permanent = [
+            {"version": "0.56.2"},
+            {"bool": True},
+            {"bool": True},
+            {"bool": True},
+        ]
+        with (
+            mock.patch.object(self.module, "hyprctl_json", side_effect=permanent),
+            mock.patch.object(self.module, "log"),
+        ):
+            self.assertFalse(self.module.nested_replay_supported())
 
     def test_tiled_slot_restore_corrects_chromium_appearance_order(self):
         slack = window(1, 0, "slack", 10)
@@ -1041,6 +2134,36 @@ class OmarchySeshTests(unittest.TestCase):
         )
         hyprctl.assert_called_once_with("clients")
 
+    def test_tiled_slot_restore_resizes_after_workspace_origin_changes(self):
+        chrome = window(1, 0, "chromium", 10)
+        terminal = window(2, 1, "terminal", 20)
+        chrome.update(at_x=1920, at_y=0, size_w=700, size_h=1000)
+        terminal.update(at_x=2620, at_y=0, size_w=300, size_h=1000)
+        matches = {1: "0xchrome", 2: "0xterminal"}
+        clients = [
+            tiled_client(chrome, "0xchrome", [0, 0], [500, 1000]),
+            tiled_client(terminal, "0xterminal", [500, 0], [500, 1000]),
+        ]
+        refreshed = [
+            tiled_client(chrome, "0xchrome", [0, 0], [700, 1000]),
+            tiled_client(terminal, "0xterminal", [700, 0], [300, 1000]),
+        ]
+
+        with (
+            mock.patch.object(self.module, "dispatch", return_value=True) as dispatch,
+            mock.patch.object(
+                self.module, "hyprctl_json", return_value=refreshed
+            ) as hyprctl,
+        ):
+            self.assertTrue(
+                self.module.restore_tiled_slots([chrome, terminal], matches, clients)
+            )
+
+        dispatch.assert_called_once_with(
+            "hl.dsp.window.resize({ x = 700, y = 1000, window = [[address:0xchrome]] })"
+        )
+        hyprctl.assert_called_once_with("clients")
+
     def test_tiled_slot_restore_swaps_reversed_ratio_before_resizing(self):
         chrome = window(1, 0, "chromium", 10)
         terminal = window(2, 1, "terminal", 20)
@@ -1133,7 +2256,7 @@ class OmarchySeshTests(unittest.TestCase):
             "hl.dsp.window.resize({ x = 1000, y = 700, window = [[address:0xtop]] })"
         )
 
-    def test_tiled_slot_restore_does_not_resize_different_workspace_bounds(self):
+    def test_tiled_slot_restore_does_not_resize_different_workspace_dimensions(self):
         left = window(1, 0, "left", 10)
         right = window(2, 1, "right", 20)
         left.update(at_x=0, at_y=0, size_w=700, size_h=1000)
@@ -1491,6 +2614,14 @@ class OmarchySeshTests(unittest.TestCase):
             [window(1, 0, "terminal", 10)],
             {1: "0x1"},
             monitor_context=({}, {}, True),
+        )
+        self.assertEqual(75, result)
+
+    def test_group_restore_ipc_failure_makes_restore_retryable(self):
+        result, _, _ = self.run_restore(
+            [window(1, 0, "terminal", 10)],
+            {1: "0x1"},
+            group_result=None,
         )
         self.assertEqual(75, result)
 
@@ -1917,7 +3048,7 @@ class OmarchySeshTests(unittest.TestCase):
     def test_first_install_enables_autosave(self):
         calls, _, marker = self.run_installer(autosave_unit_exists=False)
         self.assertIn("--user enable omarchy-sesh-autosave.service", calls)
-        self.assertEqual("0.1.0", marker)
+        self.assertEqual("0.2.0", marker)
 
     def test_reinstall_preserves_manual_mode(self):
         calls, _, _ = self.run_installer(autosave_unit_exists=True)

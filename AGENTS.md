@@ -47,7 +47,8 @@ process; they are not identities that survive reboot.
 one-to-one, launches all missing process groups through Hyprland's Lua dispatch
 API, and polls all outstanding windows within one shared deadline. Each matched
 window is placed immediately. Strictly recognized Chromium app-mode windows are
-launched individually through `omarchy-launch-webapp`.
+launched individually through `omarchy-launch-webapp`. On Hyprland 0.56+, safe
+complete window groups are reconstructed after placement and tiled correction.
 
 `autosave` waits before its first capture and remains gated until restore has
 completed for the current `HYPRLAND_INSTANCE_SIGNATURE`. Omarchy power-menu
@@ -82,6 +83,9 @@ Do not assume paths under `$HOME` when an XDG override is available.
   quoting is not valid for Lua dispatch arguments.
 - Restore floating windows by resizing before moving because Hyprland resize is
   center-anchored. Tiled layout must remain documented as best-effort.
+- Restore groups only after complete unique matching and placement. Never merge
+  an unrelated current group, and keep group reconstruction optional on
+  Hyprland 0.55.
 - Keep one startup restore trigger. Adding a Hyprland autostart invocation
   creates duplicate-restore races.
 - The restore-complete marker is scoped to the compositor instance. Autosave
@@ -125,6 +129,7 @@ Hyprland session and its real saved database are intentionally part of the test.
 - Update `docs/session-restore-spec.md` when architecture, state, dispatch API,
   restore guarantees, or limitations change.
 - Consult `docs/future-improvements.md` for known gaps. Current notable
-  limitations are unverified cross-restart `stableId` behavior, tab-group
-  reconstruction, fallback-monitor floating geometry, and ambiguous same-class
-  windows without stable titles.
+  limitations are group active-tab and lock/deny state, fallback-monitor
+  floating geometry, and ambiguous same-class windows without stable titles.
+  Hyprland `stableId` was investigated and is only valid for a live window
+  object, not across relaunch or compositor restart.

@@ -43,6 +43,7 @@ DEFAULT_EXCLUDE = set(DEFAULT_CONFIG["exclude_classes"])
 CHROMIUM_NORMAL_CLASSES = {"chromium", "chromium-browser"}
 RESTORE_TIMEOUT = 20.0
 RESTORE_RETRY_DELAY = 2.0
+RESTORE_POLL_INTERVAL = 0.05
 
 
 def log(msg):
@@ -73,6 +74,21 @@ def dispatch(lua):
     )
     if out.returncode != 0 or "error" in output.lower():
         log(f"dispatch failed ({lua}): {output}")
+        return False
+    return True
+
+
+def eval_lua(lua):
+    out = subprocess.run(
+        ["hyprctl", "eval", lua], capture_output=True, text=True, check=False
+    )
+    output = "\n".join(
+        part.strip() for part in (out.stdout, out.stderr) if part.strip()
+    )
+    if out.returncode != 0 or out.stdout.strip() != "ok":
+        log(f"eval failed ({lua}): {output}")
+        if 1 <= out.returncode <= 6:
+            return None
         return False
     return True
 
@@ -179,6 +195,26 @@ def db_conn():
             pinned INTEGER NOT NULL DEFAULT 0,
             xwayland INTEGER NOT NULL DEFAULT 0,
             pid INTEGER,
+            group_id INTEGER,
+            group_ord INTEGER,
+            FOREIGN KEY (session) REFERENCES sessions(id)
+        )
+            """
+        )
+        conn.execute(
+            """
+        CREATE TABLE IF NOT EXISTS workspace_layouts (
+            session INTEGER NOT NULL,
+            workspace_id INTEGER NOT NULL,
+            layout TEXT,
+            at_x INTEGER, at_y INTEGER,
+            size_w INTEGER, size_h INTEGER,
+            work_x INTEGER, work_y INTEGER,
+            work_w INTEGER, work_h INTEGER,
+            gap_top INTEGER, gap_right INTEGER,
+            gap_bottom INTEGER, gap_left INTEGER,
+            complete INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (session, workspace_id),
             FOREIGN KEY (session) REFERENCES sessions(id)
         )
             """
@@ -201,7 +237,28 @@ def db_conn():
             conn.execute("ALTER TABLE windows ADD COLUMN pid INTEGER")
         if "monitor_description" not in window_columns:
             conn.execute("ALTER TABLE windows ADD COLUMN monitor_description TEXT")
-        conn.execute("PRAGMA user_version = 3")
+        if "group_id" not in window_columns:
+            conn.execute("ALTER TABLE windows ADD COLUMN group_id INTEGER")
+        if "group_ord" not in window_columns:
+            conn.execute("ALTER TABLE windows ADD COLUMN group_ord INTEGER")
+        layout_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(workspace_layouts)")
+        }
+        for column in (
+            "work_x",
+            "work_y",
+            "work_w",
+            "work_h",
+            "gap_top",
+            "gap_right",
+            "gap_bottom",
+            "gap_left",
+        ):
+            if column not in layout_columns:
+                conn.execute(
+                    f"ALTER TABLE workspace_layouts ADD COLUMN {column} INTEGER"
+                )
+        conn.execute("PRAGMA user_version = 5")
         conn.commit()
     except Exception:
         conn.rollback()
@@ -228,7 +285,7 @@ def read_proc(pid):
     return cmdline, cwd, "" if cmdline else "empty cmdline"
 
 
-def persist_snapshot(label, status, error, rows):
+def persist_snapshot(label, status, error, rows, workspace_layouts=None):
     conn = db_conn()
     with conn:
         cur = conn.execute(
@@ -239,11 +296,21 @@ def persist_snapshot(label, status, error, rows):
         conn.executemany(
             "INSERT INTO windows (session, ord, class, initial_class, title, initial_title, "
             "cmdline, cwd, workspace_id, workspace_name, monitor_name, monitor_description, at_x, at_y, size_w, "
-            "size_h, floating, fullscreen, pinned, xwayland, pid) "
+            "size_h, floating, fullscreen, pinned, xwayland, pid, group_id, group_ord) "
             "VALUES (:session, :ord, :class, :initial_class, :title, :initial_title, "
             ":cmdline, :cwd, :workspace_id, :workspace_name, :monitor_name, :monitor_description, :at_x, :at_y, "
-            ":size_w, :size_h, :floating, :fullscreen, :pinned, :xwayland, :pid)",
+            ":size_w, :size_h, :floating, :fullscreen, :pinned, :xwayland, :pid, :group_id, :group_ord)",
             [dict(r, session=sid, ord=i) for i, r in enumerate(rows)],
+        )
+        conn.executemany(
+            "INSERT INTO workspace_layouts "
+            "(session, workspace_id, layout, at_x, at_y, size_w, size_h, "
+            "work_x, work_y, work_w, work_h, gap_top, gap_right, gap_bottom, "
+            "gap_left, complete) "
+            "VALUES (:session, :workspace_id, :layout, :at_x, :at_y, :size_w, "
+            ":size_h, :work_x, :work_y, :work_w, :work_h, :gap_top, "
+            ":gap_right, :gap_bottom, :gap_left, :complete)",
+            [dict(layout, session=sid) for layout in workspace_layouts or ()],
         )
         keep_ids = {
             row[0]
@@ -263,6 +330,9 @@ def persist_snapshot(label, status, error, rows):
             if row[0] not in keep_ids
         ]
         for session_id in prune_ids:
+            conn.execute(
+                "DELETE FROM workspace_layouts WHERE session = ?", (session_id,)
+            )
             conn.execute("DELETE FROM windows WHERE session = ?", (session_id,))
         conn.executemany(
             "DELETE FROM sessions WHERE id = ?", [(sid,) for sid in prune_ids]
@@ -277,23 +347,231 @@ def cmd_save(label="manual", teardown=False, wait=False):
         log(f"save[{label}]: another session operation is running")
         return 75
     try:
+        if label == "periodic" and not restore_is_ready():
+            log("save[periodic]: startup restore is not complete")
+            return 75
+        if label == "logout" and not teardown:
+            if not mark_restore_completed(None, complete=False):
+                log("save[logout]: could not close the autosave gate")
+                return 75
         clients = hyprctl_json("clients")
         monitors = hyprctl_json("monitors")
-        if clients is None or monitors is None:
+        workspaces = hyprctl_json("workspaces")
+        gaps_out = hyprctl_json("getoption", "general:gaps_out")
+        gaps_in = hyprctl_json("getoption", "general:gaps_in")
+        workspace_rules = hyprctl_json("workspacerules")
+        if any(
+            value is None
+            for value in (
+                clients,
+                monitors,
+                workspaces,
+                gaps_out,
+                gaps_in,
+                workspace_rules,
+            )
+        ):
             log(f"save[{label}]: capture failed because Hyprland IPC is unavailable")
             return 1
         status = "failed" if teardown else "complete"
         errors = ["teardown captures are diagnostic only"] if teardown else []
-        return _save_clients(label, clients, monitors, status, errors)
+        return _save_clients(
+            label,
+            clients,
+            monitors,
+            status,
+            errors,
+            workspaces=workspaces,
+            gaps_out=css_gaps(gaps_out),
+            gaps_in=css_gaps(gaps_in),
+            workspace_rules=workspace_rules,
+        )
     finally:
         lock_file.close()
 
 
-def _save_clients(label, clients, monitors, status, errors):
+def assign_snapshot_groups(captured):
+    address_counts = {}
+    row_by_address = {}
+    grouped_by_address = {}
+    for row, address, grouped in captured:
+        row["group_id"] = None
+        row["group_ord"] = None
+        if not isinstance(address, str) or not address:
+            continue
+        address_counts[address] = address_counts.get(address, 0) + 1
+        row_by_address[address] = row
+        grouped_by_address[address] = grouped
+
+    seen = set()
+    group_id = 1
+    for _, address, grouped in captured:
+        if address in seen or not isinstance(grouped, list) or not grouped:
+            continue
+        if (
+            any(not isinstance(member, str) or not member for member in grouped)
+            or len(set(grouped)) != len(grouped)
+            or address not in grouped
+        ):
+            continue
+        seen.update(grouped)
+        if any(
+            address_counts.get(member) != 1
+            or grouped_by_address.get(member) != grouped
+            for member in grouped
+        ):
+            continue
+        for group_ord, member in enumerate(grouped):
+            row_by_address[member]["group_id"] = group_id
+            row_by_address[member]["group_ord"] = group_ord
+        group_id += 1
+
+
+def css_gaps(option):
+    value = option.get("css") if isinstance(option, dict) else None
+    if not isinstance(value, str):
+        return None
+    try:
+        values = [round(float(part)) for part in value.split()]
+    except ValueError:
+        return None
+    if len(values) == 1:
+        return values * 4
+    if len(values) == 2:
+        return [values[0], values[1], values[0], values[1]]
+    if len(values) == 3:
+        return [values[0], values[1], values[2], values[1]]
+    return values if len(values) == 4 else None
+
+
+def monitor_workarea(monitor, gaps_out=None):
+    scale = monitor.get("scale")
+    reserved = monitor.get("reserved") or []
+    if (
+        monitor.get("transform", 0) != 0
+        or not isinstance(scale, (int, float))
+        or scale <= 0
+        or len(reserved) < 4
+        or any(not isinstance(value, (int, float)) for value in reserved[:4])
+    ):
+        return None
+    left, top, right, bottom = reserved[:4]
+    gap_top, gap_right, gap_bottom, gap_left = gaps_out or (0, 0, 0, 0)
+    raw_width = monitor.get("width")
+    raw_height = monitor.get("height")
+    x = monitor.get("x")
+    y = monitor.get("y")
+    if not all(
+        isinstance(value, (int, float))
+        for value in (x, y, raw_width, raw_height)
+    ):
+        return None
+    width = round(raw_width / scale)
+    height = round(raw_height / scale)
+    return (
+        round(x + left + gap_left),
+        round(y + top + gap_top),
+        round(width - left - right - gap_left - gap_right),
+        round(height - top - bottom - gap_top - gap_bottom),
+    )
+
+
+def captured_workspace_layouts(
+    clients,
+    captured,
+    monitors,
+    workspaces,
+    gaps_out=None,
+    gaps_in=None,
+    workspace_rules=(),
+):
+    workspace_by_id = {workspace.get("id"): workspace for workspace in workspaces}
+    monitor_by_id = {monitor.get("id"): monitor for monitor in monitors}
+    client_by_address = {
+        client.get("address"): client for client in clients if client.get("address")
+    }
+    all_tiled = {}
+    for client in clients:
+        workspace_id = (client.get("workspace") or {}).get("id")
+        address = client.get("address")
+        if (
+            client.get("mapped")
+            and not client.get("floating")
+            and not client.get("fullscreen")
+            and workspace_id is not None
+            and address
+        ):
+            all_tiled.setdefault(workspace_id, set()).add(address)
+
+    captured_by_workspace = {}
+    for row, address, _ in captured:
+        if (
+            not row.get("floating")
+            and not row.get("fullscreen")
+            and row.get("workspace_id") is not None
+            and address
+        ):
+            captured_by_workspace.setdefault(row["workspace_id"], []).append(
+                (row, address)
+            )
+
+    layouts = []
+    for workspace_id, items in captured_by_workspace.items():
+        geometries = [saved_geometry(row) for row, _ in items]
+        if len(items) < 2 or any(geometry is None for geometry in geometries):
+            continue
+        left = min(geometry[0] for geometry in geometries)
+        top = min(geometry[1] for geometry in geometries)
+        right = max(geometry[0] + geometry[2] for geometry in geometries)
+        bottom = max(geometry[1] + geometry[3] for geometry in geometries)
+        captured_addresses = {address for _, address in items}
+        monitor_ids = {
+            client_by_address.get(address, {}).get("monitor") for _, address in items
+        }
+        workarea = None
+        if len(monitor_ids) == 1 and not workspace_rules:
+            workarea = monitor_workarea(
+                monitor_by_id.get(next(iter(monitor_ids)), {}), gaps_out
+            )
+        layouts.append(
+            {
+                "workspace_id": workspace_id,
+                "layout": workspace_by_id.get(workspace_id, {}).get("tiledLayout"),
+                "at_x": left,
+                "at_y": top,
+                "size_w": right - left,
+                "size_h": bottom - top,
+                "work_x": workarea[0] if workarea else None,
+                "work_y": workarea[1] if workarea else None,
+                "work_w": workarea[2] if workarea else None,
+                "work_h": workarea[3] if workarea else None,
+                "gap_top": gaps_in[0] if gaps_in else None,
+                "gap_right": gaps_in[1] if gaps_in else None,
+                "gap_bottom": gaps_in[2] if gaps_in else None,
+                "gap_left": gaps_in[3] if gaps_in else None,
+                "complete": int(
+                    captured_addresses == all_tiled.get(workspace_id, set())
+                ),
+            }
+        )
+    return layouts
+
+
+def _save_clients(
+    label,
+    clients,
+    monitors,
+    status,
+    errors,
+    workspaces=None,
+    gaps_out=None,
+    gaps_in=None,
+    workspace_rules=(),
+):
     cfg = load_config()
     exclude = DEFAULT_EXCLUDE | set(cfg.get("exclude_classes", []))
     monitor_by_id = {m["id"]: m for m in monitors}
-    rows = []
+    captured = []
     for w in clients:
         if not w.get("mapped"):
             continue
@@ -309,33 +587,43 @@ def _save_clients(label, clients, monitors, status, errors):
         monitor = monitor_by_id.get(w.get("monitor"), {})
         at = w.get("at") or []
         size = w.get("size") or []
-        rows.append(
-            {
-                "class": cls,
-                "initial_class": w.get("initialClass", cls),
-                "title": w.get("title", ""),
-                "initial_title": w.get("initialTitle", ""),
-                "cmdline": cmdline,
-                "cwd": cwd,
-                "workspace_id": ws.get("id"),
-                "workspace_name": ws.get("name"),
-                "monitor_name": monitor.get("name"),
-                "monitor_description": monitor.get("description"),
-                "at_x": at[0] if len(at) > 0 else None,
-                "at_y": at[1] if len(at) > 1 else None,
-                "size_w": size[0] if len(size) > 0 else None,
-                "size_h": size[1] if len(size) > 1 else None,
-                "floating": 1 if w.get("floating") else 0,
-                "fullscreen": w.get("fullscreen", 0),
-                "pinned": 1 if w.get("pinned") else 0,
-                "xwayland": 1 if w.get("xwayland") else 0,
-                "pid": pid,
-            }
-        )
+        row = {
+            "class": cls,
+            "initial_class": w.get("initialClass", cls),
+            "title": w.get("title", ""),
+            "initial_title": w.get("initialTitle", ""),
+            "cmdline": cmdline,
+            "cwd": cwd,
+            "workspace_id": ws.get("id"),
+            "workspace_name": ws.get("name"),
+            "monitor_name": monitor.get("name"),
+            "monitor_description": monitor.get("description"),
+            "at_x": at[0] if len(at) > 0 else None,
+            "at_y": at[1] if len(at) > 1 else None,
+            "size_w": size[0] if len(size) > 0 else None,
+            "size_h": size[1] if len(size) > 1 else None,
+            "floating": 1 if w.get("floating") else 0,
+            "fullscreen": w.get("fullscreen", 0),
+            "pinned": 1 if w.get("pinned") else 0,
+            "xwayland": 1 if w.get("xwayland") else 0,
+            "pid": pid,
+        }
+        captured.append((row, w.get("address"), w.get("grouped")))
+    assign_snapshot_groups(captured)
+    rows = [row for row, _, _ in captured]
+    workspace_layouts = captured_workspace_layouts(
+        clients,
+        captured,
+        monitors,
+        workspaces or (),
+        gaps_out,
+        gaps_in,
+        workspace_rules,
+    )
     if errors and status == "complete":
         status = "partial"
     error = "; ".join(errors)
-    sid = persist_snapshot(label, status, error, rows)
+    sid = persist_snapshot(label, status, error, rows, workspace_layouts)
     if status == "complete" and label == "manual":
         mark_restore_completed(sid)
     log(
@@ -358,6 +646,18 @@ def load_windows(conn, sid):
     cur = conn.execute("SELECT * FROM windows WHERE session = ? ORDER BY ord", (sid,))
     cols = [d[0] for d in cur.description]
     return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+def load_workspace_layouts(conn, sid):
+    cur = conn.execute(
+        "SELECT workspace_id, layout, at_x, at_y, size_w, size_h, "
+        "work_x, work_y, work_w, work_h, gap_top, gap_right, gap_bottom, "
+        "gap_left, complete "
+        "FROM workspace_layouts WHERE session = ?",
+        (sid,),
+    )
+    cols = [d[0] for d in cur.description]
+    return {row[0]: dict(zip(cols, row)) for row in cur.fetchall()}
 
 
 def window_classes_match(saved, current):
@@ -399,6 +699,36 @@ def client_matches(row, client):
     if title_matches or initial_title_matches:
         return 3
     return 4
+
+
+def client_match_is_unique(row, client, rows):
+    rank = client_matches(row, client)
+    candidate_ranks = [
+        candidate_rank
+        for candidate in rows
+        if (candidate_rank := client_matches(candidate, client)) is not None
+    ]
+    return (
+        rank is not None
+        and rank == min(candidate_ranks)
+        and candidate_ranks.count(rank) == 1
+    )
+
+
+def row_match_is_unique(row, client, clients):
+    rank = client_matches(row, client)
+    candidate_ranks = [
+        candidate_rank
+        for candidate in clients
+        if candidate.get("mapped")
+        and candidate.get("address")
+        and (candidate_rank := client_matches(row, candidate)) is not None
+    ]
+    return (
+        rank is not None
+        and rank == min(candidate_ranks)
+        and candidate_ranks.count(rank) == 1
+    )
 
 
 def match_windows(rows, clients, used_addresses=None, max_rank=2):
@@ -674,13 +1004,12 @@ def geometries_match(left, right, tolerance=2):
     return all(abs(a - b) <= tolerance for a, b in zip(left, right))
 
 
-def geometry_bounds(geometries):
-    return (
-        min(geometry[0] for geometry in geometries),
-        min(geometry[1] for geometry in geometries),
-        max(geometry[0] + geometry[2] for geometry in geometries),
-        max(geometry[1] + geometry[3] for geometry in geometries),
-    )
+def geometry_dimensions(geometries):
+    left = min(geometry[0] for geometry in geometries)
+    top = min(geometry[1] for geometry in geometries)
+    right = max(geometry[0] + geometry[2] for geometry in geometries)
+    bottom = max(geometry[1] + geometry[3] for geometry in geometries)
+    return right - left, bottom - top
 
 
 def simple_split_order(geometries, tolerance=2):
@@ -704,6 +1033,615 @@ def simple_split_order(geometries, tolerance=2):
         if top[1] + top[3] <= bottom[1] + tolerance:
             return "y", order
     return None
+
+
+def geometry_bounds(geometries):
+    left = min(geometry[0] for geometry in geometries)
+    top = min(geometry[1] for geometry in geometries)
+    right = max(geometry[0] + geometry[2] for geometry in geometries)
+    bottom = max(geometry[1] + geometry[3] for geometry in geometries)
+    return left, top, right - left, bottom - top
+
+
+def infer_split_tree(items, root_bounds=None, inner_gaps=None, tolerance=2):
+    if (
+        not items
+        or len(items) > 16
+        or len({key for key, _ in items}) != len(items)
+    ):
+        return None
+    rectangles = {key: geometry for key, geometry in items}
+    gap_top, gap_right, gap_bottom, gap_left = inner_gaps or (0, 0, 0, 0)
+    if any(
+        geometry is None or geometry[2] <= 0 or geometry[3] <= 0
+        for geometry in rectangles.values()
+    ):
+        return None
+    keys = list(rectangles)
+    for index, key in enumerate(keys):
+        x, y, width, height = rectangles[key]
+        for other in keys[index + 1 :]:
+            ox, oy, owidth, oheight = rectangles[other]
+            if (
+                min(x + width, ox + owidth) - max(x, ox) > tolerance
+                and min(y + height, oy + oheight) - max(y, oy) > tolerance
+            ):
+                return None
+
+    root_bounds = root_bounds or geometry_bounds(rectangles.values())
+    root_right = root_bounds[0] + root_bounds[2]
+    root_bottom = root_bounds[1] + root_bounds[3]
+    if root_bounds[2] <= 0 or root_bounds[3] <= 0 or any(
+        geometry[0] < root_bounds[0] - tolerance
+        or geometry[1] < root_bounds[1] - tolerance
+        or geometry[0] + geometry[2] > root_right + tolerance
+        or geometry[1] + geometry[3] > root_bottom + tolerance
+        for geometry in rectangles.values()
+    ):
+        return None
+
+    memo = {}
+
+    def infer(subset, node_bounds):
+        frozen = frozenset(subset)
+        memo_key = (frozen, tuple(round(value, 6) for value in node_bounds))
+        if memo_key in memo:
+            return memo[memo_key]
+        if len(frozen) == 1:
+            result = (("leaf", next(iter(frozen))), 1)
+            memo[memo_key] = result
+            return result
+
+        visible_parent = geometry_bounds([rectangles[key] for key in frozen])
+        exemplar = None
+        solution_count = 0
+        for axis, start_index, size_index in (("x", 0, 2), ("y", 1, 3)):
+            other_start = 1 if axis == "x" else 0
+            other_size = 3 if axis == "x" else 2
+            ordered = sorted(
+                frozen,
+                key=lambda key: (
+                    rectangles[key][start_index],
+                    rectangles[key][start_index] + rectangles[key][size_index],
+                    str(key),
+                ),
+            )
+            for split_at in range(1, len(ordered)):
+                first_keys = ordered[:split_at]
+                second_keys = ordered[split_at:]
+                first_end = max(
+                    rectangles[key][start_index] + rectangles[key][size_index]
+                    for key in first_keys
+                )
+                second_start = min(
+                    rectangles[key][start_index] for key in second_keys
+                )
+                if first_end > second_start + tolerance:
+                    continue
+                first_box = geometry_bounds(
+                    [rectangles[key] for key in first_keys]
+                )
+                second_box = geometry_bounds(
+                    [rectangles[key] for key in second_keys]
+                )
+                parent_other_start = visible_parent[other_start]
+                parent_other_end = parent_other_start + visible_parent[other_size]
+                if any(
+                    abs(box[other_start] - parent_other_start) > tolerance
+                    or abs(
+                        box[other_start] + box[other_size] - parent_other_end
+                    )
+                    > tolerance
+                    for box in (first_box, second_box)
+                ):
+                    continue
+                if axis == "x":
+                    boundary = (
+                        first_end + gap_right + second_start - gap_left
+                    ) / 2
+                else:
+                    boundary = (
+                        first_end + gap_bottom + second_start - gap_top
+                    ) / 2
+                if axis == "x":
+                    first_node = (
+                        node_bounds[0],
+                        node_bounds[1],
+                        boundary - node_bounds[0],
+                        node_bounds[3],
+                    )
+                    second_node = (
+                        boundary,
+                        node_bounds[1],
+                        node_bounds[0] + node_bounds[2] - boundary,
+                        node_bounds[3],
+                    )
+                else:
+                    first_node = (
+                        node_bounds[0],
+                        node_bounds[1],
+                        node_bounds[2],
+                        boundary - node_bounds[1],
+                    )
+                    second_node = (
+                        node_bounds[0],
+                        boundary,
+                        node_bounds[2],
+                        node_bounds[1] + node_bounds[3] - boundary,
+                    )
+                first_tree, first_count = infer(first_keys, first_node)
+                second_tree, second_count = infer(second_keys, second_node)
+                if first_count == 0 or second_count == 0:
+                    continue
+                fraction = first_node[size_index] / node_bounds[size_index]
+                if not 0.05 <= fraction <= 0.95:
+                    continue
+                candidate = (
+                    "split",
+                    axis,
+                    fraction,
+                    first_tree,
+                    second_tree,
+                )
+                if exemplar is None:
+                    exemplar = candidate
+                solution_count = min(
+                    2, solution_count + first_count * second_count
+                )
+                if solution_count == 2:
+                    result = (exemplar, 2)
+                    memo[memo_key] = result
+                    return result
+        result = (exemplar, solution_count)
+        memo[memo_key] = result
+        return result
+
+    tree, count = infer(keys, root_bounds)
+    return tree if count == 1 else None
+
+
+def split_tree_seed(tree):
+    while tree[0] == "split":
+        tree = tree[3]
+    return tree[1]
+
+
+def nested_replay_supported():
+    version = hyprctl_json("version")
+    if version is None:
+        return None
+    match = re.match(r"^v?(\d+)\.(\d+)\.(\d+)", str(version.get("version", "")))
+    if not match or tuple(map(int, match.groups())) < (0, 56, 0):
+        log("restore: Hyprland 0.56+ is required for nested tiled replay")
+        return False
+    required = {
+        "dwindle:use_active_for_splits": True,
+        "dwindle:preserve_split": True,
+        "dwindle:permanent_direction_override": False,
+    }
+    for option, expected in required.items():
+        value = hyprctl_json("getoption", option)
+        if value is None:
+            return None
+        if value.get("bool") is not expected:
+            log(
+                f"restore: nested tiled replay requires {option} = "
+                f"{str(expected).lower()}"
+            )
+            return False
+    return True
+
+
+def workspace_geometry_matches(
+    rows, matches, clients, layout, current_workarea, tolerance=3
+):
+    client_by_address = {
+        client.get("address"): client
+        for client in clients
+        if client.get("mapped") and client.get("address")
+    }
+    current = []
+    for row in rows:
+        client = client_by_address.get(matches.get(row["id"]))
+        geometry = window_geometry(client or {})
+        if geometry is None:
+            return False
+        current.append(geometry)
+    if not geometries_match(
+        current_workarea[2:], (layout["work_w"], layout["work_h"]), tolerance
+    ):
+        return False
+    for row, actual in zip(rows, current):
+        desired = saved_geometry(row)
+        desired_relative = (
+            desired[0] - layout["work_x"],
+            desired[1] - layout["work_y"],
+            desired[2],
+            desired[3],
+        )
+        actual_relative = (
+            actual[0] - current_workarea[0],
+            actual[1] - current_workarea[1],
+            actual[2],
+            actual[3],
+        )
+        if not geometries_match(desired_relative, actual_relative, tolerance):
+            return False
+    return True
+
+
+def replay_workspace_tree(workspace_id, rows, matches, tree, focus_context):
+    addresses = [matches[row["id"]] for row in rows]
+    variable_by_id = {
+        row["id"]: f"w{index}" for index, row in enumerate(rows, start=1)
+    }
+    declarations = [
+        f"local {variable_by_id[row['id']]}=assert(hl.get_window({lua_quote(f'address:{matches[row['id']]}')}), 'replay member missing')"
+        for row in rows
+    ]
+    operations = []
+    staging = lua_quote(f"name:omarchy-sesh-stage-{os.getpid()}-{workspace_id}")
+    seed_id = split_tree_seed(tree)
+    for row in rows:
+        if row["id"] == seed_id:
+            continue
+        operations.append(
+            "run(hl.dispatch(hl.dsp.window.move({ "
+            f"workspace = {staging}, follow = false, window = {lua_quote(f'address:{matches[row['id']]}')} "
+            "})))"
+        )
+
+    def expand(node):
+        if node[0] == "leaf":
+            return
+        _, axis, fraction, first, second = node
+        first_id = split_tree_seed(first)
+        second_id = split_tree_seed(second)
+        first_selector = lua_quote(f"address:{matches[first_id]}")
+        second_selector = lua_quote(f"address:{matches[second_id]}")
+        direction = "right" if axis == "x" else "down"
+        operations.extend(
+            (
+                f"run(hl.dispatch(hl.dsp.focus({{ window = {first_selector} }})))",
+                f"run(hl.dispatch(hl.dsp.layout({lua_quote(f'preselect {direction}')})))",
+                "run(hl.dispatch(hl.dsp.window.move({ "
+                f"workspace = {workspace_id}, follow = false, window = {second_selector} "
+                "})))",
+                f"run(hl.dispatch(hl.dsp.focus({{ window = {first_selector} }})))",
+                f"run(hl.dispatch(hl.dsp.layout({lua_quote(f'splitratio {2 * fraction:.12g} exact')})))",
+            )
+        )
+        expand(first)
+        expand(second)
+
+    expand(tree)
+    focus_action = None
+    if focus_context.get("address"):
+        focus_action = (
+            "hl.dispatch(hl.dsp.focus({ "
+            f"window = {lua_quote(f'address:{focus_context['address']}')} "
+            "}))"
+        )
+    elif (
+        not focus_context.get("special_workspace")
+        and focus_context.get("workspace_id") is not None
+    ):
+        focus_action = (
+            "hl.dispatch(hl.dsp.focus({ "
+            f"workspace = {focus_context['workspace_id']} "
+            "}))"
+        )
+    script = [
+        *declarations,
+        "local function run(result) assert(result.ok, result.error or 'dispatch failed') end",
+        f"local ok,err=pcall(function() {' '.join(operations)} end)",
+    ]
+    if focus_action:
+        script.append(f"local focus={focus_action}")
+    script.append("if not ok then error(err) end")
+    result = eval_lua(" ".join(script))
+    return result, addresses
+
+
+def load_focus_context():
+    active_window = hyprctl_json("activewindow")
+    active_workspace = hyprctl_json("activeworkspace")
+    monitors = hyprctl_json("monitors")
+    if active_window is None or active_workspace is None or monitors is None:
+        return None
+    focused_monitor = next(
+        (monitor for monitor in monitors if monitor.get("focused")), {}
+    )
+    special = focused_monitor.get("specialWorkspace") or {}
+    return {
+        "address": active_window.get("address"),
+        "workspace_id": active_workspace.get("id"),
+        "monitor_name": focused_monitor.get("name"),
+        "special_workspace": special.get("name") if special.get("id") else None,
+    }
+
+
+def restore_focus_context(context):
+    if not context:
+        return True
+    address = context.get("address")
+    workspace_id = context.get("workspace_id")
+    special_workspace = context.get("special_workspace")
+    if address:
+        lua = f"hl.dsp.focus({{ window = {lua_quote(f'address:{address}')} }})"
+        dispatched = dispatch(lua)
+        current = hyprctl_json("activewindow")
+        if current is None:
+            return None
+        if dispatched and current.get("address") == address:
+            return True
+        if special_workspace:
+            return restore_focus_context(dict(context, address=None))
+        if workspace_id is None:
+            return False
+        lua = f"hl.dsp.focus({{ workspace = {workspace_id} }})"
+        endpoint = "activeworkspace"
+        expected = workspace_id
+        field = "id"
+    elif special_workspace:
+        monitors = hyprctl_json("monitors")
+        if monitors is None:
+            return None
+        monitor_name = context.get("monitor_name")
+        expected_special = (
+            special_workspace
+            if special_workspace.startswith("special:")
+            else f"special:{special_workspace}"
+        )
+
+        def special_is_focused(current_monitors):
+            return any(
+                monitor.get("name") == monitor_name
+                and monitor.get("focused")
+                and (monitor.get("specialWorkspace") or {}).get("name")
+                == expected_special
+                for monitor in current_monitors
+            )
+
+        if special_is_focused(monitors):
+            return True
+        if not monitor_name or not dispatch(
+            f"hl.dsp.focus({{ monitor = {lua_quote(monitor_name)} }})"
+        ):
+            return None if hyprctl_json("monitors") is None else False
+        monitors = hyprctl_json("monitors")
+        if monitors is None:
+            return None
+        if not any(
+            monitor.get("name") == monitor_name
+            and (monitor.get("specialWorkspace") or {}).get("name")
+            == expected_special
+            for monitor in monitors
+        ):
+            toggle_name = special_workspace.removeprefix("special:")
+            if not dispatch(
+                "hl.dsp.workspace.toggle_special("
+                f"{lua_quote(toggle_name)}"
+                ")"
+            ):
+                return None if hyprctl_json("monitors") is None else False
+            monitors = hyprctl_json("monitors")
+            if monitors is None:
+                return None
+        return special_is_focused(monitors)
+    elif workspace_id is not None:
+        lua = f"hl.dsp.focus({{ workspace = {workspace_id} }})"
+        endpoint = "activeworkspace"
+        expected = workspace_id
+        field = "id"
+    else:
+        return True
+    dispatched = dispatch(lua)
+    current = hyprctl_json(endpoint)
+    if current is None:
+        return None
+    return dispatched and current.get(field) == expected
+
+
+def recover_replay_workspace(workspace_id, addresses, focus_context):
+    clients = hyprctl_json("clients")
+    if clients is None:
+        return None
+    workspace_by_address = {
+        client.get("address"): (client.get("workspace") or {}).get("id")
+        for client in clients
+    }
+    for address in addresses:
+        if workspace_by_address.get(address) != workspace_id:
+            moved = dispatch(
+                "hl.dsp.window.move({ "
+                f"workspace = {workspace_id}, follow = false, "
+                f"window = {lua_quote(f'address:{address}')} "
+                "})"
+            )
+            if not moved:
+                return None if hyprctl_json("clients") is None else False
+    return restore_focus_context(focus_context)
+
+
+def restore_nested_tiled_layouts(
+    rows, matches, clients, layouts, focus_context=None
+):
+    rows_by_workspace = {}
+    for row in rows:
+        if not row.get("floating") and row.get("workspace_id") is not None:
+            rows_by_workspace.setdefault(row["workspace_id"], []).append(row)
+
+    if not any(
+        len(workspace_rows) >= 3 and layouts.get(workspace_id)
+        for workspace_id, workspace_rows in rows_by_workspace.items()
+    ):
+        return True
+    live_workspaces = hyprctl_json("workspaces")
+    live_monitors = hyprctl_json("monitors")
+    gaps_out = hyprctl_json("getoption", "general:gaps_out")
+    gaps_in = hyprctl_json("getoption", "general:gaps_in")
+    workspace_rules = hyprctl_json("workspacerules")
+    if any(
+        value is None
+        for value in (
+            live_workspaces,
+            live_monitors,
+            gaps_out,
+            gaps_in,
+            workspace_rules,
+        )
+    ):
+        return None
+    if workspace_rules:
+        log("restore: workspace-specific rules disable nested tiled replay")
+        return True
+    gaps_out = css_gaps(gaps_out)
+    gaps_in = css_gaps(gaps_in)
+    if gaps_out is None or gaps_in is None:
+        return True
+    live_workspace_by_id = {
+        workspace.get("id"): workspace for workspace in live_workspaces
+    }
+    live_monitor_by_name = {
+        monitor.get("name"): monitor for monitor in live_monitors
+    }
+
+    candidates = []
+    for workspace_id, workspace_rows in rows_by_workspace.items():
+        layout = layouts.get(workspace_id)
+        if len(workspace_rows) < 3 or not layout:
+            continue
+        if (
+            layout.get("layout") != "dwindle"
+            or not layout.get("complete")
+            or any(
+                layout.get(field) is None
+                for field in (
+                    "work_x",
+                    "work_y",
+                    "work_w",
+                    "work_h",
+                    "gap_top",
+                    "gap_right",
+                    "gap_bottom",
+                    "gap_left",
+                )
+            )
+            or any(
+                row.get("fullscreen")
+                or row.get("pinned")
+                or row.get("group_id") is not None
+                for row in workspace_rows
+            )
+        ):
+            continue
+        live_workspace = live_workspace_by_id.get(workspace_id, {})
+        if live_workspace.get("tiledLayout") != "dwindle":
+            continue
+        current_workarea = monitor_workarea(
+            live_monitor_by_name.get(live_workspace.get("monitor"), {}),
+            gaps_out,
+        )
+        if current_workarea is None or not geometries_match(
+            current_workarea[2:], (layout["work_w"], layout["work_h"])
+        ):
+            continue
+        saved_gaps_in = (
+            layout["gap_top"],
+            layout["gap_right"],
+            layout["gap_bottom"],
+            layout["gap_left"],
+        )
+        if tuple(gaps_in) != saved_gaps_in:
+            continue
+        workspace_rows.sort(key=lambda row: row["ord"])
+        tree = infer_split_tree(
+            [(row["id"], saved_geometry(row)) for row in workspace_rows],
+            (
+                layout["work_x"],
+                layout["work_y"],
+                layout["work_w"],
+                layout["work_h"],
+            ),
+            saved_gaps_in,
+        )
+        if tree is None:
+            log(f"restore: workspace {workspace_id} has ambiguous tiled geometry")
+            continue
+        saved_bounds = geometry_bounds(
+            [saved_geometry(row) for row in workspace_rows]
+        )
+        if not geometries_match(
+            saved_bounds,
+            (
+                layout.get("at_x"),
+                layout.get("at_y"),
+                layout.get("size_w"),
+                layout.get("size_h"),
+            ),
+        ):
+            continue
+        context = tiled_workspace_clients(
+            workspace_id, workspace_rows, matches, clients
+        )
+        if context is None:
+            continue
+        current, client_by_address = context
+        if any(
+            client.get("grouped") not in (None, [])
+            or client.get("pinned")
+            for client in current
+        ) or any(
+            not row_match_is_unique(row, client_by_address[matches[row["id"]]], clients)
+            for row in workspace_rows
+        ):
+            continue
+        if not geometries_match(
+            geometry_dimensions([window_geometry(client) for client in current]),
+            (layout["size_w"], layout["size_h"]),
+        ):
+            continue
+        if workspace_geometry_matches(
+            workspace_rows, matches, clients, layout, current_workarea
+        ):
+            continue
+        candidates.append(
+            (workspace_id, workspace_rows, layout, current_workarea, tree)
+        )
+
+    if not candidates:
+        return True
+    supported = nested_replay_supported()
+    if supported is None:
+        return None
+    if not supported:
+        return True
+    focus_context = focus_context or load_focus_context()
+    if focus_context is None:
+        return None
+
+    for workspace_id, workspace_rows, layout, current_workarea, tree in candidates:
+        result, addresses = replay_workspace_tree(
+            workspace_id, workspace_rows, matches, tree, focus_context
+        )
+        if result is None:
+            recover_replay_workspace(workspace_id, addresses, focus_context)
+            return None
+        refreshed = hyprctl_json("clients")
+        if refreshed is None:
+            recover_replay_workspace(workspace_id, addresses, focus_context)
+            return None
+        if not result or not workspace_geometry_matches(
+            workspace_rows, matches, refreshed, layout, current_workarea
+        ):
+            log(f"restore: tiled replay verification failed on workspace {workspace_id}")
+            recovery = recover_replay_workspace(
+                workspace_id, addresses, focus_context
+            )
+            return None if recovery is None else False
+        clients = refreshed
+    return True
 
 
 def tiled_workspace_clients(workspace_id, rows, matches, clients):
@@ -733,17 +1671,7 @@ def tiled_workspace_clients(workspace_id, rows, matches, clients):
     client_by_address = {client["address"]: client for client in current}
     for row in rows:
         client = client_by_address[matches[row["id"]]]
-        rank = client_matches(row, client)
-        candidate_ranks = [
-            candidate_rank
-            for candidate in rows
-            if (candidate_rank := client_matches(candidate, client)) is not None
-        ]
-        if (
-            rank is None
-            or rank != min(candidate_ranks)
-            or candidate_ranks.count(rank) != 1
-        ):
+        if not client_match_is_unique(row, client, rows):
             return None
     return current, client_by_address
 
@@ -793,7 +1721,7 @@ def restore_tiled_slots(rows, matches, clients):
             or current_split is None
             or saved_split[0] != current_split[0]
             or not geometries_match(
-                geometry_bounds(saved), geometry_bounds(current_geometry)
+                geometry_dimensions(saved), geometry_dimensions(current_geometry)
             )
         ):
             continue
@@ -844,7 +1772,7 @@ def restore_tiled_slots(rows, matches, clients):
             or current_split is None
             or saved_split[0] != current_split[0]
             or not geometries_match(
-                geometry_bounds(saved), geometry_bounds(current_geometry)
+                geometry_dimensions(saved), geometry_dimensions(current_geometry)
             )
         ):
             if workspace_id in swapped_workspaces:
@@ -1122,7 +2050,143 @@ def launch_request(row):
     return command, rules_str, lua
 
 
-def restore_windows(rows, initial_matches, initial_clients):
+def hyprland_supports_group_restore():
+    version = hyprctl_json("version")
+    if version is None:
+        return None
+    match = re.match(r"^v?(\d+)\.(\d+)\.(\d+)", str(version.get("version", "")))
+    if not match:
+        log("restore: cannot verify Hyprland group API version; skipping groups")
+        return False
+    return tuple(map(int, match.groups())) >= (0, 56, 0)
+
+
+def saved_window_groups(rows):
+    grouped = {}
+    for row in rows:
+        if row.get("group_id") is not None:
+            grouped.setdefault(row["group_id"], []).append(row)
+    return sorted(
+        grouped.values(), key=lambda group: min(row["ord"] for row in group)
+    )
+
+
+def restore_window_groups(rows, matches):
+    eligible = []
+    for group in saved_window_groups(rows):
+        ordered = sorted(group, key=lambda row: row.get("group_ord", -1))
+        if [row.get("group_ord") for row in ordered] != list(range(len(ordered))):
+            log("restore: skipping group with invalid saved member order")
+            continue
+        if any(row["id"] not in matches for row in ordered):
+            log("restore: skipping incomplete saved window group")
+            continue
+        if any(row.get("fullscreen") or row.get("pinned") for row in ordered):
+            log("restore: skipping fullscreen or pinned window group")
+            continue
+        if len({row.get("workspace_id") for row in ordered}) != 1 or len(
+            {bool(row.get("floating")) for row in ordered}
+        ) != 1:
+            log("restore: skipping group with inconsistent saved placement")
+            continue
+        eligible.append(ordered)
+
+    if not eligible:
+        return True
+    supported = hyprland_supports_group_restore()
+    if supported is None:
+        return None
+    if not supported:
+        log("restore: Hyprland 0.56+ is required to restore window groups")
+        return True
+
+    clients = hyprctl_json("clients")
+    if clients is None:
+        return None
+    client_by_address = {
+        client.get("address"): client
+        for client in clients
+        if client.get("mapped") and client.get("address")
+    }
+    expected_groups = []
+    for group in eligible:
+        addresses = [matches[row["id"]] for row in group]
+        current = [client_by_address.get(address) for address in addresses]
+        if any(client is None for client in current):
+            log("restore: skipping group whose matched member disappeared")
+            continue
+        if any(
+            not client_match_is_unique(row, client, rows)
+            or not row_match_is_unique(row, client, clients)
+            for row, client in zip(group, current)
+        ):
+            log("restore: skipping group with ambiguous matched members")
+            continue
+        grouped = [client.get("grouped") for client in current]
+        if all(value == addresses for value in grouped):
+            continue
+        if any(value not in (None, []) for value in grouped):
+            log("restore: skipping group with conflicting current membership")
+            continue
+
+        selectors = [lua_quote(f"address:{address}") for address in addresses]
+        declarations = [
+            f"local w{index}=assert(hl.get_window({selector}), 'group member missing')"
+            for index, selector in enumerate(selectors, 1)
+        ]
+        ungrouped = " and ".join(
+            f"w{index}.group == nil" for index in range(1, len(addresses) + 1)
+        )
+        operations = [
+            *declarations,
+            f"assert({ungrouped}, 'group member already grouped')",
+            f"hl.dispatch(hl.dsp.group.toggle({{ window = {selectors[0]} }}))",
+            "local g=assert(w1.group, 'group creation failed')",
+            *(
+                f"g:add(w{index}, g.size + 1)"
+                for index in range(2, len(addresses) + 1)
+            ),
+            *(
+                [
+                    f"hl.dispatch(hl.dsp.group.active({{ index = 1, window = {selectors[0]} }}))"
+                ]
+                if len(addresses) > 1
+                else []
+            ),
+            f"assert(g.size == {len(addresses)}, 'group size mismatch')",
+            *(
+                f"assert(g.members[{index}] == w{index}, 'group order mismatch')"
+                for index in range(1, len(addresses) + 1)
+            ),
+        ]
+        eval_result = eval_lua(" ".join(operations))
+        if eval_result is None:
+            return None
+        if not eval_result:
+            return False
+        expected_groups.append(addresses)
+
+    if not expected_groups:
+        return True
+    clients = hyprctl_json("clients")
+    if clients is None:
+        return None
+    client_by_address = {
+        client.get("address"): client
+        for client in clients
+        if client.get("mapped") and client.get("address")
+    }
+    for addresses in expected_groups:
+        if any(
+            client_by_address.get(address, {}).get("grouped") != addresses
+            for address in addresses
+        ):
+            log("restore: reconstructed window group failed verification")
+            return False
+    return True
+
+
+def restore_windows(rows, initial_matches, initial_clients, layouts=None):
     row_by_id = {row["id"]: row for row in rows}
     matches = dict(initial_matches)
     used_addresses = {
@@ -1239,7 +2303,7 @@ def restore_windows(rows, initial_matches, initial_clients):
                     state["attempts"] = state["max_attempts"]
 
         if len(handled) < len(rows):
-            time.sleep(0.2)
+            time.sleep(RESTORE_POLL_INTERVAL)
 
     for row in rows:
         if row["id"] not in handled:
@@ -1248,6 +2312,10 @@ def restore_windows(rows, initial_matches, initial_clients):
             log(
                 f"restore: no window appeared for {row['class']} ({state['launch_cmd']})"
             )
+    focus_context = load_focus_context()
+    if focus_context is None:
+        log("restore: Hyprland IPC failed while recording focus")
+        return restored, failures, launched_processes, True
     if any(not row.get("floating") and saved_geometry(row) is not None for row in rows):
         clients = hyprctl_json("clients")
         if clients is None:
@@ -1258,11 +2326,36 @@ def restore_windows(rows, initial_matches, initial_clients):
             for row_id, address in matches.items()
             if row_by_id[row_id].get("workspace_id") not in failed_monitor_workspaces
         }
+        nested_result = restore_nested_tiled_layouts(
+            rows, tiled_matches, clients, layouts or {}, focus_context
+        )
+        if nested_result is None:
+            log("restore: Hyprland IPC failed while replaying tiled layouts")
+            return restored, failures, launched_processes, True
+        if not nested_result:
+            failures += 1
+        clients = hyprctl_json("clients")
+        if clients is None:
+            log("restore: Hyprland IPC failed after replaying tiled layouts")
+            return restored, failures, launched_processes, True
         tiled_result = restore_tiled_slots(rows, tiled_matches, clients)
         if tiled_result is None:
             return restored, failures, launched_processes, True
         if not tiled_result:
             failures += 1
+    group_result = restore_window_groups(rows, matches)
+    if group_result is None:
+        log("restore: Hyprland IPC failed while restoring window groups")
+        return restored, failures, launched_processes, True
+    if not group_result:
+        failures += 1
+    focus_result = restore_focus_context(focus_context)
+    if focus_result is None:
+        log("restore: Hyprland IPC failed while restoring focus")
+        return restored, failures, launched_processes, True
+    if not focus_result:
+        log("restore: failed to restore the previously focused workspace")
+        failures += 1
     return restored, failures, launched_processes, False
 
 
@@ -1295,8 +2388,8 @@ def cmd_restore(dry_run=False):
             conn.close()
             return 0
         rows = load_windows(conn, sid)
-        conn.close()
         if not rows:
+            conn.close()
             print("saved session is empty; nothing to restore")
             return 0 if dry_run or mark_restore_completed(sid) else 75
         initial_matches = match_windows(rows, clients, max_rank=2)
@@ -1315,14 +2408,18 @@ def cmd_restore(dry_run=False):
             print(
                 f"would launch up to {launched_processes} processes for {len(rows)} windows"
             )
+            conn.close()
             return 0
+
+        layouts = load_workspace_layouts(conn, sid)
+        conn.close()
 
         if not mark_restore_completed(sid, complete=False):
             print("restore deferred: could not persist restore state", file=sys.stderr)
             return 75
 
         restored, failures, launched_processes, ipc_failed = restore_windows(
-            rows, initial_matches, clients
+            rows, initial_matches, clients, layouts
         )
         print(f"restored {restored}/{len(rows)} windows")
         log(

@@ -23,23 +23,38 @@
 - [ ] **Monitor remapping acceptance**: verify saved workspaces on disconnected,
       renamed, rewired, and reordered monitors, including floating geometry on
       a differently sized fallback display.
-- [ ] **Stable identity**: investigate Hyprland `stableId` support and prefer it
-      over title-based matching where it remains valid across compositor
-      sessions.
-- [ ] **Window groups**: restore Hyprland group membership after every member
-      has been matched and placed.
+- [x] **Stable identity investigation**: Hyprland `stableId` is a per-process
+      incrementing window-object ID. It changes when an app creates a new window
+      and its counter resets when Hyprland restarts, so it cannot identify a
+      semantic window across reboot and is intentionally not persisted.
+- [x] **Window group implementation**: capture complete membership and order,
+      then safely reconstruct uniquely matched groups through Hyprland 0.56's
+      public Lua API after placement.
+- [ ] **Window group acceptance**: verify ordered reconstruction live, including
+      partial, ambiguous, pre-existing, floating, and failed groups. Active-tab,
+      fullscreen/pinned, and lock/deny restoration remain unsupported.
 - [ ] **Exact tiled layout serialization**: pursue a Hyprland API or native
       plugin that exports and restores dwindle/master split trees and ratios.
       This is the robust replacement for inferred pixel resizing, but a local
-      plugin would require C++ code tied to Hyprland's unstable internal ABI and
-      rebuilding for matching compositor versions.
+       plugin would require C++ code tied to Hyprland's unstable internal ABI and
+       rebuilding for matching compositor versions.
+- [x] **Inferred nested dwindle replay**: infer an unambiguous guillotine tree
+      from schema-v5 workspace geometry, rebuild complete uniquely matched
+      workspaces through guarded public Lua dispatches, restore focus, and verify
+      every final rectangle. Controlled reboot acceptance remains outstanding.
+- [x] **Translated tiled sizing**: restore simple two-window split ratios when
+      monitor reordering changes the workspace origin but not its dimensions.
 - [ ] **Slow applications**: collect real startup timings and make the restore
       timeout configurable only if the current 20-second bound is insufficient.
-- [ ] **Restore performance**: benchmark dispatch and window-discovery latency
-      with larger sessions. Python is currently appropriate because restore is
-      I/O-bound, applications launch concurrently, and its standard library
-      provides robust JSON, SQLite, process, and `/proc` handling without extra
-      dependencies. If the current 200 ms polling becomes a bottleneck,
+- [x] **Polling latency**: reduce window-discovery polling from 200 ms to 50 ms,
+      limiting avoidable detection delay without changing restore semantics.
+- [ ] **Restore performance benchmark**: benchmark dispatch and window-discovery
+      latency with larger sessions. Python is currently appropriate because
+      restore is I/O-bound, applications launch concurrently, and its standard
+      library provides robust JSON, SQLite, process, and `/proc` handling
+      without extra dependencies. A synthetic matching benchmark reached a
+      7.62 ms p95 at 64 windows; live IPC and discovery timings remain. If
+      subprocess polling remains a bottleneck,
       investigate Hyprland event notifications or persistent IPC before
       considering a language rewrite.
 - [x] **Chromium app-mode launcher**: strictly recognized web-app windows launch

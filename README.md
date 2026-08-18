@@ -4,23 +4,26 @@ Restore window positions and running apps after reboot or shutdown on
 Omarchy (Hyprland). Snapshot lives in a sqlite DB at
 `${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/session.db`.
 
-Scope: floating windows restore pixel-exact. Tiled windows relaunch onto the
-saved workspaces; complete, uniquely matched two-window splits are resized
-toward their saved dimensions, and compatible saved slots have their occupants
-corrected. This remains best-effort because Hyprland does not expose the split
-tree. App content (browser tabs, unsaved docs, tmux sessions) stays
-application-owned. See `docs/session-restore-spec.md`.
+Scope: floating windows restore pixel-exact. Complete, uniquely matched nested
+dwindle layouts with one unambiguous recursive split are rebuilt from their
+saved rectangles and verified. Simple two-window sizing and compatible-slot
+correction remain the fallback. This is still best-effort because Hyprland does
+not expose its split tree. App content (browser tabs, unsaved docs, tmux
+sessions) stays application-owned. See `docs/session-restore-spec.md`.
 
 ## How it works
 
-**Save** (`omarchy-sesh save`) queries `hyprctl -j clients` and `hyprctl -j monitors`,
+**Save** (`omarchy-sesh save`) queries clients, monitors, and workspaces through
+`hyprctl -j`,
 filters out unmapped windows and excluded classes, and for each remaining
 window reads its real command line and cwd from `/proc/<pid>/{cmdline,cwd}`.
 Position, size, workspace, monitor connector and description, and
 floating/fullscreen/pinned state are captured alongside the launch command and
-written as one `sessions` row plus one `windows` row per window in the sqlite
-DB. Windows sharing a saved PID are kept as one launch group. The latest five
-complete and five diagnostic snapshots are retained.
+written as one `sessions` row plus window and workspace-layout rows in the
+sqlite DB. Complete Hyprland group membership and member order are translated
+from live addresses to snapshot-local metadata. Windows sharing a saved PID are
+kept as one launch group. The latest five complete and five diagnostic
+snapshots are retained.
 
 **Restore** (`omarchy-sesh restore`) loads the most recent complete session;
 a healthy empty session intentionally restores nothing. An advisory lock
@@ -32,27 +35,44 @@ appear during one shared bounded polling window. If a process does not recreate
 all of its saved windows, its command is retried independently. Chromium app-mode
 windows are restored individually through
 Omarchy's web-app launcher because Chromium does not reopen them from the base
-browser command. Each saved workspace returns to the same connected monitor;
+browser command. After matching, eligible nested dwindle workspaces are rebuilt
+in one fast Lua evaluation: one seed remains on the target workspace while the
+other leaves pass through a temporary staging workspace. Focus, insertion
+direction, and split ratios recreate the saved geometry, which is then verified.
+Each saved workspace returns to the same connected monitor;
 renamed or rewired outputs are identified by monitor description. Workspaces
 from disconnected displays fall back to the focused monitor, then the lowest
 monitor ID. `--dry-run` prints the launch plan without executing it.
+
+On Hyprland 0.56 or newer, complete and uniquely matched window groups are
+re-formed in saved member order after placement. Partial or ambiguous groups,
+unrelated existing groups, and groups containing fullscreen or pinned windows
+are left unchanged. Hyprland does not expose the saved active tab or lock/deny
+state; reconstructed groups select their first saved member. Hyprland 0.55
+continues to restore the windows without grouping them.
 
 **Autosave** (`omarchy-sesh autosave`) waits one interval before its first
 capture, then saves periodically (default 60s, configurable). It remains gated
 until restore succeeds, so a partial login cannot replace the reboot snapshot,
 and refreshes the active Hyprland instance before every capture. Explicitly
 selecting Active mode captures the current desktop first when no successful
-restore marker exists.
+restore marker exists. A synchronous logout, reboot, or shutdown save closes
+the gate before capture so a periodic save cannot supersede it during teardown.
 
-Because tiled windows are relaunched independently rather than replayed into
-Hyprland's split tree, the tool attempts saved pixel sizes only for a simple
-two-window split when both windows are present, uniquely identified, share the
-same split axis, and the workspace bounds are unchanged. It puts each window on
-the correct side before resizing one split anchor. Compatible multi-window
-slots still receive occupant correction, but their geometry is not resized.
-This usually recovers simple ratios such as 70/30, but cannot reconstruct
-missing or nested splits. See `docs/session-restore-spec.md` for the full design
-rationale and limitations.
+Nested replay requires a schema-v5 snapshot, `dwindle:use_active_for_splits =
+true`, `dwindle:preserve_split = true`,
+`dwindle:permanent_direction_override = false`, every saved tiled window to be
+present and uniquely identified, no unrelated tiled occupants, unchanged
+workspace dimensions, and geometry with one unambiguous recursive split. Apps
+continue to launch in parallel. Replay runs independently per workspace and
+restores the focused window or empty workspace afterward; because Hyprland
+layout messages act on the focused workspace, a very brief workspace change may
+still be visible during login.
+Ineligible workspaces retain the existing two-window ratio and compatible-slot
+fallback without moving unrelated windows. Hyprland's `stableId` is only a live
+compositor window-object selector and resets with Hyprland, so ambiguous
+same-class windows still depend on title and workspace metadata. See
+`docs/session-restore-spec.md` for the full design rationale and limitations.
 When a disconnected display falls back to a monitor with different dimensions,
 saved floating coordinates may require manual adjustment.
 
@@ -60,6 +80,10 @@ saved floating coordinates may require manual adjustment.
 
 - Hyprland >= 0.55 (uses the Lua dispatch API)
 - python3 (stdlib only — sqlite3, json, shlex)
+
+Nested tiled replay requires Hyprland >= 0.56 with the three dwindle options
+listed above. Ordinary restore remains available when those conditions are not
+met.
 
 ## Install
 
@@ -76,8 +100,9 @@ Installs (user-level, no sudo needed) and is idempotent:
 `omarchy-sesh.service` is the single restore trigger. The autosave service is
 ordered after it and waits one interval before its first capture. Logout,
 reboot, and shutdown menu actions save synchronously before Omarchy closes any
-windows; `ExecStop` remains a diagnostic fallback and cannot replace a healthy
-snapshot. Old snapshots are pruned automatically.
+windows and close the autosave gate first; `ExecStop` remains a diagnostic
+fallback and cannot replace a healthy snapshot. Old snapshots are pruned
+automatically.
 Newly enabled services start with the next graphical login; reinstalling does
 not relaunch applications. Updates restart an already-running autosave process
 so it uses the newly installed binary.
