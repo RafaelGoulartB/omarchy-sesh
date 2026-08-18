@@ -65,6 +65,32 @@ def hyprctl_json(*args):
         return None
 
 
+def hyprctl_batch_json(*commands):
+    out = subprocess.run(
+        ["hyprctl", "-j", "--batch", "; ".join(commands)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if out.returncode != 0:
+        log(f"hyprctl -j --batch failed: {out.stderr.strip()}")
+        return None
+    decoder = json.JSONDecoder()
+    values = []
+    position = 0
+    while position < len(out.stdout):
+        while position < len(out.stdout) and out.stdout[position].isspace():
+            position += 1
+        if position == len(out.stdout):
+            break
+        try:
+            value, position = decoder.raw_decode(out.stdout, position)
+        except json.JSONDecodeError:
+            return None
+        values.append(value)
+    return values if len(values) == len(commands) else None
+
+
 def dispatch(lua):
     out = subprocess.run(
         ["hyprctl", "dispatch", lua], capture_output=True, text=True, check=False
@@ -87,7 +113,7 @@ def eval_lua(lua):
     )
     if out.returncode != 0 or out.stdout.strip() != "ok":
         log(f"eval failed ({lua}): {output}")
-        if 1 <= out.returncode <= 6:
+        if out.returncode < 0 or 1 <= out.returncode <= 6:
             return None
         return False
     return True
@@ -1219,10 +1245,10 @@ def nested_replay_supported():
         "dwindle:preserve_split": True,
         "dwindle:permanent_direction_override": False,
     }
-    for option, expected in required.items():
-        value = hyprctl_json("getoption", option)
-        if value is None:
-            return None
+    values = hyprctl_batch_json(*(f"getoption {option}" for option in required))
+    if values is None:
+        return None
+    for (option, expected), value in zip(required.items(), values):
         if value.get("bool") is not expected:
             log(
                 f"restore: nested tiled replay requires {option} = "
@@ -1477,25 +1503,18 @@ def restore_nested_tiled_layouts(
         for workspace_id, workspace_rows in rows_by_workspace.items()
     ):
         return True
-    live_workspaces = hyprctl_json("workspaces")
-    live_monitors = hyprctl_json("monitors")
-    gaps_out = hyprctl_json("getoption", "general:gaps_out")
-    gaps_in = hyprctl_json("getoption", "general:gaps_in")
     workspace_rules = hyprctl_json("workspacerules")
-    if any(
-        value is None
-        for value in (
-            live_workspaces,
-            live_monitors,
-            gaps_out,
-            gaps_in,
-            workspace_rules,
-        )
-    ):
+    if workspace_rules is None:
         return None
     if workspace_rules:
         log("restore: workspace-specific rules disable nested tiled replay")
         return True
+    live_workspaces = hyprctl_json("workspaces")
+    live_monitors = hyprctl_json("monitors")
+    gaps_out = hyprctl_json("getoption", "general:gaps_out")
+    gaps_in = hyprctl_json("getoption", "general:gaps_in")
+    if any(value is None for value in (live_workspaces, live_monitors, gaps_out, gaps_in)):
+        return None
     gaps_out = css_gaps(gaps_out)
     gaps_in = css_gaps(gaps_in)
     if gaps_out is None or gaps_in is None:
@@ -2071,7 +2090,7 @@ def saved_window_groups(rows):
     )
 
 
-def restore_window_groups(rows, matches):
+def restore_window_groups(rows, matches, failed_monitor_workspaces=()):
     eligible = []
     for group in saved_window_groups(rows):
         ordered = sorted(group, key=lambda row: row.get("group_ord", -1))
@@ -2083,6 +2102,11 @@ def restore_window_groups(rows, matches):
             continue
         if any(row.get("fullscreen") or row.get("pinned") for row in ordered):
             log("restore: skipping fullscreen or pinned window group")
+            continue
+        if any(
+            row.get("workspace_id") in failed_monitor_workspaces for row in ordered
+        ):
+            log("restore: skipping group after failed monitor placement")
             continue
         if len({row.get("workspace_id") for row in ordered}) != 1 or len(
             {bool(row.get("floating")) for row in ordered}
@@ -2114,6 +2138,12 @@ def restore_window_groups(rows, matches):
         current = [client_by_address.get(address) for address in addresses]
         if any(client is None for client in current):
             log("restore: skipping group whose matched member disappeared")
+            continue
+        if any(
+            (client.get("workspace") or {}).get("id") != row.get("workspace_id")
+            for row, client in zip(group, current)
+        ):
+            log("restore: skipping group whose members are not on their saved workspace")
             continue
         if any(
             not client_match_is_unique(row, client, rows)
@@ -2314,8 +2344,11 @@ def restore_windows(rows, initial_matches, initial_clients, layouts=None):
             )
     focus_context = load_focus_context()
     if focus_context is None:
-        log("restore: Hyprland IPC failed while recording focus")
-        return restored, failures, launched_processes, True
+        log(
+            "restore: Hyprland IPC failed while recording focus; "
+            "tiled/group correction will still run"
+        )
+        failures += 1
     if any(not row.get("floating") and saved_geometry(row) is not None for row in rows):
         clients = hyprctl_json("clients")
         if clients is None:
@@ -2343,19 +2376,20 @@ def restore_windows(rows, initial_matches, initial_clients, layouts=None):
             return restored, failures, launched_processes, True
         if not tiled_result:
             failures += 1
-    group_result = restore_window_groups(rows, matches)
+    group_result = restore_window_groups(rows, matches, failed_monitor_workspaces)
     if group_result is None:
         log("restore: Hyprland IPC failed while restoring window groups")
         return restored, failures, launched_processes, True
     if not group_result:
         failures += 1
-    focus_result = restore_focus_context(focus_context)
-    if focus_result is None:
-        log("restore: Hyprland IPC failed while restoring focus")
-        return restored, failures, launched_processes, True
-    if not focus_result:
-        log("restore: failed to restore the previously focused workspace")
-        failures += 1
+    if focus_context is not None:
+        focus_result = restore_focus_context(focus_context)
+        if focus_result is None:
+            log("restore: Hyprland IPC failed while restoring focus")
+            return restored, failures, launched_processes, True
+        if not focus_result:
+            log("restore: failed to restore the previously focused workspace")
+            failures += 1
     return restored, failures, launched_processes, False
 
 

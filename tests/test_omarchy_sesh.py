@@ -175,6 +175,31 @@ class OmarchySeshTests(unittest.TestCase):
         ):
             self.assertIsNone(self.module.eval_lua("return true"))
 
+        result.returncode = -9
+        with (
+            mock.patch.object(self.module.subprocess, "run", return_value=result),
+            mock.patch.object(self.module, "log"),
+        ):
+            self.assertIsNone(self.module.eval_lua("return true"))
+
+    def test_hyprctl_batch_json_parses_each_response(self):
+        result = mock.Mock(
+            returncode=0,
+            stdout='{"bool": true}\n\n{"bool": false}\n',
+            stderr="",
+        )
+        with mock.patch.object(self.module.subprocess, "run", return_value=result) as run:
+            self.assertEqual(
+                [{"bool": True}, {"bool": False}],
+                self.module.hyprctl_batch_json("getoption one", "getoption two"),
+            )
+        run.assert_called_once_with(
+            ["hyprctl", "-j", "--batch", "getoption one; getoption two"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
     def test_migration_marks_historical_empty_session_unknown(self):
         self.module.STATE_DIR.mkdir(parents=True)
         conn = sqlite3.connect(self.module.DB_PATH)
@@ -1145,6 +1170,63 @@ class OmarchySeshTests(unittest.TestCase):
         hyprctl.assert_not_called()
         evaluate.assert_not_called()
 
+    def test_window_group_restore_skips_members_off_saved_workspace(self):
+        first = window(1, 0, "terminal", 10, title="First")
+        second = window(2, 1, "terminal", 20, title="Second")
+        first.update(group_id=1, group_ord=0)
+        second.update(group_id=1, group_ord=1)
+        clients = [group_client(first, "0xa", []), group_client(second, "0xb", [])]
+        clients[1]["workspace"] = {"id": 2}
+        with (
+            mock.patch.object(
+                self.module,
+                "hyprctl_json",
+                side_effect=[{"version": "0.56.2"}, clients],
+            ),
+            mock.patch.object(self.module, "eval_lua") as evaluate,
+            mock.patch.object(self.module, "log") as log,
+        ):
+            self.assertTrue(
+                self.module.restore_window_groups(
+                    [first, second], {1: "0xa", 2: "0xb"}
+                )
+            )
+        evaluate.assert_not_called()
+        log.assert_any_call(
+            "restore: skipping group whose members are not on their saved workspace"
+        )
+
+    def test_window_group_restore_skips_failed_monitor_placement(self):
+        first = window(1, 0, "terminal", 10, title="First")
+        second = window(2, 1, "terminal", 20, title="Second")
+        first.update(group_id=1, group_ord=0)
+        second.update(group_id=1, group_ord=1)
+        clients = [group_client(first, "0xa", []), group_client(second, "0xb", [])]
+        with (
+            mock.patch.object(
+                self.module,
+                "load_workspace_monitor_context",
+                return_value=({}, {}, False),
+            ),
+            mock.patch.object(
+                self.module, "prepare_workspace_monitor", return_value=False
+            ),
+            mock.patch.object(self.module, "place_window") as place,
+            mock.patch.object(self.module, "load_focus_context", return_value={}),
+            mock.patch.object(self.module, "restore_focus_context", return_value=True),
+            mock.patch.object(self.module, "hyprctl_json") as hyprctl,
+            mock.patch.object(self.module, "eval_lua") as evaluate,
+            mock.patch.object(self.module, "log") as log,
+        ):
+            result = self.module.restore_windows(
+                [first, second], {1: "0xa", 2: "0xb"}, clients
+            )
+        self.assertEqual((0, 2, 0, False), result)
+        place.assert_not_called()
+        hyprctl.assert_not_called()
+        evaluate.assert_not_called()
+        log.assert_any_call("restore: skipping group after failed monitor placement")
+
     def test_window_group_restore_skips_unrelated_existing_group(self):
         first = window(1, 0, "terminal", 10, title="First")
         second = window(2, 1, "terminal", 20, title="Second")
@@ -1394,6 +1476,43 @@ class OmarchySeshTests(unittest.TestCase):
             )
         self.assertEqual((2, 0, 0, False), result)
         self.assertEqual(["tiled", "groups"], events)
+
+    def test_focus_context_ipc_failure_does_not_block_tiled_or_group_restore(self):
+        row = window(1, 0, "first", 10)
+        row.update(at_x=0, at_y=0, size_w=500, size_h=1000)
+        events = []
+        clients = [{"mapped": True, "address": "0xa"}]
+        with (
+            mock.patch.object(
+                self.module,
+                "load_workspace_monitor_context",
+                return_value=({}, {}, False),
+            ),
+            mock.patch.object(
+                self.module, "prepare_workspace_monitor", return_value=True
+            ),
+            mock.patch.object(self.module, "place_window", return_value=True),
+            mock.patch.object(
+                self.module,
+                "restore_tiled_slots",
+                side_effect=lambda *_args: events.append("tiled") or True,
+            ),
+            mock.patch.object(self.module, "hyprctl_json", return_value=clients),
+            mock.patch.object(
+                self.module,
+                "restore_window_groups",
+                side_effect=lambda *_args: events.append("groups") or True,
+            ),
+            mock.patch.object(self.module, "load_focus_context", return_value=None),
+            mock.patch.object(
+                self.module, "restore_focus_context"
+            ) as restore_focus,
+            mock.patch.object(self.module, "log"),
+        ):
+            result = self.module.restore_windows([row], {1: "0xa"}, clients)
+        self.assertEqual((1, 1, 0, False), result)
+        self.assertEqual(["tiled", "groups"], events)
+        restore_focus.assert_not_called()
 
     def run_restore(
         self,
@@ -1828,6 +1947,33 @@ class OmarchySeshTests(unittest.TestCase):
             )
         replay.assert_not_called()
 
+    def test_nested_replay_checks_workspace_rules_before_context_queries(self):
+        rows = self.nested_workspace()
+        matches = {1: "0xleft", 2: "0xtop", 3: "0xbottom"}
+        clients = [
+            tiled_client(rows[0], "0xleft", [0, 0], [500, 1000]),
+            tiled_client(rows[1], "0xtop", [500, 0], [500, 500]),
+            tiled_client(rows[2], "0xbottom", [500, 500], [500, 500]),
+        ]
+        with (
+            mock.patch.object(
+                self.module, "hyprctl_json", return_value=[{"workspaceString": "1"}]
+            ) as hyprctl,
+            mock.patch.object(self.module, "replay_workspace_tree") as replay,
+            mock.patch.object(self.module, "log"),
+        ):
+            self.assertTrue(
+                self.module.restore_nested_tiled_layouts(
+                    rows,
+                    matches,
+                    clients,
+                    {1: workspace_layout()},
+                    {"address": "0xfocused", "workspace_id": 2},
+                )
+            )
+        hyprctl.assert_called_once_with("workspacerules")
+        replay.assert_not_called()
+
     def test_nested_replay_failure_recovers_staged_windows(self):
         rows = self.nested_workspace()
         matches = {1: "0xleft", 2: "0xtop", 3: "0xbottom"}
@@ -1988,22 +2134,36 @@ class OmarchySeshTests(unittest.TestCase):
 
     def test_nested_replay_capability_checks_version_and_dwindle_options(self):
         enabled = [
-            {"version": "0.56.2"},
             {"bool": True},
             {"bool": True},
             {"bool": False},
         ]
-        with mock.patch.object(self.module, "hyprctl_json", side_effect=enabled):
+        with (
+            mock.patch.object(
+                self.module, "hyprctl_json", return_value={"version": "0.56.2"}
+            ) as hyprctl,
+            mock.patch.object(
+                self.module, "hyprctl_batch_json", return_value=enabled
+            ) as batch,
+        ):
             self.assertTrue(self.module.nested_replay_supported())
+        hyprctl.assert_called_once_with("version")
+        batch.assert_called_once_with(
+            "getoption dwindle:use_active_for_splits",
+            "getoption dwindle:preserve_split",
+            "getoption dwindle:permanent_direction_override",
+        )
 
         permanent = [
-            {"version": "0.56.2"},
             {"bool": True},
             {"bool": True},
             {"bool": True},
         ]
         with (
-            mock.patch.object(self.module, "hyprctl_json", side_effect=permanent),
+            mock.patch.object(
+                self.module, "hyprctl_json", return_value={"version": "0.56.2"}
+            ),
+            mock.patch.object(self.module, "hyprctl_batch_json", return_value=permanent),
             mock.patch.object(self.module, "log"),
         ):
             self.assertFalse(self.module.nested_replay_supported())
