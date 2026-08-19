@@ -172,6 +172,26 @@ Config (optional): `${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/sesh/config.json`
 }
 ```
 
+## Dependencies
+
+- `hyprctl` — queried (`-j`) for clients, monitors, and workspaces, and
+  invoked to relaunch/place windows during restore.
+- `bash` — runs `install.sh`/`uninstall.sh`.
+- `python3` (stdlib only: `sqlite3`, `json`, `shlex`) — implements the
+  `omarchy-sesh` CLI.
+- `/proc/<pid>/{cmdline,cwd}` — read directly to capture each window's
+  launch command and working directory.
+- systemd user units (`omarchy-sesh.service`,
+  `omarchy-sesh-autosave.service`) — installed to drive restore-on-login and
+  periodic autosave.
+
+No network calls and no non-stdlib QML imports. See
+[Requirements](#requirements) for version constraints.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
 ## Uninstall
 
 Omarchy does not run lifecycle hooks when removing plugins. For a plugin
