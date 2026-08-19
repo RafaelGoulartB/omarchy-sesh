@@ -1,5 +1,6 @@
 import importlib.machinery
 import importlib.util
+import io
 import os
 import sqlite3
 import subprocess
@@ -1724,6 +1725,44 @@ class OmarchySeshTests(unittest.TestCase):
         self.assertEqual(2, place.call_count)
         self.assertEqual(["initial-scan", "dispatch", "dispatch", "poll"], events[:4])
 
+    def test_tiled_workspace_is_corrected_before_unrelated_window_times_out(self):
+        first = window(1, 0, "left", 10)
+        second = window(2, 1, "right", 20)
+        slow = window(3, 2, "slow", 30)
+        first.update(at_x=0, at_y=0, size_w=500, size_h=1000)
+        second.update(at_x=500, at_y=0, size_w=500, size_h=1000)
+        slow["workspace_id"] = 2
+        events = []
+
+        with mock.patch.object(
+            self.module,
+            "restore_tiled_layouts",
+            side_effect=lambda *_args: events.append("tiled") or True,
+        ):
+            result, _dispatch, _place = self.run_restore(
+                [first, second, slow],
+                wait_matches={2: "0x2", 3: "0x3"},
+                appearances={2: 2, 3: 4},
+                clients=[
+                    {
+                        "mapped": True,
+                        "address": "0x1",
+                        "class": first["class"],
+                        "initialClass": first["initial_class"],
+                        "title": first["title"],
+                        "initialTitle": first["initial_title"],
+                        "workspace": {"id": 1},
+                    }
+                ],
+                events=events,
+            )
+
+        self.assertEqual(1, result)
+        self.assertIn("tiled", events)
+        polls = [index for index, event in enumerate(events) if event == "poll"]
+        self.assertGreaterEqual(len(polls), 2)
+        self.assertLess(events.index("tiled"), polls[1])
+
     def test_launched_window_is_discovered_before_workspace_placement(self):
         row = window(1, 0, "terminal", 10, title="Saved")
         result, dispatch, place = self.run_restore(
@@ -2011,6 +2050,23 @@ class OmarchySeshTests(unittest.TestCase):
         recover.assert_called_once_with(
             1, ["0xleft", "0xtop", "0xbottom"], focus
         )
+
+    def test_tiled_layout_helper_runs_slot_fallback_after_nested_failure(self):
+        rows = self.nested_workspace()
+        clients = [tiled_client(rows[0], "0xleft", [0, 0], [500, 1000])]
+        with (
+            mock.patch.object(
+                self.module, "restore_nested_tiled_layouts", return_value=False
+            ),
+            mock.patch.object(self.module, "hyprctl_json", return_value=clients),
+            mock.patch.object(
+                self.module, "restore_tiled_slots", return_value=True
+            ) as slots,
+        ):
+            self.assertFalse(
+                self.module.restore_tiled_layouts(rows, {1: "0xleft"}, clients, {})
+            )
+        slots.assert_called_once_with(rows, {1: "0xleft"}, clients)
 
     def test_nested_replay_ipc_failure_is_retryable(self):
         rows = self.nested_workspace()
@@ -3314,6 +3370,59 @@ class OmarchySeshTests(unittest.TestCase):
             self.assertNotEqual(0, result.returncode)
             self.assertTrue(binary.is_symlink())
             self.assertIn("could not verify", result.stderr)
+        finally:
+            temporary.cleanup()
+
+    def test_acceptance_reports_matching_power_menu_restore(self):
+        temporary = tempfile.TemporaryDirectory()
+        try:
+            module = load_module(temporary.name)
+            row = window(1, 0, "terminal", 10, title="acceptance")
+            sid = module.persist_snapshot("logout", "complete", "", [row])
+            module.RESTORE_MARKER_PATH.write_text(
+                '{"session": %d, "instance": "instance-1", "complete": true}' % sid
+            )
+            client = tiled_client(row, "0x1", [0, 0], [1000, 1000])
+            with (
+                mock.patch.dict(
+                    os.environ, {"HYPRLAND_INSTANCE_SIGNATURE": "instance-1"}, clear=False
+                ),
+                mock.patch.object(module, "systemd_unit_active", return_value=True),
+                mock.patch.object(module, "hyprctl_json", return_value=[client]),
+                mock.patch.object(
+                    module, "subprocess"
+                ) as subprocess_mock,
+                mock.patch("sys.stdout", new_callable=io.StringIO) as output,
+            ):
+                subprocess_mock.run.return_value.returncode = 0
+                result = module.cmd_acceptance(expect_power_save=True)
+            self.assertEqual(0, result)
+            self.assertNotIn("FAIL:", output.getvalue())
+        finally:
+            temporary.cleanup()
+
+    def test_acceptance_reports_expected_restore_failure(self):
+        temporary = tempfile.TemporaryDirectory()
+        try:
+            module = load_module(temporary.name)
+            row = window(1, 0, "terminal", 10)
+            sid = module.persist_snapshot("logout", "complete", "", [row])
+            module.RESTORE_MARKER_PATH.write_text(
+                '{"session": %d, "instance": "instance-1", "complete": false}' % sid
+            )
+            with (
+                mock.patch.dict(
+                    os.environ, {"HYPRLAND_INSTANCE_SIGNATURE": "instance-1"}, clear=False
+                ),
+                mock.patch.object(module, "systemd_unit_failed", return_value=True),
+                mock.patch.object(module, "systemd_unit_active", return_value=True),
+                mock.patch.object(module, "subprocess") as subprocess_mock,
+                mock.patch("sys.stdout", new_callable=io.StringIO) as output,
+            ):
+                subprocess_mock.run.return_value.returncode = 0
+                result = module.cmd_acceptance(expect_restore_failure=True)
+            self.assertEqual(0, result)
+            self.assertNotIn("FAIL:", output.getvalue())
         finally:
             temporary.cleanup()
 

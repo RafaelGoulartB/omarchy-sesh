@@ -1876,6 +1876,22 @@ def restore_tiled_slots(rows, matches, clients):
     return all_ok
 
 
+def restore_tiled_layouts(rows, matches, clients, layouts, focus_context=None):
+    nested_result = restore_nested_tiled_layouts(
+        rows, matches, clients, layouts or {}, focus_context
+    )
+    if nested_result is None:
+        return None
+    clients = hyprctl_json("clients")
+    if clients is None:
+        log("restore: Hyprland IPC failed after replaying tiled layouts")
+        return None
+    slots_result = restore_tiled_slots(rows, matches, clients)
+    if slots_result is None:
+        return None
+    return nested_result and slots_result
+
+
 def restore_was_completed(sid):
     instance = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
     if not instance:
@@ -2316,6 +2332,21 @@ def restore_windows(rows, initial_matches, initial_clients, layouts=None):
                 failures += 1
             handled.add(row_id)
 
+        # A complete workspace can be corrected while unrelated applications
+        # are still starting, rather than waiting for the restore-wide deadline.
+        if found and len(handled) < len(rows) and any(
+            not row.get("floating") and saved_geometry(row) is not None
+            for row in rows
+        ):
+            tiled_result = restore_tiled_layouts(
+                rows, matches, clients, layouts or {}
+            )
+            if tiled_result is None:
+                log("restore: Hyprland IPC failed while replaying tiled layouts")
+                return restored, failures, launched_processes, True
+            if not tiled_result:
+                failures += 1
+
         now = time.monotonic()
         for state in states:
             missing = [row for row in state["rows"] if row["id"] not in handled]
@@ -2359,20 +2390,11 @@ def restore_windows(rows, initial_matches, initial_clients, layouts=None):
             for row_id, address in matches.items()
             if row_by_id[row_id].get("workspace_id") not in failed_monitor_workspaces
         }
-        nested_result = restore_nested_tiled_layouts(
+        tiled_result = restore_tiled_layouts(
             rows, tiled_matches, clients, layouts or {}, focus_context
         )
-        if nested_result is None:
-            log("restore: Hyprland IPC failed while replaying tiled layouts")
-            return restored, failures, launched_processes, True
-        if not nested_result:
-            failures += 1
-        clients = hyprctl_json("clients")
-        if clients is None:
-            log("restore: Hyprland IPC failed after replaying tiled layouts")
-            return restored, failures, launched_processes, True
-        tiled_result = restore_tiled_slots(rows, tiled_matches, clients)
         if tiled_result is None:
+            log("restore: Hyprland IPC failed while replaying tiled layouts")
             return restored, failures, launched_processes, True
         if not tiled_result:
             failures += 1
@@ -2496,6 +2518,86 @@ def cmd_status():
     conn.close()
 
 
+def acceptance_result(ok, message):
+    print(f"{'PASS' if ok else 'FAIL'}: {message}")
+    return ok
+
+
+def acceptance_session(marker):
+    try:
+        conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+        session = conn.execute(
+            "SELECT label, capture_status FROM sessions WHERE id = ?", (marker["session"],)
+        ).fetchone()
+        rows = load_windows(conn, marker["session"])
+        conn.close()
+    except (KeyError, OSError, sqlite3.Error):
+        return None, []
+    return session, rows
+
+
+def systemd_unit_active(unit):
+    result = subprocess.run(
+        ["systemctl", "--user", "is-active", "--quiet", unit], check=False
+    )
+    return result.returncode == 0
+
+
+def systemd_unit_failed(unit):
+    result = subprocess.run(
+        ["systemctl", "--user", "is-failed", "--quiet", unit], check=False
+    )
+    return result.returncode == 0
+
+
+def cmd_acceptance(expect_power_save=False, expect_restore_failure=False):
+    """Report read-only evidence for a deliberate live reboot acceptance run."""
+    instance = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    restore_ok = (
+        systemd_unit_failed("omarchy-sesh.service")
+        if expect_restore_failure
+        else systemd_unit_active("omarchy-sesh.service")
+    )
+    autosave_enabled = subprocess.run(
+        ["systemctl", "--user", "is-enabled", "--quiet", AUTOSAVE_UNIT], check=False
+    ).returncode == 0
+    autosave_active = systemd_unit_active(AUTOSAVE_UNIT)
+    checks = [
+        acceptance_result(bool(instance), "Hyprland instance is available"),
+        acceptance_result(restore_ok,
+                          "restore service " + ("failed as expected" if expect_restore_failure else "is active")),
+        acceptance_result(not autosave_enabled or autosave_active,
+                          "autosave service state matches its mode"),
+    ]
+    try:
+        marker = json.loads(RESTORE_MARKER_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        marker = {}
+    marker_complete = marker.get("complete") is True and marker.get("instance") == instance
+    checks.append(
+        acceptance_result(marker_complete != expect_restore_failure,
+                          "restore marker " + ("is incomplete as expected" if expect_restore_failure else "matches this compositor"))
+    )
+    session, rows = acceptance_session(marker)
+    session_complete = bool(session and session[1] == "complete")
+    checks.append(acceptance_result(session_complete, "restore source is a complete snapshot"))
+    if expect_power_save:
+        checks.append(
+            acceptance_result(bool(session and session[0] == "logout"),
+                              "restore source was saved by a power-menu action")
+        )
+    if expect_restore_failure or not session_complete:
+        return 0 if all(checks) else 1
+    clients = hyprctl_json("clients")
+    matches = match_windows(rows, clients or []) if clients is not None else {}
+    checks.append(acceptance_result(clients is not None, "Hyprland clients are readable"))
+    checks.append(
+        acceptance_result(len(matches) == len(rows),
+                          f"matched {len(matches)}/{len(rows)} saved windows")
+    )
+    return 0 if all(checks) else 1
+
+
 def cmd_mode(mode=None):
     if mode is None:
         result = subprocess.run(
@@ -2560,6 +2662,12 @@ def main():
 
     sub.add_parser("status", help="list saved sessions")
 
+    p_acceptance = sub.add_parser(
+        "acceptance", help="report read-only evidence for a live reboot acceptance run"
+    )
+    p_acceptance.add_argument("--expect-power-save", action="store_true")
+    p_acceptance.add_argument("--expect-restore-failure", action="store_true")
+
     p_mode = sub.add_parser("mode", help="get or set autosave mode")
     p_mode.add_argument("mode", nargs="?", choices=("active", "manual"))
 
@@ -2572,6 +2680,11 @@ def main():
         return cmd_autosave(args.interval)
     if args.command == "status":
         return cmd_status()
+    if args.command == "acceptance":
+        return cmd_acceptance(
+            expect_power_save=args.expect_power_save,
+            expect_restore_failure=args.expect_restore_failure,
+        )
     if args.command == "mode":
         return cmd_mode(args.mode)
     parser.print_help()

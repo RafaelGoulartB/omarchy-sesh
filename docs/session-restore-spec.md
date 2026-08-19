@@ -237,8 +237,10 @@ the service retries after two seconds.
     - For ineligible workspaces, retain the existing guarded two-window sizing
       and exact compatible-slot swaps. A monitor-origin change alone does not
       prevent either path.
-3. Rebuild or correct tiled layouts only after monitor remapping and ordinary
-   placement complete. Equivalent but geometrically ambiguous trees, master and
+3. Rebuild or correct a tiled layout as soon as all of that workspace's saved
+   windows are matched, without waiting for unrelated applications. Keep the
+   final all-workspace pass after ordinary placement completes. Equivalent but
+   geometrically ambiguous trees, master and
    other layouts, changed workspace dimensions, incomplete snapshots, and
    grouped tiled leaves retain fallback behavior. If a missing display falls
    back to a monitor with different dimensions, saved floating coordinates may

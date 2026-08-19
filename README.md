@@ -125,6 +125,8 @@ omarchy-sesh restore [--dry-run]            # relaunch latest snapshot
 omarchy-sesh autosave [--interval 60]       # periodic save (crash cover)
 omarchy-sesh status                         # list saved sessions
 omarchy-sesh mode [active|manual]           # query or change autosave mode
+omarchy-sesh acceptance [--expect-power-save|--expect-restore-failure]
+                                            # read-only live acceptance evidence
 ```
 
 Config (optional): `${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/sesh/config.json`
@@ -162,3 +164,10 @@ to rerun.
 See `docs/future-improvements.md` for the full roadmap, including live reboot
 acceptance, stable window identity, window groups, configuration, and upgrade
 coverage.
+
+## Live Reboot Acceptance
+
+`omarchy-sesh acceptance` only reads systemd, Hyprland, and saved session state;
+it never saves, restores, changes mode, or powers off. Follow
+`docs/live-acceptance.md` for the controlled reboot, power-menu, and
+failure-recovery procedures.
