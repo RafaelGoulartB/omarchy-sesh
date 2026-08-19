@@ -44,8 +44,9 @@
       every final rectangle. Controlled reboot acceptance remains outstanding.
 - [x] **Translated tiled sizing**: restore simple two-window split ratios when
       monitor reordering changes the workspace origin but not its dimensions.
-- [ ] **Slow applications**: collect real startup timings and make the restore
-      timeout configurable only if the current 20-second bound is insufficient.
+- [ ] **Slow applications**: collect real startup timings and change the default
+      restore timeout only if the current configurable 20-second bound is
+      insufficient.
 - [x] **Polling latency**: reduce window-discovery polling from 200 ms to 50 ms,
       limiting avoidable detection delay without changing restore semantics.
 - [ ] **Restore performance benchmark**: benchmark dispatch and window-discovery
@@ -72,7 +73,7 @@
 - [ ] **Menu customization coverage**: test user menu files that customize
       power action labels, icons, conditions, or commands without overwriting
       user-owned behavior.
-- [ ] **Configuration surface**: expose validated settings for excludes,
+- [x] **Configuration surface**: expose validated settings for excludes,
       autosave interval, restore timeout, snapshot retention, and monitor
       fallback. Preserve existing defaults when extending configuration.
 - [ ] **Upgrade coverage**: test plugin upgrades from each released schema and

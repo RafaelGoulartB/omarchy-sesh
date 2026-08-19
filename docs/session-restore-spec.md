@@ -192,8 +192,9 @@ the service retries after two seconds.
    one-to-one and compare class multiplicities for the already-restored guard.
 2. Build saved PID groups in window order and dispatch every missing group
    immediately, without waiting for an earlier application to start. Then poll
-   all outstanding rows together every 50 ms within one shared 20-second
-   deadline, placing each window as soon as it is matched. If one launch does
+   all outstanding rows together every 50 ms within one shared deadline
+   (`restore_timeout_seconds`, default 20), placing each window as soon as it is
+   matched. If one launch does
    not recreate every saved window, retry that group independently after a
    short grace period, up to the number of windows initially missing from the
    group.
@@ -209,9 +210,11 @@ the service retries after two seconds.
     - Before applying the first window's state on each workspace, move the
       workspace to its resolved monitor. Prefer a connected monitor whose name
       and saved description agree, then a unique description match for renamed
-      or rewired outputs. A disconnected output falls back to the focused
-      monitor, then the lowest monitor ID. Conflicting saved identities are
-      skipped rather than guessed.
+       or rewired outputs. A disconnected output uses `monitor_fallback`: the
+       focused monitor then lowest monitor ID by default, the lowest monitor
+       directly, or a preferred connector. An unavailable preferred connector
+       safely uses the default policy. Conflicting saved identities are skipped
+       rather than guessed.
     - Apply state through the Hyprland Lua dispatcher API: move to the saved
       workspace, set floating state, resize before moving floating windows,
       then restore fullscreen and pinned state. Monitor remapping happens first
@@ -280,6 +283,7 @@ All confirmed against the installed Omarchy defaults.
     ExecStop=-%h/.local/bin/omarchy-sesh save --label logout --teardown
     RemainAfterExit=yes
     Restart=on-failure
+    RestartPreventExitStatus=1 2
     RestartSec=2
 
    [Install]
@@ -300,9 +304,27 @@ All confirmed against the installed Omarchy defaults.
 4. **Hook mechanism** — Omarchy has no pre-logout hook. Do not add another
    startup hook because that recreates the duplicate-restore race.
 
-5. **Config / exclude list** — `${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/sesh/config.json`:
-   `exclude_classes` (defaults skip polkit/portal agents), `autosave_seconds`
-   (default 60). Save reads exclusions and autosave reads its interval at startup.
+5. **Configuration** — `${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/sesh/config.json`
+   supports `exclude_classes` (defaults skip polkit/portal agents),
+   `autosave_seconds` (default 60), `restore_timeout_seconds` (default 20),
+   `snapshot_retention` (default 5 per complete/diagnostic status class), and
+   `monitor_fallback` (`focused` by default, `lowest`, or a connector-shaped
+   name; any other string is rejected). The restore timeout must be at least
+   `RESTORE_RETRY_DELAY` so a launch group can retry at least once. The file is
+   read as UTF-8 regardless of the ambient locale.
+
+   The complete object is validated before an operation acquires its lock.
+   Malformed JSON, unknown keys, invalid types, and unsafe values fail `restore`
+   closed: status 2, nothing restored, and `omarchy-sesh.service` does not
+   restart on status 2, so a persistent configuration error cannot create a
+   service loop. The capture path deliberately does not fail closed — `save` and
+   `autosave` log the same error and continue with the defaults, because the
+   power-menu and `ExecStop` callers discard the exit status, so aborting there
+   would silently lose the session the tool exists to protect. For the same
+   reason the autosave daemon keeps its normal `Restart=on-failure` and never
+   exits on a configuration error. An unreadable file (an I/O or permission
+   error rather than bad content) is transient and never fails an operation:
+   every command logs it and continues with the defaults.
 
 ## 6a. Prototype status (verified live on Hyprland 0.56.2)
 
@@ -330,8 +352,8 @@ windows were cleaned up after each run.
 `systemd/user/omarchy-sesh.service` is the single restore trigger and retries
 temporary lock or IPC failures. Application launch/placement failures are not
 automatically relaunched in a loop. Autosave waits one interval and remains
-gated while startup restore is retryable. Saves retain the latest five complete
-and five diagnostic snapshots.
+gated while startup restore is retryable. Saves retain the configured number of
+complete and diagnostic snapshots independently (five of each by default).
 
 Window group membership and order are implemented for Hyprland 0.56+, pending
 controlled live acceptance. Active-tab and lock/deny state are not restored

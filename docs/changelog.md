@@ -27,9 +27,17 @@ tagged prerelease, `alpha`; changes after that tag are listed as unreleased.
 - Regression coverage now includes monitor identity conflicts and fallbacks,
   tiled split sizing and slot correction, Chromium profiles, global matching,
   restore markers, XDG paths, and installer recovery.
+- Validated configuration now controls restore timeout, per-status snapshot
+  retention, and disconnected-monitor fallback alongside the existing exclude
+  and autosave settings.
 
 ### Changed
 
+- Malformed or unknown configuration fails restore closed before any side
+  effects, and `omarchy-sesh.service` does not restart-loop on it. Save and
+  autosave instead log the error and continue with the defaults, so a
+  configuration typo cannot skip a logout snapshot or stop periodic saves.
+- `omarchy-sesh mode` warns when autosave is enabled but not running.
 - Window discovery uses ranked one-to-one assignment instead of greedy class
   matching, reducing incorrect matches between similar windows.
 - Hyprland 0.55 remains supported and restores grouped windows independently;

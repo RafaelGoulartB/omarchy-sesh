@@ -1,3 +1,4 @@
+import contextlib
 import importlib.machinery
 import importlib.util
 import io
@@ -16,10 +17,23 @@ sys.dont_write_bytecode = True
 SCRIPT = Path(__file__).parents[1] / "bin" / "omarchy-sesh"
 INSTALLER = Path(__file__).parents[1] / "install.sh"
 UNINSTALLER = Path(__file__).parents[1] / "uninstall.sh"
+AUTOSAVE_SERVICE = (
+    Path(__file__).parents[1]
+    / "systemd"
+    / "user"
+    / "omarchy-sesh-autosave.service"
+)
+RESTORE_SERVICE = (
+    Path(__file__).parents[1] / "systemd" / "user" / "omarchy-sesh.service"
+)
 
 
 def load_module(state_home):
-    with mock.patch.dict(os.environ, {"XDG_STATE_HOME": state_home}, clear=False):
+    with mock.patch.dict(
+        os.environ,
+        {"XDG_STATE_HOME": state_home, "XDG_CONFIG_HOME": state_home},
+        clear=False,
+    ):
         loader = importlib.machinery.SourceFileLoader("omarchy_sesh", str(SCRIPT))
         spec = importlib.util.spec_from_loader(loader.name, loader)
         module = importlib.util.module_from_spec(spec)
@@ -148,6 +162,165 @@ class OmarchySeshTests(unittest.TestCase):
 
     def tearDown(self):
         self.tempdir.cleanup()
+
+    def write_config(self, content):
+        self.module.CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        self.module.CONFIG_PATH.write_text(content, encoding="utf-8")
+
+    def test_config_defaults_preserve_existing_behavior(self):
+        self.assertEqual(
+            {
+                "exclude_classes": [
+                    "polkit-gnome-authentication-agent-1",
+                    "xdg-desktop-portal",
+                    "org.freedesktop.impl.portal.Polkit",
+                ],
+                "autosave_seconds": 60,
+                "restore_timeout_seconds": 20.0,
+                "snapshot_retention": 5,
+                "monitor_fallback": "focused",
+            },
+            self.module.load_config(),
+        )
+
+    def test_config_accepts_the_complete_validated_surface(self):
+        self.write_config(
+            '{"exclude_classes": ["panel"], "autosave_seconds": 120, '
+            '"restore_timeout_seconds": 45.5, "snapshot_retention": 8, '
+            '"monitor_fallback": "DP-2"}'
+        )
+
+        self.assertEqual(
+            {
+                "exclude_classes": ["panel"],
+                "autosave_seconds": 120,
+                "restore_timeout_seconds": 45.5,
+                "snapshot_retention": 8,
+                "monitor_fallback": "DP-2",
+            },
+            self.module.load_config(),
+        )
+
+    def test_config_rejects_invalid_files_and_values(self):
+        invalid_configs = {
+            "invalid JSON": "{",
+            "top-level value": "[]",
+            "unknown setting": '{"restore_timout_seconds": 30}',
+            "exclude_classes": '{"exclude_classes": [""]}',
+            "autosave_seconds": '{"autosave_seconds": true}',
+            "restore_timeout_seconds": '{"restore_timeout_seconds": 0}',
+            "snapshot_retention": '{"snapshot_retention": 0}',
+            "monitor_fallback": '{"monitor_fallback": ""}',
+        }
+        for expected, content in invalid_configs.items():
+            with self.subTest(expected=expected):
+                self.write_config(content)
+                with self.assertRaisesRegex(self.module.ConfigError, expected):
+                    self.module.load_config()
+
+    def test_config_rejects_a_restore_timeout_below_one_group_retry(self):
+        self.write_config(
+            f'{{"restore_timeout_seconds": {self.module.RESTORE_RETRY_DELAY / 2}}}'
+        )
+        with self.assertRaisesRegex(
+            self.module.ConfigError, "so a launch group can retry at least once"
+        ):
+            self.module.load_config()
+
+    def test_config_rejects_monitor_fallbacks_that_name_no_policy_or_connector(self):
+        for value in ("lowset", "Focused", "DP2", "-1"):
+            with self.subTest(value=value):
+                self.write_config(f'{{"monitor_fallback": "{value}"}}')
+                with self.assertRaisesRegex(
+                    self.module.ConfigError, "monitor_fallback must be"
+                ):
+                    self.module.load_config()
+
+    def test_config_accepts_connector_shaped_monitor_fallbacks(self):
+        for value in ("DP-2", "eDP-1", "HDMI-A-1", "DVI-D-1", "lowest"):
+            with self.subTest(value=value):
+                self.write_config(f'{{"monitor_fallback": "{value}"}}')
+                self.assertEqual(value, self.module.load_config()["monitor_fallback"])
+
+    def test_config_is_decoded_as_utf8_regardless_of_the_locale_encoding(self):
+        config = mock.Mock()
+        config.read_text.return_value = '{"exclude_classes": ["café"]}'
+        with mock.patch.object(self.module, "CONFIG_PATH", config):
+            self.assertEqual(["café"], self.module.load_config()["exclude_classes"])
+        self.assertEqual({"encoding": "utf-8"}, config.read_text.call_args.kwargs)
+
+    def test_unreadable_config_falls_back_to_defaults_instead_of_failing(self):
+        config = mock.Mock()
+        config.read_text.side_effect = PermissionError(13, "Permission denied")
+        with (
+            mock.patch.object(self.module, "CONFIG_PATH", config),
+            mock.patch.object(self.module, "log") as logged,
+        ):
+            self.assertEqual(self.module.default_config(), self.module.load_config())
+        self.assertIn("Permission denied", logged.call_args.args[0])
+
+    def test_config_rejects_values_that_exceed_runtime_limits(self):
+        for setting in (
+            "autosave_seconds",
+            "restore_timeout_seconds",
+            "snapshot_retention",
+        ):
+            with self.subTest(setting=setting):
+                self.write_config(f'{{"{setting}": {10 ** 100}}}')
+                with self.assertRaisesRegex(self.module.ConfigError, setting):
+                    self.module.load_config()
+
+    def test_config_rejects_non_utf8_input(self):
+        self.module.CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        self.module.CONFIG_PATH.write_bytes(b"\xff")
+        with self.assertRaisesRegex(self.module.ConfigError, "must be UTF-8"):
+            self.module.load_config()
+
+    def test_invalid_config_still_captures_the_session_with_defaults(self):
+        self.write_config('{"autosave_seconds": 0}')
+        with (
+            mock.patch.object(
+                self.module, "acquire_operation_lock", return_value=None
+            ) as acquire,
+            mock.patch.object(self.module, "log") as logged,
+        ):
+            self.assertEqual(75, self.module.cmd_save(label="logout"))
+
+        acquire.assert_called_once()
+        reported = logged.call_args_list[0].args[0]
+        self.assertIn("save[logout]", reported)
+        self.assertIn("autosave_seconds", reported)
+        self.assertIn("default settings", reported)
+
+    def test_defaults_replace_a_rejected_config_on_the_capture_path(self):
+        self.write_config('{"monitor_fallback": "lowset", "snapshot_retention": 8}')
+        with mock.patch.object(self.module, "log"):
+            self.assertEqual(
+                self.module.default_config(),
+                self.module.load_config_or_defaults("save[periodic]"),
+            )
+
+    def test_main_reports_configuration_errors_with_exit_status_two(self):
+        self.write_config('{"snapshot_retention": 0}')
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(sys, "argv", [str(SCRIPT), "restore"]),
+            mock.patch.object(self.module, "acquire_operation_lock") as acquire,
+            mock.patch("sys.stderr", stderr),
+        ):
+            result = self.module.main()
+
+        self.assertEqual(2, result)
+        self.assertIn("configuration error: snapshot_retention", stderr.getvalue())
+        acquire.assert_not_called()
+
+    def test_restore_service_does_not_restart_configuration_errors(self):
+        self.assertIn("RestartPreventExitStatus=1 2", RESTORE_SERVICE.read_text())
+
+    def test_autosave_service_restarts_on_failure_without_status_exemptions(self):
+        unit = AUTOSAVE_SERVICE.read_text()
+        self.assertIn("Restart=on-failure", unit)
+        self.assertNotIn("RestartPreventExitStatus", unit)
 
     def test_lua_quote_uses_collision_free_long_string(self):
         value = "run 'quoted' ]] and ]=] command"
@@ -356,6 +529,24 @@ class OmarchySeshTests(unittest.TestCase):
         conn.close()
         self.assertNotIn(session_ids[0], retained)
         self.assertEqual(set(session_ids[1:]), retained)
+
+    def test_snapshot_retention_applies_to_complete_and_diagnostic_history(self):
+        for index in range(3):
+            self.module.persist_snapshot(
+                "periodic", "complete", "", [], snapshot_retention=2
+            )
+            self.module.persist_snapshot(
+                "logout", "failed", f"failure {index}", [], snapshot_retention=2
+            )
+        conn = self.module.db_conn()
+        counts = dict(
+            conn.execute(
+                "SELECT capture_status, COUNT(*) FROM sessions GROUP BY capture_status"
+            )
+        )
+        conn.close()
+
+        self.assertEqual({"complete": 2, "failed": 2}, counts)
 
     def test_manual_snapshot_opens_autosave_gate(self):
         with mock.patch.dict(os.environ, {"HYPRLAND_INSTANCE_SIGNATURE": "instance-1"}):
@@ -687,6 +878,38 @@ class OmarchySeshTests(unittest.TestCase):
 
         self.assertEqual(
             {1: "DP-2"}, self.module.workspace_monitor_targets([row], monitors)
+        )
+
+    def test_monitor_target_can_use_lowest_or_preferred_fallback(self):
+        row = window(1, 0, "terminal", 10)
+        monitors = [
+            {"id": 4, "name": "DP-4", "focused": True},
+            {"id": 2, "name": "DP-2"},
+        ]
+
+        self.assertEqual(
+            {1: "DP-2"},
+            self.module.workspace_monitor_targets([row], monitors, "lowest"),
+        )
+        self.assertEqual(
+            {1: "DP-2"},
+            self.module.workspace_monitor_targets([row], monitors, "DP-2"),
+        )
+
+    def test_unavailable_preferred_monitor_falls_back_safely(self):
+        row = window(1, 0, "terminal", 10)
+        monitors = [
+            {"id": 0, "name": "eDP-1", "focused": True},
+            {"id": 1, "name": "DP-1"},
+        ]
+        with mock.patch.object(self.module, "log") as log:
+            targets = self.module.workspace_monitor_targets(
+                [row], monitors, "HDMI-A-1"
+            )
+
+        self.assertEqual({1: "eDP-1"}, targets)
+        log.assert_called_once_with(
+            "restore: configured fallback monitor 'HDMI-A-1' is unavailable"
         )
 
     def test_monitor_target_skips_conflicting_workspace_identity(self):
@@ -2885,6 +3108,39 @@ class OmarchySeshTests(unittest.TestCase):
         self.assertEqual(75, result)
         dispatch.assert_not_called()
 
+    def test_restore_uses_configured_timeout_and_monitor_fallback(self):
+        self.module.persist_snapshot(
+            "periodic", "complete", "", [window(1, 0, "terminal", 10)]
+        )
+        cfg = dict(self.module.DEFAULT_CONFIG)
+        cfg.update(restore_timeout_seconds=37.5, monitor_fallback="DP-2")
+        lock_file = mock.Mock()
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"HYPRLAND_INSTANCE_SIGNATURE": "instance-1"},
+                clear=False,
+            ),
+            mock.patch.object(self.module, "load_config", return_value=cfg),
+            mock.patch.object(
+                self.module, "acquire_operation_lock", return_value=lock_file
+            ),
+            mock.patch.object(self.module, "hyprctl_json", return_value=[]),
+            mock.patch.object(self.module, "restore_was_completed", return_value=False),
+            mock.patch.object(
+                self.module,
+                "restore_windows",
+                return_value=(1, 0, 1, False),
+            ) as restore_windows,
+            mock.patch.object(self.module, "mark_restore_completed", return_value=True),
+        ):
+            result = self.module.cmd_restore()
+
+        self.assertEqual(0, result)
+        args = restore_windows.call_args.args
+        self.assertEqual(37.5, args[4])
+        self.assertEqual("DP-2", args[5])
+
     def test_no_session_without_compositor_requests_retry(self):
         connection = mock.Mock()
         lock_file = mock.Mock()
@@ -3062,6 +3318,42 @@ class OmarchySeshTests(unittest.TestCase):
             self.module.cmd_autosave()
         save.assert_not_called()
 
+    def test_autosave_keeps_running_when_configuration_becomes_invalid(self):
+        with (
+            mock.patch.object(
+                self.module, "load_config", return_value={"autosave_seconds": 60}
+            ),
+            mock.patch.object(
+                self.module.time,
+                "sleep",
+                side_effect=[None, None, RuntimeError("stop")],
+            ),
+            mock.patch.object(self.module, "refresh_hyprland_instance"),
+            mock.patch.object(self.module, "restore_is_ready", return_value=True),
+            mock.patch.object(
+                self.module,
+                "cmd_save",
+                side_effect=self.module.ConfigError("invalid setting"),
+            ) as save,
+            mock.patch.object(self.module, "log"),
+            self.assertRaisesRegex(RuntimeError, "stop"),
+        ):
+            self.module.cmd_autosave()
+        self.assertEqual(2, save.call_count)
+
+    def test_autosave_starts_with_defaults_when_the_config_is_invalid(self):
+        self.write_config('{"autosave_seconds": 0}')
+        with (
+            mock.patch.object(
+                self.module.time, "sleep", side_effect=RuntimeError("stop")
+            ) as sleep,
+            mock.patch.object(self.module, "log") as logged,
+            self.assertRaisesRegex(RuntimeError, "stop"),
+        ):
+            self.module.cmd_autosave()
+        sleep.assert_called_once_with(self.module.DEFAULT_CONFIG["autosave_seconds"])
+        self.assertIn("autosave", logged.call_args_list[0].args[0])
+
     def test_autosave_is_not_ready_without_compositor_instance(self):
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertFalse(self.module.restore_is_ready())
@@ -3111,21 +3403,42 @@ class OmarchySeshTests(unittest.TestCase):
             self.assertNotIn("HYPRLAND_INSTANCE_SIGNATURE", os.environ)
 
     def test_mode_reports_enabled_autosave_as_active(self):
-        result = mock.Mock(returncode=0, stdout="enabled\n")
+        results = [
+            mock.Mock(returncode=0, stdout="enabled\n"),
+            mock.Mock(returncode=0, stdout="active\n"),
+        ]
         with (
             mock.patch.object(
-                self.module.subprocess, "run", return_value=result
+                self.module.subprocess, "run", side_effect=results
             ) as run,
             mock.patch("builtins.print") as output,
         ):
             self.assertEqual(0, self.module.cmd_mode())
-        run.assert_called_once_with(
-            ["systemctl", "--user", "is-enabled", "omarchy-sesh-autosave.service"],
-            capture_output=True,
-            text=True,
-            check=False,
+        self.assertEqual(
+            [
+                ["systemctl", "--user", "is-enabled", "omarchy-sesh-autosave.service"],
+                ["systemctl", "--user", "is-active", "omarchy-sesh-autosave.service"],
+            ],
+            [call.args[0] for call in run.call_args_list],
         )
         output.assert_called_once_with("active")
+
+    def test_mode_warns_when_enabled_autosave_is_not_running(self):
+        results = [
+            mock.Mock(returncode=0, stdout="enabled\n"),
+            mock.Mock(returncode=3, stdout="failed\n"),
+        ]
+        stderr = io.StringIO()
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(self.module.subprocess, "run", side_effect=results),
+            mock.patch("sys.stderr", stderr),
+            contextlib.redirect_stdout(stdout),
+        ):
+            self.assertEqual(0, self.module.cmd_mode())
+        self.assertEqual("active", stdout.getvalue().strip())
+        self.assertIn("enabled but failed", stderr.getvalue())
+        self.assertIn("periodic saves are not happening", stderr.getvalue())
 
     def test_mode_reports_disabled_autosave_as_manual(self):
         result = mock.Mock(returncode=1, stdout="disabled\n", stderr="")

@@ -21,8 +21,8 @@ floating/fullscreen/pinned state are captured alongside the launch command and
 written as one `sessions` row plus window and workspace-layout rows in the
 SQLite DB. Complete Hyprland group membership and member order are translated
 from live addresses to snapshot-local metadata. Windows sharing a saved PID are
-kept as one launch group. The latest five complete and five diagnostic
-snapshots are retained.
+kept as one launch group. By default, the latest five complete and five
+diagnostic snapshots are retained; retention is configurable.
 
 **Restore** (`omarchy-sesh restore`) loads the most recent complete session;
 a healthy empty session intentionally restores nothing. An advisory lock
@@ -38,10 +38,12 @@ browser command. After matching, eligible nested dwindle workspaces are rebuilt
 in one fast Lua evaluation: one seed remains on the target workspace while the
 other leaves pass through a temporary staging workspace. Focus, insertion
 direction, and split ratios recreate the saved geometry, which is then verified.
-Each saved workspace returns to the same connected monitor;
-renamed or rewired outputs are identified by monitor description. Workspaces
-from disconnected displays fall back to the focused monitor, then the lowest
-monitor ID. `--dry-run` prints the launch plan without executing it.
+Each saved workspace returns to the same connected monitor; renamed or rewired
+outputs are identified by monitor description. Workspaces from disconnected
+displays use the configured fallback: the focused monitor then the lowest
+monitor ID by default, the lowest monitor directly, or a preferred connector.
+An unavailable preferred connector safely returns to the default policy.
+`--dry-run` prints the launch plan without executing it.
 
 On Hyprland 0.56 or newer, complete and uniquely matched window groups are
 re-formed in saved member order after placement. Partial or ambiguous groups,
@@ -168,9 +170,27 @@ Config (optional): `${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/sesh/config.json`
 ```json
 {
   "exclude_classes": ["polkit-gnome-authentication-agent-1"],
-  "autosave_seconds": 60
+  "autosave_seconds": 60,
+  "restore_timeout_seconds": 20,
+  "snapshot_retention": 5,
+  "monitor_fallback": "focused"
 }
 ```
+
+`exclude_classes` must be an array of non-empty strings. Autosave and retention
+must be positive integers, and the restore timeout must be at least 2 seconds so
+a launch group can retry at least once. `monitor_fallback` accepts `"focused"`,
+`"lowest"`, or a connector-shaped name such as `"DP-2"`; any other string is
+rejected rather than treated as an unknown monitor. Each retention slot applies
+separately to complete and diagnostic snapshots.
+
+Unknown settings, invalid JSON, and invalid values are reported the same way
+everywhere but acted on differently, because a bad config must never cost you a
+session. `restore` fails closed: it reports the error, exits 2, and changes
+nothing, and its service does not restart-loop. `save` and `autosave` log the
+error and continue with the built-in defaults, so a typo cannot skip the logout
+snapshot or silently stop periodic saves. A file that cannot be read at all is
+treated as transient: every command logs it and continues with the defaults.
 
 ## Dependencies
 
@@ -187,10 +207,6 @@ Config (optional): `${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/sesh/config.json`
 
 No network calls and no non-stdlib QML imports. See
 [Requirements](#requirements) for version constraints.
-
-## License
-
-MIT — see [LICENSE](LICENSE).
 
 ## Uninstall
 
@@ -225,3 +241,7 @@ coverage.
 it never saves, restores, changes mode, or powers off. Follow
 `docs/live-acceptance.md` for the controlled reboot, power-menu, and
 failure-recovery procedures.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

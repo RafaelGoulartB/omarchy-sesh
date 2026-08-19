@@ -9,7 +9,7 @@ ExecStart=%h/.local/bin/omarchy-sesh restore
 ExecStop=-%h/.local/bin/omarchy-sesh save --label logout --teardown
 RemainAfterExit=yes
 Restart=on-failure
-RestartPreventExitStatus=1
+RestartPreventExitStatus=1 2
 RestartSec=2
 
 [Install]

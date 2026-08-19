@@ -64,8 +64,9 @@ service's `ExecStop` capture is diagnostic fallback only.
 - Optional config: `${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/sesh/config.json`
 - Installed CLI: `~/.local/bin/omarchy-sesh`
 
-The configuration currently supports `exclude_classes` and `autosave_seconds`.
-Do not assume paths under `$HOME` when an XDG override is available.
+The validated configuration supports `exclude_classes`, `autosave_seconds`,
+`restore_timeout_seconds`, `snapshot_retention`, and `monitor_fallback`. Do not
+assume paths under `$HOME` when an XDG override is available.
 
 ## Correctness Invariants
 

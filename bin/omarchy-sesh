@@ -3,6 +3,7 @@
 import argparse
 import fcntl
 import json
+import math
 import os
 import re
 import shlex
@@ -37,6 +38,9 @@ DEFAULT_CONFIG = {
         "org.freedesktop.impl.portal.Polkit",
     ],
     "autosave_seconds": 60,
+    "restore_timeout_seconds": 20.0,
+    "snapshot_retention": 5,
+    "monitor_fallback": "focused",
 }
 
 DEFAULT_EXCLUDE = set(DEFAULT_CONFIG["exclude_classes"])
@@ -44,6 +48,14 @@ CHROMIUM_NORMAL_CLASSES = {"chromium", "chromium-browser"}
 RESTORE_TIMEOUT = 20.0
 RESTORE_RETRY_DELAY = 2.0
 RESTORE_POLL_INTERVAL = 0.05
+MAX_CONFIG_SECONDS = 2_147_483_647
+MAX_SNAPSHOT_RETENTION = 9_223_372_036_854_775_807
+MONITOR_FALLBACK_POLICIES = ("focused", "lowest")
+MONITOR_CONNECTOR_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*(-[A-Za-z0-9]+)*-[0-9]+$")
+
+
+class ConfigError(ValueError):
+    pass
 
 
 def log(msg):
@@ -144,14 +156,92 @@ def acquire_operation_lock(wait=False, wait_timeout=15):
     return lock_file
 
 
-def load_config():
+def default_config():
     cfg = dict(DEFAULT_CONFIG)
-    if CONFIG_PATH.exists():
-        try:
-            cfg.update(json.loads(CONFIG_PATH.read_text()))
-        except (json.JSONDecodeError, OSError):
-            pass
+    cfg["exclude_classes"] = list(DEFAULT_CONFIG["exclude_classes"])
     return cfg
+
+
+def load_config():
+    cfg = default_config()
+    try:
+        content = CONFIG_PATH.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return cfg
+    except UnicodeError as e:
+        raise ConfigError(f"{CONFIG_PATH}: configuration must be UTF-8") from e
+    except OSError as e:
+        # A file we cannot read says nothing about its contents, so treat it as
+        # transient rather than failing an operation the way bad content does.
+        log(f"{CONFIG_PATH}: {e.strerror or e}; continuing with default settings")
+        return cfg
+    try:
+        configured = json.loads(content)
+    except json.JSONDecodeError as e:
+        raise ConfigError(
+            f"{CONFIG_PATH}: invalid JSON at line {e.lineno}, column {e.colno}"
+        ) from e
+    if not isinstance(configured, dict):
+        raise ConfigError(f"{CONFIG_PATH}: top-level value must be an object")
+    unknown = sorted(set(configured) - set(DEFAULT_CONFIG))
+    if unknown:
+        raise ConfigError(f"{CONFIG_PATH}: unknown setting {unknown[0]!r}")
+    cfg.update(configured)
+
+    excludes = cfg["exclude_classes"]
+    if not isinstance(excludes, list) or any(
+        not isinstance(value, str) or not value for value in excludes
+    ):
+        raise ConfigError("exclude_classes must be an array of non-empty strings")
+    autosave_seconds = cfg["autosave_seconds"]
+    if (
+        type(autosave_seconds) is not int
+        or autosave_seconds < 1
+        or autosave_seconds > MAX_CONFIG_SECONDS
+    ):
+        raise ConfigError(
+            f"autosave_seconds must be an integer from 1 to {MAX_CONFIG_SECONDS}"
+        )
+    restore_timeout = cfg["restore_timeout_seconds"]
+    if (
+        type(restore_timeout) not in (int, float)
+        or (type(restore_timeout) is float and not math.isfinite(restore_timeout))
+        or restore_timeout < RESTORE_RETRY_DELAY
+        or restore_timeout > MAX_CONFIG_SECONDS
+    ):
+        raise ConfigError(
+            f"restore_timeout_seconds must be a number from {RESTORE_RETRY_DELAY} "
+            f"to {MAX_CONFIG_SECONDS}, so a launch group can retry at least once"
+        )
+    retention = cfg["snapshot_retention"]
+    if (
+        type(retention) is not int
+        or retention < 1
+        or retention > MAX_SNAPSHOT_RETENTION
+    ):
+        raise ConfigError(
+            "snapshot_retention must be an integer from 1 to "
+            f"{MAX_SNAPSHOT_RETENTION}"
+        )
+    monitor_fallback = cfg["monitor_fallback"]
+    if not isinstance(monitor_fallback, str) or (
+        monitor_fallback not in MONITOR_FALLBACK_POLICIES
+        and not MONITOR_CONNECTOR_RE.match(monitor_fallback)
+    ):
+        raise ConfigError(
+            "monitor_fallback must be 'focused', 'lowest', or a monitor connector "
+            "such as 'DP-2'"
+        )
+    return cfg
+
+
+def load_config_or_defaults(operation):
+    """Never let a bad config cost a capture; report it and use the defaults."""
+    try:
+        return load_config()
+    except ConfigError as e:
+        log(f"{operation}: {e}; continuing with default settings")
+        return default_config()
 
 
 def migrate_empty_xdg_paths():
@@ -311,7 +401,9 @@ def read_proc(pid):
     return cmdline, cwd, "" if cmdline else "empty cmdline"
 
 
-def persist_snapshot(label, status, error, rows, workspace_layouts=None):
+def persist_snapshot(
+    label, status, error, rows, workspace_layouts=None, snapshot_retention=5
+):
     conn = db_conn()
     with conn:
         cur = conn.execute(
@@ -341,13 +433,17 @@ def persist_snapshot(label, status, error, rows, workspace_layouts=None):
         keep_ids = {
             row[0]
             for row in conn.execute(
-                "SELECT id FROM sessions WHERE capture_status = 'complete' ORDER BY id DESC LIMIT 5"
+                "SELECT id FROM sessions WHERE capture_status = 'complete' "
+                "ORDER BY id DESC LIMIT ?",
+                (snapshot_retention,),
             )
         }
         keep_ids.update(
             row[0]
             for row in conn.execute(
-                "SELECT id FROM sessions WHERE capture_status != 'complete' ORDER BY id DESC LIMIT 5"
+                "SELECT id FROM sessions WHERE capture_status != 'complete' "
+                "ORDER BY id DESC LIMIT ?",
+                (snapshot_retention,),
             )
         )
         prune_ids = [
@@ -368,6 +464,7 @@ def persist_snapshot(label, status, error, rows, workspace_layouts=None):
 
 
 def cmd_save(label="manual", teardown=False, wait=False):
+    cfg = load_config_or_defaults(f"save[{label}]")
     lock_file = acquire_operation_lock(wait=wait)
     if lock_file is None:
         log(f"save[{label}]: another session operation is running")
@@ -411,6 +508,7 @@ def cmd_save(label="manual", teardown=False, wait=False):
             gaps_out=css_gaps(gaps_out),
             gaps_in=css_gaps(gaps_in),
             workspace_rules=workspace_rules,
+            cfg=cfg,
         )
     finally:
         lock_file.close()
@@ -593,8 +691,10 @@ def _save_clients(
     gaps_out=None,
     gaps_in=None,
     workspace_rules=(),
+    cfg=None,
 ):
-    cfg = load_config()
+    if cfg is None:
+        cfg = load_config()
     exclude = DEFAULT_EXCLUDE | set(cfg.get("exclude_classes", []))
     monitor_by_id = {m["id"]: m for m in monitors}
     captured = []
@@ -649,7 +749,14 @@ def _save_clients(
     if errors and status == "complete":
         status = "partial"
     error = "; ".join(errors)
-    sid = persist_snapshot(label, status, error, rows, workspace_layouts)
+    sid = persist_snapshot(
+        label,
+        status,
+        error,
+        rows,
+        workspace_layouts,
+        cfg["snapshot_retention"],
+    )
     if status == "complete" and label == "manual":
         mark_restore_completed(sid)
     log(
@@ -932,17 +1039,30 @@ def monitor_sort_key(monitor):
     return monitor_id, monitor.get("name") or ""
 
 
-def workspace_monitor_targets(rows, monitors):
+def workspace_monitor_targets(rows, monitors, monitor_fallback="focused"):
     monitors = [monitor for monitor in monitors if monitor.get("name")]
     by_name = {monitor["name"]: monitor for monitor in monitors}
-    fallback = next(
+    lowest = min(monitors, key=monitor_sort_key, default=None)
+    focused = next(
         (
             monitor
             for monitor in sorted(monitors, key=monitor_sort_key)
             if monitor.get("focused")
         ),
-        min(monitors, key=monitor_sort_key, default=None),
+        None,
     )
+    if monitor_fallback == "lowest":
+        fallback = lowest
+    elif monitor_fallback == "focused":
+        fallback = focused or lowest
+    else:
+        fallback = by_name.get(monitor_fallback)
+        if fallback is None:
+            log(
+                f"restore: configured fallback monitor {monitor_fallback!r} "
+                "is unavailable"
+            )
+            fallback = focused or lowest
     rows_by_workspace = {}
     for row in rows:
         if row.get("workspace_id") is not None:
@@ -988,7 +1108,7 @@ def workspace_monitor_targets(rows, monitors):
     return targets
 
 
-def load_workspace_monitor_context(rows):
+def load_workspace_monitor_context(rows, monitor_fallback="focused"):
     monitors = hyprctl_json("monitors")
     workspaces = hyprctl_json("workspaces")
     if monitors is None or workspaces is None or not monitors:
@@ -998,7 +1118,11 @@ def load_workspace_monitor_context(rows):
     current_monitors = {
         workspace.get("id"): workspace.get("monitor") for workspace in workspaces
     }
-    return workspace_monitor_targets(rows, monitors), current_monitors, False
+    return (
+        workspace_monitor_targets(rows, monitors, monitor_fallback),
+        current_monitors,
+        False,
+    )
 
 
 def prepare_workspace_monitor(row, address, targets, current_monitors, prepared):
@@ -2232,7 +2356,14 @@ def restore_window_groups(rows, matches, failed_monitor_workspaces=()):
     return True
 
 
-def restore_windows(rows, initial_matches, initial_clients, layouts=None):
+def restore_windows(
+    rows,
+    initial_matches,
+    initial_clients,
+    layouts=None,
+    restore_timeout=RESTORE_TIMEOUT,
+    monitor_fallback="focused",
+):
     row_by_id = {row["id"]: row for row in rows}
     matches = dict(initial_matches)
     used_addresses = {
@@ -2250,7 +2381,7 @@ def restore_windows(rows, initial_matches, initial_clients, layouts=None):
         if client.get("address")
     }
     monitor_targets, current_monitors, monitor_ipc_failed = (
-        load_workspace_monitor_context(rows)
+        load_workspace_monitor_context(rows, monitor_fallback)
     )
     if monitor_ipc_failed:
         return restored, len(rows), launched_processes, True
@@ -2298,7 +2429,7 @@ def restore_windows(rows, initial_matches, initial_clients, layouts=None):
         else:
             state["attempts"] = state["max_attempts"]
 
-    deadline = time.monotonic() + RESTORE_TIMEOUT
+    deadline = time.monotonic() + restore_timeout
     while len(handled) < len(rows) and time.monotonic() < deadline:
         clients = hyprctl_json("clients")
         if clients is None:
@@ -2416,6 +2547,7 @@ def restore_windows(rows, initial_matches, initial_clients, layouts=None):
 
 
 def cmd_restore(dry_run=False):
+    cfg = load_config()
     lock_file = acquire_operation_lock()
     if lock_file is None:
         print("restore deferred: another session operation is running")
@@ -2475,7 +2607,12 @@ def cmd_restore(dry_run=False):
             return 75
 
         restored, failures, launched_processes, ipc_failed = restore_windows(
-            rows, initial_matches, clients, layouts
+            rows,
+            initial_matches,
+            clients,
+            layouts,
+            cfg["restore_timeout_seconds"],
+            cfg["monitor_fallback"],
         )
         print(f"restored {restored}/{len(rows)} windows")
         log(
@@ -2492,7 +2629,7 @@ def cmd_restore(dry_run=False):
 
 
 def cmd_autosave(interval=None):
-    cfg = load_config()
+    cfg = load_config_or_defaults("autosave")
     interval = interval or cfg.get("autosave_seconds", 60)
     while True:
         time.sleep(interval)
@@ -2608,6 +2745,19 @@ def cmd_mode(mode=None):
         )
         if result.returncode == 0:
             print("active")
+            state = subprocess.run(
+                ["systemctl", "--user", "is-active", AUTOSAVE_UNIT],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if state.returncode != 0:
+                print(
+                    f"warning: {AUTOSAVE_UNIT} is enabled but "
+                    f"{state.stdout.strip() or 'not running'}; "
+                    "periodic saves are not happening",
+                    file=sys.stderr,
+                )
             return 0
         if result.stdout.strip() == "disabled":
             print("manual")
@@ -2672,21 +2822,25 @@ def main():
     p_mode.add_argument("mode", nargs="?", choices=("active", "manual"))
 
     args = parser.parse_args()
-    if args.command == "save":
-        return cmd_save(args.label, teardown=args.teardown, wait=args.wait)
-    if args.command == "restore":
-        return cmd_restore(dry_run=args.dry_run)
-    if args.command == "autosave":
-        return cmd_autosave(args.interval)
-    if args.command == "status":
-        return cmd_status()
-    if args.command == "acceptance":
-        return cmd_acceptance(
-            expect_power_save=args.expect_power_save,
-            expect_restore_failure=args.expect_restore_failure,
-        )
-    if args.command == "mode":
-        return cmd_mode(args.mode)
+    try:
+        if args.command == "save":
+            return cmd_save(args.label, teardown=args.teardown, wait=args.wait)
+        if args.command == "restore":
+            return cmd_restore(dry_run=args.dry_run)
+        if args.command == "autosave":
+            return cmd_autosave(args.interval)
+        if args.command == "status":
+            return cmd_status()
+        if args.command == "acceptance":
+            return cmd_acceptance(
+                expect_power_save=args.expect_power_save,
+                expect_restore_failure=args.expect_restore_failure,
+            )
+        if args.command == "mode":
+            return cmd_mode(args.mode)
+    except ConfigError as e:
+        print(f"configuration error: {e}", file=sys.stderr)
+        return 2
     parser.print_help()
     return 1
 
