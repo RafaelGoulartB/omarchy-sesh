@@ -1,7 +1,7 @@
 # omarchy-sesh
 
 Restore window positions and running apps after reboot or shutdown on
-Omarchy (Hyprland). Snapshot lives in a sqlite DB at
+Omarchy (Hyprland). Snapshots live in a SQLite DB at
 `${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/session.db`.
 
 Scope: floating windows restore pixel-exact. Complete, uniquely matched nested
@@ -14,13 +14,12 @@ sessions) stays application-owned. See `docs/session-restore-spec.md`.
 ## How it works
 
 **Save** (`omarchy-sesh save`) queries clients, monitors, and workspaces through
-`hyprctl -j`,
-filters out unmapped windows and excluded classes, and for each remaining
-window reads its real command line and cwd from `/proc/<pid>/{cmdline,cwd}`.
+`hyprctl -j`, filters out unmapped windows and excluded classes, and reads each
+remaining window's real command line and cwd from `/proc/<pid>/{cmdline,cwd}`.
 Position, size, workspace, monitor connector and description, and
 floating/fullscreen/pinned state are captured alongside the launch command and
 written as one `sessions` row plus window and workspace-layout rows in the
-sqlite DB. Complete Hyprland group membership and member order are translated
+SQLite DB. Complete Hyprland group membership and member order are translated
 from live addresses to snapshot-local metadata. Windows sharing a saved PID are
 kept as one launch group. The latest five complete and five diagnostic
 snapshots are retained.
@@ -85,39 +84,74 @@ Nested tiled replay requires Hyprland >= 0.56 with the three dwindle options
 listed above. Ordinary restore remains available when those conditions are not
 met.
 
-## Install
+## Installing as an Omarchy Plugin
+
+The plugin is published as an Omarchy bar widget with manifest id
+`mrpbennett.sesh` (kind `bar-widget`). Use the Omarchy plugin manager instead of
+running `install.sh` by hand.
+
+### Install
 
 ```sh
-./install.sh
+omarchy plugin add https://github.com/mrpbennett/omarchy-sesh.git --enable
 ```
 
-Installs (user-level, no sudo needed) and is idempotent:
+What happens:
 
-- binary → `~/.local/bin/omarchy-sesh`
-- both systemd user units → `${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/`
-- power-menu overrides → `${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/extensions/omarchy-menu.jsonc`
+1. Omarchy clones the repository into a staging directory.
+2. It validates the folder against the Omarchy plugin manifest schema
+   (`omarchy plugin validate`); invalid plugins are refused.
+3. It reads the manifest id (`mrpbennett.sesh`) and moves the checkout to
+   `~/.config/omarchy/plugins/mrpbennett.sesh/`.
+4. It rescans shell plugins and, because the manifest declares a bar widget,
+   asks which bar section to place it in (default `right`).
+5. It enables the widget with `omarchy plugin enable mrpbennett.sesh --section <section>`.
 
-`omarchy-sesh.service` is the single restore trigger. The autosave service is
-ordered after it and waits one interval before its first capture. Logout,
-reboot, and shutdown menu actions save synchronously before Omarchy closes any
-windows and close the autosave gate first; `ExecStop` remains a diagnostic
-fallback and cannot replace a healthy snapshot. Old snapshots are pruned
-automatically.
-Newly enabled services start with the next graphical login; reinstalling does
-not relaunch applications. Updates restart an already-running autosave process
-so it uses the newly installed binary.
+Verify placement with:
 
-### Omarchy plugin
+```sh
+omarchy plugin list
+```
 
-Install this repository with `omarchy plugin add <git-url> --enable`. The bar
-widget installs the user-level binary and services through `install.sh` on its
-first open. Its three actions enable autosave, switch to manual mode and save
-immediately, or restore the latest snapshot. Reinstalling preserves manual
-mode when autosave was disabled. Plugin updates are detected from the manifest
-version and redeploy the binary and units on the next panel open. A running
-autosave process is restarted to load the new binary; manual mode stays stopped.
+To update a git-managed plugin:
 
-## Usage
+```sh
+omarchy plugin update mrpbennett.sesh
+```
+
+To remove it, see [Uninstall](#uninstall).
+
+### First Use
+
+The bar widget is a button showing a session icon. Opening its panel on a fresh
+install runs the plugin's installation check: it verifies the CLI binary, the
+two systemd user units, and the version marker. If any are missing, it runs the
+bundled `install.sh` automatically, which deploys (user-level, no sudo):
+
+- `~/.local/bin/omarchy-sesh`
+- `~/.config/systemd/user/omarchy-sesh.service` and
+  `omarchy-sesh-autosave.service`
+- marker-delimited pre-shutdown save actions in
+  `~/.config/omarchy/extensions/omarchy-menu.jsonc`, preserving any
+  user-customized logout, reboot, and shutdown actions
+
+After installation the widget shows three actions:
+
+- **Active** — enables periodic autosave (default interval 60s).
+- **Manual** — disables autosave and saves the current session immediately.
+- **Restore** — relaunches the latest snapshot's apps and window layout.
+
+On a fresh install autosave defaults to manual mode. Selecting **Active**
+captures the current desktop once and enables the periodic saver. A restore then
+runs at the next graphical login via `omarchy-sesh.service`; the autosave
+service is ordered after it and waits one interval before its first capture.
+Saves before logout, reboot, or shutdown happen synchronously so the reboot
+snapshot is never superseded by a periodic capture during teardown.
+
+See [How it works](#how-it-works) for the full save/restore behavior and
+`install.sh`/`Service.qml` for the installation and first-open wiring.
+
+## CLI
 
 ```sh
 omarchy-sesh save [--label manual|logout]   # snapshot current windows
