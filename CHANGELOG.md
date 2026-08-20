@@ -1,15 +1,16 @@
 # Changelog
 
-All notable changes to `omarchy-sesh` are documented here. The project has one
-tagged prerelease, `alpha`; changes after that tag are listed as unreleased.
+All notable changes to `omarchy-sesh` are documented here.
 
-## Unreleased
+## v0.2.1 - 2026-08-20
 
 ### Added
 
 - Named session snapshots: `save --name NAME`, `restore --name NAME`, `list`,
   and `delete --name NAME`. Names are conflict-safe, retained independently of
   automatic snapshots, and schema version 6 migrates existing databases.
+- Named saves confirm success with `Session saved under NAME`; failed captures
+  now report unavailable Hyprland IPC directly to the invoking user.
 - Monitor-aware restoration records connector names and physical display
   descriptions, resolves renamed or rewired outputs, and uses a deterministic
   fallback for disconnected displays.
