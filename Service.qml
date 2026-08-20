@@ -16,9 +16,11 @@ Item {
   property bool installed: false
   property string mode: "manual"
   property bool modeKnown: false
-  property bool busy: checkProcess.running || installProcess.running || modeProcess.running || actionProcess.running
+  property bool busy: checkProcess.running || installProcess.running || modeProcess.running || actionProcess.running || listProcess.running
   property string status: ""
   property string error: ""
+  property var sessions: []
+  property bool sessionsLoading: false
   property string pendingAction: ""
   property bool startEnabledMode: false
   property bool installAfterCheck: false
@@ -69,6 +71,21 @@ Item {
     return runAction("restore")
   }
 
+  function listSessions() {
+    if (!installed || listProcess.running || actionProcess.running) return false
+    sessions = []
+    sessionsLoading = true
+    status = "Loading saved sessions..."
+    error = ""
+    listProcess.command = [binaryPath, "list", "--json"]
+    listProcess.running = true
+    return true
+  }
+
+  function restoreNamed(name) {
+    return runAction("restore", name)
+  }
+
   function runMode(nextMode) {
     if (!installed || busy) return false
     status = nextMode === "active" ? "Enabling autosave..." : "Saving session..."
@@ -78,12 +95,12 @@ Item {
     return true
   }
 
-  function runAction(action) {
+  function runAction(action, name) {
     if (!installed || busy) return false
     status = action === "restore" ? "Restoring session..." : "Saving session..."
     error = ""
     actionProcess.command = action === "restore"
-      ? [binaryPath, "restore"]
+      ? (name === undefined ? [binaryPath, "restore"] : [binaryPath, "restore", "--name", name])
       : [binaryPath, "save", "--label", "manual"]
     actionProcess.running = true
     return true
@@ -158,6 +175,31 @@ Item {
         root.status = value === "active" ? "Autosave active" : "Manual mode"
       }
       root.preserveStatus = false
+    }
+  }
+
+  Process {
+    id: listProcess
+    command: []
+    stdout: StdioCollector { id: listOutput; waitForEnd: true }
+    stderr: StdioCollector { id: listError; waitForEnd: true }
+    onExited: function(exitCode) {
+      root.sessionsLoading = false
+      if (exitCode !== 0) {
+        root.status = ""
+        root.error = listError.text.trim() || "Could not load saved sessions"
+        return
+      }
+      try {
+        var sessions = JSON.parse(listOutput.text)
+        if (!Array.isArray(sessions)) throw new Error("not an array")
+        root.sessions = sessions
+        root.status = sessions.length ? "Choose a saved session" : "No named sessions saved"
+      } catch (error) {
+        root.sessions = []
+        root.status = ""
+        root.error = "Could not read saved sessions"
+      }
     }
   }
 

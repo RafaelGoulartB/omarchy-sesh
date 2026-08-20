@@ -2737,7 +2737,7 @@ def cmd_restore(dry_run=False, name=None):
             print("restore failed: Hyprland IPC is unavailable", file=sys.stderr)
             conn.close()
             return 75
-        if restore_was_completed(sid):
+        if name is None and restore_was_completed(sid):
             print(
                 "restore skipped: named session already handled for this desktop"
                 if name is not None
@@ -2827,16 +2827,27 @@ def cmd_status():
     conn.close()
 
 
-def cmd_list():
+def cmd_list(as_json=False):
     conn = db_conn()
+    sessions = []
     for name, sid, created, windows in conn.execute(
         "SELECT n.name, s.id, s.created_at, COUNT(w.id) FROM named_sessions n "
         "JOIN sessions s ON s.id = n.session "
         "LEFT JOIN windows w ON w.session = s.id "
         "GROUP BY n.name, s.id, s.created_at ORDER BY n.name COLLATE BINARY"
     ):
-        print(f"{name}: session {sid}, {created}, {windows} windows")
+        sessions.append(
+            {"name": name, "id": sid, "created_at": created, "windows": windows}
+        )
     conn.close()
+    if as_json:
+        print(json.dumps(sessions, ensure_ascii=False))
+    else:
+        for session in sessions:
+            print(
+                f"{session['name']}: session {session['id']}, "
+                f"{session['created_at']}, {session['windows']} windows"
+            )
     return 0
 
 
@@ -3031,7 +3042,8 @@ def main():
 
     sub.add_parser("status", help="list saved sessions")
 
-    sub.add_parser("list", help="list named sessions")
+    p_list = sub.add_parser("list", help="list named sessions")
+    p_list.add_argument("--json", action="store_true", help="emit JSON")
 
     p_delete = sub.add_parser("delete", help="delete a named session")
     p_delete.add_argument("--name", required=True, type=argparse_session_name)
@@ -3058,7 +3070,7 @@ def main():
         if args.command == "status":
             return cmd_status()
         if args.command == "list":
-            return cmd_list()
+            return cmd_list(as_json=args.json)
         if args.command == "delete":
             return cmd_delete(args.name)
         if args.command == "acceptance":

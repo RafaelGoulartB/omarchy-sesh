@@ -59,7 +59,7 @@ After installation the widget shows three actions:
 
 - **Active** — enables periodic autosave (default interval 60s).
 - **Manual** — disables autosave and saves the current session immediately.
-- **Restore** — relaunches the latest snapshot's apps and window layout.
+- **Restore** — opens a picker of named sessions to relaunch.
 
 On a fresh install autosave defaults to manual mode. Selecting **Active**
 captures the current desktop once and enables the periodic saver. A restore then
@@ -148,6 +148,8 @@ shows named sessions and `omarchy-sesh delete --name NAME` removes a name and
 its saved window state. Saving an existing name fails; delete it before using
 that name again. Names may contain internal spaces but cannot be empty, padded
 with whitespace, contain control characters, or exceed 128 characters.
+The panel's **Restore** action lists these named sessions; create them from the
+CLI until a named-save panel action is added.
 
 **Restore** (`omarchy-sesh restore`) loads the most recent complete session;
 a healthy empty session intentionally restores nothing. An advisory lock

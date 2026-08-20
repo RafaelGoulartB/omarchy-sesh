@@ -2,6 +2,19 @@
 
 All notable changes to `omarchy-sesh` are documented here.
 
+## v0.2.2 - 2026-08-20
+
+### Added
+
+- The panel's Restore action now opens a keyboard- and pointer-accessible picker
+  of named sessions, displaying each name, capture time, and window count.
+- `omarchy-sesh list --json` emits named-session metadata for panel consumers.
+
+### Fixed
+
+- Named sessions can now be restored repeatedly in the same Hyprland desktop;
+  the one-per-desktop guard remains in place for automatic latest restore.
+
 ## v0.2.1 - 2026-08-20
 
 ### Added

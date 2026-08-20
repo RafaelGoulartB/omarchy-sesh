@@ -556,6 +556,33 @@ class OmarchySeshTests(unittest.TestCase):
         self.assertIn(f"work: session {sid}", stdout.getvalue())
         self.assertIn("1 windows", stdout.getvalue())
 
+    def test_list_json_prints_named_session_metadata(self):
+        sid = self.module.persist_snapshot(
+            "manual", "complete", "", [window(1, 0, "terminal", 1)], name='work "desk"'
+        )
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            self.assertEqual(0, self.module.cmd_list(as_json=True))
+
+        self.assertEqual(
+            [
+                {
+                    "name": 'work "desk"',
+                    "id": sid,
+                    "created_at": mock.ANY,
+                    "windows": 1,
+                }
+            ],
+            self.module.json.loads(stdout.getvalue()),
+        )
+
+    def test_list_json_prints_an_empty_array_without_named_sessions(self):
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            self.assertEqual(0, self.module.cmd_list(as_json=True))
+
+        self.assertEqual([], self.module.json.loads(stdout.getvalue()))
+
     def test_delete_removes_named_snapshot_and_its_payload(self):
         sid = self.module.persist_snapshot(
             "manual",
@@ -610,6 +637,32 @@ class OmarchySeshTests(unittest.TestCase):
             self.assertEqual(0, self.module.cmd_restore(name="work"))
 
         self.assertEqual(sid, restore_windows.call_args.args[0][0]["session"])
+
+    def test_named_restore_can_repeat_in_the_same_desktop(self):
+        self.module.persist_snapshot(
+            "manual", "complete", "", [window(1, 0, "terminal", 1)], name="work"
+        )
+        lock_file = mock.Mock()
+        with (
+            mock.patch.dict(
+                os.environ, {"HYPRLAND_INSTANCE_SIGNATURE": "instance-1"}, clear=False
+            ),
+            mock.patch.object(
+                self.module, "acquire_operation_lock", return_value=lock_file
+            ),
+            mock.patch.object(self.module, "hyprctl_json", return_value=[]),
+            mock.patch.object(
+                self.module, "restore_was_completed", return_value=True
+            ) as restore_was_completed,
+            mock.patch.object(
+                self.module, "restore_windows", return_value=(1, 0, 1, False)
+            ) as restore_windows,
+            mock.patch.object(self.module, "mark_restore_completed", return_value=True),
+        ):
+            self.assertEqual(0, self.module.cmd_restore(name="work"))
+
+        restore_was_completed.assert_not_called()
+        restore_windows.assert_called_once()
 
     def test_restore_rejects_a_missing_named_snapshot(self):
         stderr = io.StringIO()
@@ -3934,7 +3987,7 @@ class OmarchySeshTests(unittest.TestCase):
     def test_first_install_enables_autosave(self):
         calls, _, marker = self.run_installer(autosave_unit_exists=False)
         self.assertIn("--user enable omarchy-sesh-autosave.service", calls)
-        self.assertEqual("0.2.0", marker)
+        self.assertEqual("0.2.2", marker)
 
     def test_reinstall_preserves_manual_mode(self):
         calls, _, _ = self.run_installer(autosave_unit_exists=True)

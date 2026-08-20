@@ -14,6 +14,7 @@ Panel {
   property bool firstOpen: true
   property int selectedIndex: 0
   property bool cursorActive: false
+  property bool showingSessions: false
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color inverse: Color.background
@@ -24,7 +25,7 @@ Panel {
   readonly property var options: [
     { title: "Active", detail: "Enable automatic session snapshots", icon: "󰐊" },
     { title: "Manual", detail: "Disable autosave and save now", icon: "󰆓" },
-    { title: "Restore", detail: "Restore the latest saved session", icon: "󰑓" }
+    { title: "Restore", detail: "Choose a saved session to restore", icon: "󰑓" }
   ]
 
   implicitWidth: button.implicitWidth
@@ -35,12 +36,24 @@ Panel {
     selectedIndex = index
     if (index === 0) service.activate()
     else if (index === 1) service.saveManual()
-    else service.restore()
+    else {
+      showingSessions = true
+      selectedIndex = 0
+      cursorActive = false
+      service.listSessions()
+    }
+  }
+
+  function chooseSession(index) {
+    if (!service.installed || service.busy || index < 0 || index >= service.sessions.length) return
+    selectedIndex = index
+    service.restoreNamed(service.sessions[index].name)
   }
 
   onOpenedChanged: if (opened) {
     selectedIndex = active ? 0 : 1
     cursorActive = false
+    showingSessions = false
     if (firstOpen) {
       firstOpen = false
       if (service.installed) service.refresh()
@@ -106,11 +119,26 @@ Panel {
       blocked: false
       onMoveRequested: function(dx, dy) {
         if (!root.cursorActive) root.cursorActive = true
-        else if (dy !== 0) root.selectedIndex = (root.selectedIndex + dy + root.options.length) % root.options.length
+        else if (dy !== 0) {
+          var count = root.showingSessions ? service.sessions.length : root.options.length
+          if (count > 0) root.selectedIndex = (root.selectedIndex + dy + count) % count
+        }
       }
-      onActivateRequested: if (root.cursorActive) root.choose(root.selectedIndex)
-      onReturnRequested: if (root.cursorActive) root.choose(root.selectedIndex)
-      onCloseRequested: root.close()
+      onActivateRequested: if (root.cursorActive) {
+        if (root.showingSessions) root.chooseSession(root.selectedIndex)
+        else root.choose(root.selectedIndex)
+      }
+      onReturnRequested: if (root.cursorActive) {
+        if (root.showingSessions) root.chooseSession(root.selectedIndex)
+        else root.choose(root.selectedIndex)
+      }
+      onCloseRequested: {
+        if (root.showingSessions) {
+          root.showingSessions = false
+          root.cursorActive = false
+          root.selectedIndex = 2
+        } else root.close()
+      }
       onTabRequested: function(direction) { root.switchPanel(direction) }
 
       ColumnLayout {
@@ -120,9 +148,9 @@ Panel {
 
         PanelHero {
           Layout.fillWidth: true
-          title: "Omarchy Sesh"
-          meta: !root.modeKnown ? "Status unavailable" : (root.active ? "Autosave active" : "Manual mode")
-          detail: service.busy ? "Working..." : "Session management"
+          title: root.showingSessions ? "Restore Session" : "Omarchy Sesh"
+          meta: root.showingSessions ? "Named saved sessions" : (!root.modeKnown ? "Status unavailable" : (root.active ? "Autosave active" : "Manual mode"))
+          detail: service.sessionsLoading ? "Loading saved sessions..." : (service.busy ? "Working..." : (root.showingSessions ? "Select a session to restore" : "Session management"))
           foreground: root.foreground
           fontFamily: root.fontFamily
           iconOpacity: service.installed ? 1.0 : 0.6
@@ -152,7 +180,7 @@ Panel {
         }
 
         Repeater {
-          model: root.options
+          model: root.showingSessions ? [] : root.options
 
           CursorSurface {
             required property var modelData
@@ -208,6 +236,80 @@ Panel {
                   color: root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
+                }
+              }
+            }
+          }
+        }
+
+        Text {
+          visible: root.showingSessions && !service.sessionsLoading && service.sessions.length === 0 && service.error === ""
+          Layout.fillWidth: true
+          text: "Named sessions are created with omarchy-sesh save --name NAME."
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.WordWrap
+        }
+
+        Repeater {
+          model: root.showingSessions ? service.sessions : []
+
+          CursorSurface {
+            required property var modelData
+            required property int index
+
+            Layout.fillWidth: true
+            implicitHeight: sessionRow.implicitHeight + Style.spacing.rowPaddingX
+            foreground: root.foreground
+            hasCursor: root.cursorActive && root.selectedIndex === index
+
+            MouseArea {
+              anchors.fill: parent
+              hoverEnabled: true
+              enabled: service.installed && !service.busy
+              cursorShape: Qt.PointingHandCursor
+              onEntered: { root.cursorActive = true; root.selectedIndex = index }
+              onClicked: root.chooseSession(index)
+            }
+
+            RowLayout {
+              id: sessionRow
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              anchors.leftMargin: Style.space(10)
+              anchors.rightMargin: Style.space(10)
+              spacing: Style.space(10)
+
+              Text {
+                text: "󰑓"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.icon
+              }
+
+              ColumnLayout {
+                Layout.fillWidth: true
+                spacing: Style.space(1)
+
+                Text {
+                  Layout.fillWidth: true
+                  text: modelData.name
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                  font.bold: true
+                  elide: Text.ElideRight
+                }
+
+                Text {
+                  Layout.fillWidth: true
+                  text: modelData.created_at + " | " + modelData.windows + (modelData.windows === 1 ? " window" : " windows")
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  elide: Text.ElideRight
                 }
               }
             }
