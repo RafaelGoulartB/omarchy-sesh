@@ -1,8 +1,7 @@
 # OmarchySesh
+The plugin you didn't know you need till you have it. Restores window positions and running apps after reboot or shutdown on Omarchy (Hyprland). 
 
-Restore window positions and running apps after reboot or shutdown on
-Omarchy (Hyprland). Snapshots live in a SQLite DB at
-`${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/session.db`.
+Snapshots live in a SQLite DB at: `${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/session.db`.
 
 ## Installing as an Omarchy Plugin
 
