@@ -74,6 +74,12 @@ dispatchers). Key facts confirmed live:
     silent workspace move
   - `hl.dsp.workspace.move({ workspace = <N>, monitor = "<NAME>" })` — move a
     workspace to a monitor (workspace must exist first)
+- **Runtime configuration** (0.56): `hyprctl keyword <option> <value>` is NOT
+  usable — it answers "keyword can't work with non-legacy parsers. Use eval."
+  and still exits 0, so its failure is silent. Read options with
+  `hyprctl -j getoption <option>` or `hl.get_config("<option>")`, and write them
+  with `hyprctl eval 'hl.config({ <section> = { <key> = <value> } })'`. Always
+  read the value back, because a rejected write is not reported.
 - UWSM caveat (Omarchy uses `uwsm-app`): **never** trigger restore or save via
   the `exit` dispatcher or by killing Hyprland — use `uwsm stop` / loginctl so
   session teardown stays ordered.
@@ -219,6 +225,21 @@ the service retries after two seconds.
       workspace, set floating state, resize before moving floating windows,
       then restore fullscreen and pinned state. Monitor remapping happens first
       so it cannot invalidate restored geometry or pinned state.
+    - Skip any property whose live client already matches the snapshot, and
+      apply the remaining dispatches for one window in a single `hyprctl eval`.
+      One evaluation replaces one process per property (~33 ms to ~8 ms for a
+      floating window) and lands the whole placement inside one compositor
+      frame, so the window never renders at an intermediate position. Every
+      dispatch is still attempted and failures are counted, so one failed
+      property cannot skip the rest of the placement.
+    - Suppress `animations:enabled` for the duration of restore and put the
+      previous value back afterwards, including when placement raises. Hyprland
+      otherwise animates every move, resize, and workspace change — the default
+      Omarchy `windows` animation runs ~380 ms — so a restored desktop visibly
+      shuffles itself into place after its windows have already mapped.
+      Suppression is best-effort: an unreadable or already-disabled option
+      leaves the setting untouched and restore proceeds unchanged. A process
+      killed mid-restore cannot run its revert; `hyprctl reload` recovers.
     - After discovery, infer a binary guillotine split tree from each saved
       workspace's tiled rectangles. Nested replay requires schema-v5 metadata,
       the saved and current dwindle layout, `use_active_for_splits` and

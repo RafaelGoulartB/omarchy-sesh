@@ -44,6 +44,16 @@ tagged prerelease, `alpha`; changes after that tag are listed as unreleased.
   direct group reconstruction is capability-gated to 0.56 or newer.
 - Restore dispatches all initially missing process groups before polling and
   places fast windows without waiting for slower applications.
+- Restore suppresses Hyprland animations through the Lua configuration API
+  while it places windows and puts the previous setting back afterwards, so a
+  restored desktop no longer visibly shuffles itself into position after its
+  windows have mapped.
+- Each window's placement is applied in one Hyprland Lua evaluation instead of
+  one `hyprctl` process per property, cutting a floating window's placement
+  cost from about 33 ms to about 8 ms and landing every property inside a
+  single compositor frame.
+- Placement skips workspace, float, fullscreen, and pin dispatches whose live
+  window already matches the snapshot.
 - Chromium app-mode identity validation accepts supported profile suffix
   changes while rejecting unrelated or malformed classes and URLs.
 - Ordinary Chromium relaunches strip shared app-mode arguments to avoid

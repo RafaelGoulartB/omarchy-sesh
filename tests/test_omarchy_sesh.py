@@ -356,6 +356,93 @@ class OmarchySeshTests(unittest.TestCase):
         ):
             self.assertIsNone(self.module.eval_lua("return true"))
 
+    def patch_animation_ipc(self, reported, set_result=True):
+        """Patch the animation IPC helpers for the rest of the current test.
+
+        These tests assert on calls made after the suppression block exits, so
+        the patches must outlive it rather than wrap it.
+        """
+        self.start_patch("animations_enabled", return_value=reported)
+        setter = self.start_patch("set_animations_enabled", return_value=set_result)
+        self.start_patch("log")
+        return setter
+
+    def start_patch(self, target, **kwargs):
+        patcher = mock.patch.object(self.module, target, **kwargs)
+        started = patcher.start()
+        self.addCleanup(patcher.stop)
+        return started
+
+    def test_animations_are_suppressed_and_restored_around_placement(self):
+        setter = self.patch_animation_ipc(True)
+        with self.module.animations_disabled():
+            self.assertEqual([mock.call(False)], setter.call_args_list)
+
+        self.assertEqual([mock.call(False), mock.call(True)], setter.call_args_list)
+
+    def test_animations_are_restored_when_placement_raises(self):
+        setter = self.patch_animation_ipc(True)
+        with self.assertRaises(RuntimeError), self.module.animations_disabled():
+            raise RuntimeError("placement failed")
+
+        self.assertEqual(mock.call(True), setter.call_args_list[-1])
+
+    def test_animations_already_off_are_left_untouched(self):
+        setter = self.patch_animation_ipc(False)
+        with self.module.animations_disabled():
+            pass
+        setter.assert_not_called()
+
+    def test_unreadable_animation_option_leaves_the_setting_untouched(self):
+        setter = self.patch_animation_ipc(None)
+        with self.module.animations_disabled():
+            pass
+        setter.assert_not_called()
+
+    def test_failed_suppression_is_not_reverted(self):
+        setter = self.patch_animation_ipc(True, set_result=False)
+        with self.module.animations_disabled():
+            pass
+
+        self.assertEqual([mock.call(False)], setter.call_args_list)
+
+    def test_animations_are_toggled_through_the_lua_config_api(self):
+        # `hyprctl keyword animations:enabled` is answered with "keyword can't
+        # work with non-legacy parsers" and still exits 0 on Hyprland 0.56, so
+        # the write must go through hl.config and be read back.
+        for enabled, expected in ((False, "false"), (True, "true")):
+            with mock.patch.object(
+                self.module, "eval_lua", return_value=True
+            ) as evaluate:
+                self.assertTrue(self.module.set_animations_enabled(enabled))
+            script = evaluate.call_args.args[0]
+            self.assertIn(
+                f"hl.config({{ animations = {{ enabled = {expected} }} }})", script
+            )
+            self.assertIn(
+                f"if hl.get_config('animations:enabled') ~= {expected} then", script
+            )
+
+    def test_animation_toggle_failure_is_reported(self):
+        for result in (False, None):
+            with mock.patch.object(self.module, "eval_lua", return_value=result):
+                self.assertFalse(self.module.set_animations_enabled(False))
+
+    def test_animations_enabled_reads_bool_and_int_option_shapes(self):
+        for option, expected in (
+            ({"option": "animations:enabled", "bool": True}, True),
+            ({"option": "animations:enabled", "bool": False}, False),
+            ({"option": "animations:enabled", "int": 0}, False),
+            ({"option": "animations:enabled"}, None),
+            ([], None),
+            (None, None),
+        ):
+            with mock.patch.object(
+                self.module, "hyprctl_json", return_value=option
+            ) as hyprctl:
+                self.assertIs(expected, self.module.animations_enabled())
+            hyprctl.assert_called_once_with("getoption", "animations:enabled")
+
     def test_hyprctl_batch_json_parses_each_response(self):
         result = mock.Mock(
             returncode=0,
@@ -924,6 +1011,122 @@ class OmarchySeshTests(unittest.TestCase):
 
         self.assertEqual({}, targets)
         log.assert_called_once()
+
+    def test_floating_placement_resizes_before_moving_in_one_evaluation(self):
+        row = window(1, 0, "terminal", 10)
+        row.update(floating=1, at_x=100, at_y=200, size_w=800, size_h=600)
+        with (
+            mock.patch.object(self.module, "eval_lua", return_value=True) as evaluate,
+            mock.patch.object(self.module, "dispatch") as dispatch,
+        ):
+            self.assertTrue(self.module.place_window(row, "0x1"))
+
+        dispatch.assert_not_called()
+        evaluate.assert_called_once()
+        script = evaluate.call_args.args[0]
+        self.assertLess(
+            script.index("hl.dsp.window.resize"), script.index("x = 100, y = 200")
+        )
+        self.assertIn("hl.dsp.window.move({ workspace = 1", script)
+        self.assertIn('hl.dsp.window.float({ action = "on"', script)
+        self.assertIn("failed=failed+1", script)
+
+    def test_placement_reports_failure_without_aborting_remaining_dispatches(self):
+        row = window(1, 0, "terminal", 10)
+        with mock.patch.object(
+            self.module, "eval_lua", return_value=False
+        ) as evaluate:
+            self.assertFalse(self.module.place_window(row, "0x1"))
+
+        script = evaluate.call_args.args[0]
+        # Every dispatch is counted rather than raising at the first failure,
+        # so one failed property cannot skip the rest of the placement.
+        self.assertNotIn("assert(", script)
+        self.assertEqual(1, script.count("if failed>0 then error"))
+
+    def test_placement_ipc_failure_is_reported_as_failure(self):
+        row = window(1, 0, "terminal", 10)
+        with mock.patch.object(self.module, "eval_lua", return_value=None):
+            self.assertFalse(self.module.place_window(row, "0x1"))
+
+    def test_already_correct_window_costs_no_compositor_round_trip(self):
+        row = window(1, 0, "terminal", 10)
+        current = {
+            "workspace": {"id": 1},
+            "floating": False,
+            "fullscreen": 0,
+            "fullscreenClient": 0,
+            "pinned": False,
+        }
+        with (
+            mock.patch.object(self.module, "eval_lua") as evaluate,
+            mock.patch.object(self.module, "dispatch") as dispatch,
+        ):
+            self.assertTrue(self.module.place_window(row, "0x1", current))
+
+        evaluate.assert_not_called()
+        dispatch.assert_not_called()
+
+    def test_matching_workspace_and_fullscreen_state_are_not_redispatched(self):
+        row = window(1, 0, "terminal", 10)
+        row.update(floating=1, fullscreen=2)
+        current = {
+            "workspace": {"id": 1},
+            "floating": False,
+            "fullscreen": 2,
+            "fullscreenClient": 2,
+            "pinned": False,
+        }
+        operations = self.module.window_placement_operations(row, "0x1", current)
+        self.assertEqual(
+            ['hl.dsp.window.float({ action = "on", window = [[address:0x1]] })'],
+            operations,
+        )
+
+    def test_divergent_client_fullscreen_state_is_still_corrected(self):
+        row = window(1, 0, "terminal", 10)
+        current = {
+            "workspace": {"id": 1},
+            "floating": False,
+            "fullscreen": 0,
+            "fullscreenClient": 1,
+            "pinned": False,
+        }
+        operations = self.module.window_placement_operations(row, "0x1", current)
+        self.assertEqual(
+            [
+                (
+                    "hl.dsp.window.fullscreen_state({ internal = 0, client = 0, "
+                    "window = [[address:0x1]] })"
+                )
+            ],
+            operations,
+        )
+
+    def test_unknown_client_state_still_dispatches_every_property(self):
+        row = window(1, 0, "terminal", 10)
+        row.update(pinned=1)
+        operations = self.module.window_placement_operations(row, "0x1")
+        self.assertEqual(
+            [
+                (
+                    "hl.dsp.window.move({ workspace = 1, follow = false, "
+                    "window = [[address:0x1]] })"
+                ),
+                'hl.dsp.window.float({ action = "off", window = [[address:0x1]] })',
+                (
+                    "hl.dsp.window.fullscreen_state({ internal = 0, client = 0, "
+                    "window = [[address:0x1]] })"
+                ),
+                "hl.dsp.window.pin({ window = [[address:0x1]] })",
+            ],
+            operations,
+        )
+
+    def test_placement_without_an_address_fails(self):
+        with mock.patch.object(self.module, "eval_lua") as evaluate:
+            self.assertFalse(self.module.place_window(window(1, 0, "terminal", 10), ""))
+        evaluate.assert_not_called()
 
     def test_prepare_moves_each_workspace_once_before_window_state(self):
         rows = [window(1, 0, "terminal", 10), window(2, 1, "browser", 20)]
@@ -1840,6 +2043,10 @@ class OmarchySeshTests(unittest.TestCase):
                 "hyprctl_json",
                 side_effect=current_clients,
             ),
+            # This harness models only the `clients` query, so animation
+            # suppression is exercised by its own focused tests instead.
+            mock.patch.object(self.module, "animations_enabled", return_value=None),
+            mock.patch.object(self.module, "set_animations_enabled", return_value=True),
             mock.patch.object(
                 self.module, "dispatch", side_effect=run_dispatch
             ) as dispatch,
@@ -3140,6 +3347,67 @@ class OmarchySeshTests(unittest.TestCase):
         args = restore_windows.call_args.args
         self.assertEqual(37.5, args[4])
         self.assertEqual("DP-2", args[5])
+
+    def test_restore_places_windows_with_animations_suppressed(self):
+        self.module.persist_snapshot(
+            "periodic", "complete", "", [window(1, 0, "terminal", 10)]
+        )
+        lock_file = mock.Mock()
+        events = []
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"HYPRLAND_INSTANCE_SIGNATURE": "instance-1"},
+                clear=False,
+            ),
+            mock.patch.object(
+                self.module, "acquire_operation_lock", return_value=lock_file
+            ),
+            mock.patch.object(self.module, "hyprctl_json", return_value=[]),
+            mock.patch.object(self.module, "restore_was_completed", return_value=False),
+            mock.patch.object(self.module, "animations_enabled", return_value=True),
+            mock.patch.object(
+                self.module,
+                "set_animations_enabled",
+                side_effect=lambda enabled: (
+                    events.append(f"animations={enabled}") or True
+                ),
+            ),
+            mock.patch.object(
+                self.module,
+                "restore_windows",
+                side_effect=lambda *_a: events.append("restore") or (1, 0, 1, False),
+            ),
+            mock.patch.object(self.module, "mark_restore_completed", return_value=True),
+        ):
+            self.assertEqual(0, self.module.cmd_restore())
+
+        self.assertEqual(["animations=False", "restore", "animations=True"], events)
+
+    def test_dry_run_does_not_touch_animations(self):
+        connection = mock.Mock()
+        lock_file = mock.Mock()
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"HYPRLAND_INSTANCE_SIGNATURE": "instance-1"},
+                clear=False,
+            ),
+            mock.patch.object(
+                self.module, "acquire_operation_lock", return_value=lock_file
+            ),
+            mock.patch.object(self.module, "db_conn", return_value=connection),
+            mock.patch.object(
+                self.module, "latest_session", return_value=(1, "periodic", "now")
+            ),
+            mock.patch.object(
+                self.module, "load_windows", return_value=[window(1, 0, "terminal", 10)]
+            ),
+            mock.patch.object(self.module, "hyprctl_json", return_value=[]),
+            mock.patch.object(self.module, "set_animations_enabled") as keyword,
+        ):
+            self.assertEqual(0, self.module.cmd_restore(dry_run=True))
+        keyword.assert_not_called()
 
     def test_no_session_without_compositor_requests_retry(self):
         connection = mock.Mock()

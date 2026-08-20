@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import contextlib
 import fcntl
 import json
 import math
@@ -114,6 +115,51 @@ def dispatch(lua):
         log(f"dispatch failed ({lua}): {output}")
         return False
     return True
+
+
+def animations_enabled():
+    option = hyprctl_json("getoption", "animations:enabled")
+    if not isinstance(option, dict):
+        return None
+    value = option.get("int", option.get("bool"))
+    return None if value is None else bool(value)
+
+
+def set_animations_enabled(enabled):
+    """Toggle `animations:enabled` through the Lua configuration API.
+
+    `hyprctl keyword` is not usable here: Hyprland 0.56 answers it with
+    "keyword can't work with non-legacy parsers. Use eval." and still exits 0,
+    so the write must go through `hl.config` and be read back to confirm it
+    actually landed.
+    """
+    value = "true" if enabled else "false"
+    return bool(
+        eval_lua(
+            f"hl.config({{ animations = {{ enabled = {value} }} }}) "
+            f"if hl.get_config('animations:enabled') ~= {value} then "
+            "error('animations:enabled did not change') end"
+        )
+    )
+
+
+@contextlib.contextmanager
+def animations_disabled():
+    """Place restored windows without animating each one into position.
+
+    Hyprland animates every move, resize, and workspace change, so an
+    otherwise fast restore visibly shuffles windows across the desktop after
+    they have already mapped. Suppression is best-effort: when the option
+    cannot be read or cleared the restore proceeds with animations on rather
+    than failing, and the previous value is always put back.
+    """
+    previous = animations_enabled()
+    suppressed = bool(previous) and set_animations_enabled(False)
+    try:
+        yield
+    finally:
+        if suppressed and not set_animations_enabled(True):
+            log("restore: could not re-enable animations; run 'hyprctl reload'")
 
 
 def eval_lua(lua):
@@ -964,54 +1010,71 @@ def match_windows(rows, clients, used_addresses=None, max_rank=2):
     return matches
 
 
-def place_window(w, address, current=None):
-    if not address:
-        return False
+def window_placement_operations(w, address, current=None):
+    """Lua dispatches that move one matched window to its saved state.
+
+    A property whose live client already matches the snapshot is skipped, so an
+    already-correct window costs no compositor round trip and no animation.
+    """
     win = lua_quote(f"address:{address}")
-    ok = True
-    if w.get("workspace_id") is not None:
-        ok = (
-            dispatch(
-                f"hl.dsp.window.move({{ workspace = {w['workspace_id']}, follow = false, window = {win} }})"
-            )
-            and ok
+    operations = []
+    workspace_id = w.get("workspace_id")
+    current_workspace = (current or {}).get("workspace") or {}
+    if workspace_id is not None and current_workspace.get("id") != workspace_id:
+        operations.append(
+            f"hl.dsp.window.move({{ workspace = {workspace_id}, follow = false, window = {win} }})"
         )
     desired_floating = bool(w.get("floating"))
     current_floating = bool(current and current.get("floating"))
     if current is None or desired_floating != current_floating:
         float_action = "on" if desired_floating else "off"
-        ok = (
-            dispatch(
-                f'hl.dsp.window.float({{ action = "{float_action}", window = {win} }})'
-            )
-            and ok
+        operations.append(
+            f'hl.dsp.window.float({{ action = "{float_action}", window = {win} }})'
         )
-    if w.get("floating"):
+    if desired_floating:
+        # Resize before moving because Hyprland resize is center-anchored.
         if w.get("size_w") is not None and w.get("size_h") is not None:
-            ok = (
-                dispatch(
-                    f"hl.dsp.window.resize({{ x = {w['size_w']}, y = {w['size_h']}, window = {win} }})"
-                )
-                and ok
+            operations.append(
+                f"hl.dsp.window.resize({{ x = {w['size_w']}, y = {w['size_h']}, window = {win} }})"
             )
         if w.get("at_x") is not None and w.get("at_y") is not None:
-            ok = (
-                dispatch(
-                    f"hl.dsp.window.move({{ x = {w['at_x']}, y = {w['at_y']}, window = {win} }})"
-                )
-                and ok
+            operations.append(
+                f"hl.dsp.window.move({{ x = {w['at_x']}, y = {w['at_y']}, window = {win} }})"
             )
     fs = w.get("fullscreen", 0)
-    ok = (
-        dispatch(
+    if (
+        current is None
+        or current.get("fullscreen", 0) != fs
+        or current.get("fullscreenClient", 0) != fs
+    ):
+        operations.append(
             f"hl.dsp.window.fullscreen_state({{ internal = {fs}, client = {fs}, window = {win} }})"
         )
-        and ok
-    )
     current_pinned = bool(current and current.get("pinned"))
     if bool(w.get("pinned")) != current_pinned:
-        ok = dispatch(f"hl.dsp.window.pin({{ window = {win} }})") and ok
-    return ok
+        operations.append(f"hl.dsp.window.pin({{ window = {win} }})")
+    return operations
+
+
+def place_window(w, address, current=None):
+    if not address:
+        return False
+    operations = window_placement_operations(w, address, current)
+    if not operations:
+        return True
+    # One evaluation replaces one hyprctl process per property and applies the
+    # whole placement inside a single compositor frame, so the window never
+    # renders at an intermediate position. Every dispatch is still attempted so
+    # a single failed property does not skip the rest of the placement.
+    script = [
+        "local failed=0",
+        *(
+            f"if not hl.dispatch({operation}).ok then failed=failed+1 end"
+            for operation in operations
+        ),
+        "if failed>0 then error(failed..' placement dispatches failed') end",
+    ]
+    return bool(eval_lua(" ".join(script)))
 
 
 def window_geometry(window):
@@ -2606,14 +2669,15 @@ def cmd_restore(dry_run=False):
             print("restore deferred: could not persist restore state", file=sys.stderr)
             return 75
 
-        restored, failures, launched_processes, ipc_failed = restore_windows(
-            rows,
-            initial_matches,
-            clients,
-            layouts,
-            cfg["restore_timeout_seconds"],
-            cfg["monitor_fallback"],
-        )
+        with animations_disabled():
+            restored, failures, launched_processes, ipc_failed = restore_windows(
+                rows,
+                initial_matches,
+                clients,
+                layouts,
+                cfg["restore_timeout_seconds"],
+                cfg["monitor_fallback"],
+            )
         print(f"restored {restored}/{len(rows)} windows")
         log(
             f"restore: restored {restored}/{len(rows)} windows from "
