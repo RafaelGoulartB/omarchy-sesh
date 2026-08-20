@@ -74,17 +74,14 @@ See [How it works](#how-it-works) for the full save/restore behavior and
 ## CLI
 
 ```sh
-omarchy-sesh save [--label manual|logout] [--name NAME]
-                                            # snapshot current windows
-omarchy-sesh restore [--name NAME] [--dry-run]
-                                            # restore latest or named snapshot
-omarchy-sesh autosave [--interval 60]       # periodic save (crash cover)
-omarchy-sesh status                         # list saved sessions
-omarchy-sesh list                           # list named sessions
-omarchy-sesh delete --name NAME             # delete a named session
-omarchy-sesh mode [active|manual]           # query or change autosave mode
-omarchy-sesh acceptance [--expect-power-save|--expect-restore-failure]
-                                            # read-only live acceptance evidence
+omarchy-sesh save [--label manual|logout] [--name NAME]                 # snapshot current windows
+omarchy-sesh restore [--name NAME] [--dry-run]                          # restore latest or named snapshot
+omarchy-sesh autosave [--interval 60]                                   # periodic save (crash cover)
+omarchy-sesh status                                                     # list saved sessions
+omarchy-sesh list                                                       # list named sessions
+omarchy-sesh delete --name NAME                                         # delete a named session
+omarchy-sesh mode [active|manual]                                       # query or change autosave mode
+omarchy-sesh acceptance [--expect-power-save|--expect-restore-failure]  # read-only live acceptance evidence
 ```
 
 Config (optional): `${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/sesh/config.json`
