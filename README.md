@@ -24,6 +24,15 @@ from live addresses to snapshot-local metadata. Windows sharing a saved PID are
 kept as one launch group. By default, the latest five complete and five
 diagnostic snapshots are retained; retention is configurable.
 
+**Named save** (`omarchy-sesh save --name NAME`) captures the same state as a
+manual save and assigns it a unique name. Named sessions are independent from
+the automatic boot snapshot: they are retained until explicitly deleted and
+are restored only with `omarchy-sesh restore --name NAME`. `omarchy-sesh list`
+shows named sessions and `omarchy-sesh delete --name NAME` removes a name and
+its saved window state. Saving an existing name fails; delete it before using
+that name again. Names may contain internal spaces but cannot be empty, padded
+with whitespace, contain control characters, or exceed 128 characters.
+
 **Restore** (`omarchy-sesh restore`) loads the most recent complete session;
 a healthy empty session intentionally restores nothing. An advisory lock
 serializes restore and save operations. Existing windows are consumed
@@ -156,10 +165,14 @@ See [How it works](#how-it-works) for the full save/restore behavior and
 ## CLI
 
 ```sh
-omarchy-sesh save [--label manual|logout]   # snapshot current windows
-omarchy-sesh restore [--dry-run]            # relaunch latest snapshot
+omarchy-sesh save [--label manual|logout] [--name NAME]
+                                            # snapshot current windows
+omarchy-sesh restore [--name NAME] [--dry-run]
+                                            # restore latest or named snapshot
 omarchy-sesh autosave [--interval 60]       # periodic save (crash cover)
 omarchy-sesh status                         # list saved sessions
+omarchy-sesh list                           # list named sessions
+omarchy-sesh delete --name NAME             # delete a named session
 omarchy-sesh mode [active|manual]           # query or change autosave mode
 omarchy-sesh acceptance [--expect-power-save|--expect-restore-failure]
                                             # read-only live acceptance evidence

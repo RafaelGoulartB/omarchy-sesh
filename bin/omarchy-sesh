@@ -51,12 +51,34 @@ RESTORE_RETRY_DELAY = 2.0
 RESTORE_POLL_INTERVAL = 0.05
 MAX_CONFIG_SECONDS = 2_147_483_647
 MAX_SNAPSHOT_RETENTION = 9_223_372_036_854_775_807
+MAX_SESSION_NAME_LENGTH = 128
 MONITOR_FALLBACK_POLICIES = ("focused", "lowest")
 MONITOR_CONNECTOR_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*(-[A-Za-z0-9]+)*-[0-9]+$")
 
 
 class ConfigError(ValueError):
     pass
+
+
+class NamedSessionConflict(ValueError):
+    pass
+
+
+def session_name(value):
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ValueError("must not be empty or have leading/trailing whitespace")
+    if len(value) > MAX_SESSION_NAME_LENGTH:
+        raise ValueError(f"must be at most {MAX_SESSION_NAME_LENGTH} characters")
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ValueError("must not contain control characters")
+    return value
+
+
+def argparse_session_name(value):
+    try:
+        return session_name(value)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"invalid session name: {e}") from e
 
 
 def log(msg):
@@ -381,6 +403,15 @@ def db_conn():
         )
             """
         )
+        conn.execute(
+            """
+        CREATE TABLE IF NOT EXISTS named_sessions (
+            name TEXT PRIMARY KEY,
+            session INTEGER NOT NULL UNIQUE,
+            FOREIGN KEY (session) REFERENCES sessions(id)
+        )
+            """
+        )
         session_columns = {
             row[1] for row in conn.execute("PRAGMA table_info(sessions)")
         }
@@ -420,7 +451,7 @@ def db_conn():
                 conn.execute(
                     f"ALTER TABLE workspace_layouts ADD COLUMN {column} INTEGER"
                 )
-        conn.execute("PRAGMA user_version = 5")
+        conn.execute("PRAGMA user_version = 6")
         conn.commit()
     except Exception:
         conn.rollback()
@@ -448,9 +479,22 @@ def read_proc(pid):
 
 
 def persist_snapshot(
-    label, status, error, rows, workspace_layouts=None, snapshot_retention=5
+    label,
+    status,
+    error,
+    rows,
+    workspace_layouts=None,
+    snapshot_retention=5,
+    name=None,
 ):
+    if name is not None:
+        session_name(name)
     conn = db_conn()
+    if name is not None and conn.execute(
+        "SELECT 1 FROM named_sessions WHERE name = ?", (name,)
+    ).fetchone():
+        conn.close()
+        raise NamedSessionConflict(name)
     with conn:
         cur = conn.execute(
             "INSERT INTO sessions (label, capture_status, capture_error) VALUES (?, ?, ?)",
@@ -476,14 +520,21 @@ def persist_snapshot(
             ":gap_right, :gap_bottom, :gap_left, :complete)",
             [dict(layout, session=sid) for layout in workspace_layouts or ()],
         )
+        if name is not None and status == "complete":
+            conn.execute(
+                "INSERT INTO named_sessions (name, session) VALUES (?, ?)", (name, sid)
+            )
         keep_ids = {
             row[0]
             for row in conn.execute(
                 "SELECT id FROM sessions WHERE capture_status = 'complete' "
+                "AND NOT EXISTS (SELECT 1 FROM named_sessions n "
+                "WHERE n.session = sessions.id) "
                 "ORDER BY id DESC LIMIT ?",
                 (snapshot_retention,),
             )
         }
+        keep_ids.update(row[0] for row in conn.execute("SELECT session FROM named_sessions"))
         keep_ids.update(
             row[0]
             for row in conn.execute(
@@ -509,20 +560,35 @@ def persist_snapshot(
     return sid
 
 
-def cmd_save(label="manual", teardown=False, wait=False):
+def cmd_save(label="manual", teardown=False, wait=False, name=None):
+    if name is not None:
+        session_name(name)
     cfg = load_config_or_defaults(f"save[{label}]")
     lock_file = acquire_operation_lock(wait=wait)
     if lock_file is None:
         log(f"save[{label}]: another session operation is running")
         return 75
     try:
+        if name is not None:
+            conn = db_conn()
+            exists = conn.execute(
+                "SELECT 1 FROM named_sessions WHERE name = ?", (name,)
+            ).fetchone()
+            conn.close()
+            if exists:
+                print(f"save failed: named session {name!r} already exists", file=sys.stderr)
+                log(f"save[{label}]: named session {name!r} already exists")
+                return 1
         if label == "periodic" and not restore_is_ready():
             log("save[periodic]: startup restore is not complete")
             return 75
-        if label == "logout" and not teardown:
-            if not mark_restore_completed(None, complete=False):
-                log("save[logout]: could not close the autosave gate")
-                return 75
+        if (
+            label == "logout"
+            and not teardown
+            and not mark_restore_completed(None, complete=False)
+        ):
+            log("save[logout]: could not close the autosave gate")
+            return 75
         clients = hyprctl_json("clients")
         monitors = hyprctl_json("monitors")
         workspaces = hyprctl_json("workspaces")
@@ -541,6 +607,7 @@ def cmd_save(label="manual", teardown=False, wait=False):
             )
         ):
             log(f"save[{label}]: capture failed because Hyprland IPC is unavailable")
+            print("save failed: Hyprland IPC is unavailable", file=sys.stderr)
             return 1
         status = "failed" if teardown else "complete"
         errors = ["teardown captures are diagnostic only"] if teardown else []
@@ -555,6 +622,7 @@ def cmd_save(label="manual", teardown=False, wait=False):
             gaps_in=css_gaps(gaps_in),
             workspace_rules=workspace_rules,
             cfg=cfg,
+            name=name,
         )
     finally:
         lock_file.close()
@@ -738,6 +806,7 @@ def _save_clients(
     gaps_in=None,
     workspace_rules=(),
     cfg=None,
+    name=None,
 ):
     if cfg is None:
         cfg = load_config()
@@ -795,20 +864,34 @@ def _save_clients(
     if errors and status == "complete":
         status = "partial"
     error = "; ".join(errors)
-    sid = persist_snapshot(
-        label,
-        status,
-        error,
-        rows,
-        workspace_layouts,
-        cfg["snapshot_retention"],
-    )
-    if status == "complete" and label == "manual":
+    try:
+        sid = persist_snapshot(
+            label,
+            status,
+            error,
+            rows,
+            workspace_layouts,
+            cfg["snapshot_retention"],
+            name,
+        )
+    except NamedSessionConflict:
+        print(f"save failed: named session {name!r} already exists", file=sys.stderr)
+        log(f"save[{label}]: named session {name!r} already exists")
+        return 1
+    if status == "complete" and (label == "manual" or name is not None):
         mark_restore_completed(sid)
     log(
         f"save[{label}]: {len(rows)} windows -> session {sid} ({status}){': ' + error if error else ''}"
     )
-    print(f"saved {len(rows)} windows (session {sid}, {status})")
+    saved_name = f", name {name!r}" if name is not None and status == "complete" else ""
+    print(f"saved {len(rows)} windows (session {sid}, {status}{saved_name})")
+    if name is not None and status == "complete":
+        print(f"Session saved under {name}")
+    if name is not None and status != "complete":
+        print(
+            f"named session {name!r} was not created because capture is {status}",
+            file=sys.stderr,
+        )
     return 0 if status == "complete" else 1
 
 
@@ -816,7 +899,18 @@ def latest_session(conn):
     cur = conn.execute(
         "SELECT id, label, created_at FROM sessions s "
         "WHERE capture_status = 'complete' "
+        "AND NOT EXISTS (SELECT 1 FROM named_sessions n WHERE n.session = s.id) "
         "ORDER BY s.id DESC LIMIT 1"
+    )
+    return cur.fetchone()
+
+
+def named_session(conn, name):
+    cur = conn.execute(
+        "SELECT s.id, s.label, s.created_at FROM named_sessions n "
+        "JOIN sessions s ON s.id = n.session "
+        "WHERE n.name = ? AND s.capture_status = 'complete'",
+        (name,),
     )
     return cur.fetchone()
 
@@ -1517,9 +1611,12 @@ def replay_workspace_tree(workspace_id, rows, matches, tree, focus_context):
             (
                 f"run(hl.dispatch(hl.dsp.focus({{ window = {first_selector} }})))",
                 f"run(hl.dispatch(hl.dsp.layout({lua_quote(f'preselect {direction}')})))",
-                "run(hl.dispatch(hl.dsp.window.move({ "
-                f"workspace = {workspace_id}, follow = false, window = {second_selector} "
-                "})))",
+                (
+                    "run(hl.dispatch(hl.dsp.window.move({ "
+                    f"workspace = {workspace_id}, follow = false, "
+                    f"window = {second_selector} "
+                    "})))"
+                ),
                 f"run(hl.dispatch(hl.dsp.focus({{ window = {first_selector} }})))",
                 f"run(hl.dispatch(hl.dsp.layout({lua_quote(f'splitratio {2 * fraction:.12g} exact')})))",
             )
@@ -2609,7 +2706,9 @@ def restore_windows(
     return restored, failures, launched_processes, False
 
 
-def cmd_restore(dry_run=False):
+def cmd_restore(dry_run=False, name=None):
+    if name is not None:
+        session_name(name)
     cfg = load_config()
     lock_file = acquire_operation_lock()
     if lock_file is None:
@@ -2617,8 +2716,12 @@ def cmd_restore(dry_run=False):
         return 75
     try:
         conn = db_conn()
-        sess = latest_session(conn)
+        sess = named_session(conn, name) if name is not None else latest_session(conn)
         if sess is None:
+            if name is not None:
+                print(f"no saved session named {name!r}", file=sys.stderr)
+                conn.close()
+                return 1
             print("no saved session to restore")
             conn.close()
             if (
@@ -2635,7 +2738,11 @@ def cmd_restore(dry_run=False):
             conn.close()
             return 75
         if restore_was_completed(sid):
-            print("restore skipped: session already handled for this desktop")
+            print(
+                "restore skipped: named session already handled for this desktop"
+                if name is not None
+                else "restore skipped: session already handled for this desktop"
+            )
             conn.close()
             return 0
         rows = load_windows(conn, sid)
@@ -2682,6 +2789,7 @@ def cmd_restore(dry_run=False):
         log(
             f"restore: restored {restored}/{len(rows)} windows from "
             f"{launched_processes} launched processes"
+            + (f" (named session {name!r})" if name is not None else "")
         )
         if ipc_failed:
             return 75
@@ -2717,6 +2825,51 @@ def cmd_status():
         ).fetchone()[0]
         print(f"session {sid} [{label}] {created}: {n} windows ({capture_status})")
     conn.close()
+
+
+def cmd_list():
+    conn = db_conn()
+    for name, sid, created, windows in conn.execute(
+        "SELECT n.name, s.id, s.created_at, COUNT(w.id) FROM named_sessions n "
+        "JOIN sessions s ON s.id = n.session "
+        "LEFT JOIN windows w ON w.session = s.id "
+        "GROUP BY n.name, s.id, s.created_at ORDER BY n.name COLLATE BINARY"
+    ):
+        print(f"{name}: session {sid}, {created}, {windows} windows")
+    conn.close()
+    return 0
+
+
+def cmd_delete(name):
+    session_name(name)
+    lock_file = acquire_operation_lock()
+    if lock_file is None:
+        print("delete deferred: another session operation is running")
+        return 75
+    try:
+        conn = db_conn()
+        missing = False
+        with conn:
+            row = conn.execute(
+                "SELECT session FROM named_sessions WHERE name = ?", (name,)
+            ).fetchone()
+            if row is None:
+                missing = True
+            else:
+                sid = row[0]
+                conn.execute("DELETE FROM named_sessions WHERE name = ?", (name,))
+                conn.execute("DELETE FROM workspace_layouts WHERE session = ?", (sid,))
+                conn.execute("DELETE FROM windows WHERE session = ?", (sid,))
+                conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
+        conn.close()
+        if missing:
+            print(f"no saved session named {name!r}", file=sys.stderr)
+            return 1
+        log(f"delete: removed named session {name!r} (session {sid})")
+        print(f"deleted named session {name!r}")
+        return 0
+    finally:
+        lock_file.close()
 
 
 def acceptance_result(ok, message):
@@ -2865,16 +3018,23 @@ def main():
 
     p_save = sub.add_parser("save", help="snapshot current windows")
     p_save.add_argument("--label", default="manual")
+    p_save.add_argument("--name", type=argparse_session_name)
     p_save.add_argument("--teardown", action="store_true")
     p_save.add_argument("--wait", action="store_true")
 
     p_restore = sub.add_parser("restore", help="restore latest snapshot")
     p_restore.add_argument("--dry-run", action="store_true")
+    p_restore.add_argument("--name", type=argparse_session_name)
 
     p_auto = sub.add_parser("autosave", help="periodically save")
     p_auto.add_argument("--interval", type=int, default=None)
 
     sub.add_parser("status", help="list saved sessions")
+
+    sub.add_parser("list", help="list named sessions")
+
+    p_delete = sub.add_parser("delete", help="delete a named session")
+    p_delete.add_argument("--name", required=True, type=argparse_session_name)
 
     p_acceptance = sub.add_parser(
         "acceptance", help="report read-only evidence for a live reboot acceptance run"
@@ -2888,13 +3048,19 @@ def main():
     args = parser.parse_args()
     try:
         if args.command == "save":
-            return cmd_save(args.label, teardown=args.teardown, wait=args.wait)
+            return cmd_save(
+                args.label, teardown=args.teardown, wait=args.wait, name=args.name
+            )
         if args.command == "restore":
-            return cmd_restore(dry_run=args.dry_run)
+            return cmd_restore(dry_run=args.dry_run, name=args.name)
         if args.command == "autosave":
             return cmd_autosave(args.interval)
         if args.command == "status":
             return cmd_status()
+        if args.command == "list":
+            return cmd_list()
+        if args.command == "delete":
+            return cmd_delete(args.name)
         if args.command == "acceptance":
             return cmd_acceptance(
                 expect_power_save=args.expect_power_save,

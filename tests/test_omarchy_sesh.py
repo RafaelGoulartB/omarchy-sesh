@@ -18,10 +18,7 @@ SCRIPT = Path(__file__).parents[1] / "bin" / "omarchy-sesh"
 INSTALLER = Path(__file__).parents[1] / "install.sh"
 UNINSTALLER = Path(__file__).parents[1] / "uninstall.sh"
 AUTOSAVE_SERVICE = (
-    Path(__file__).parents[1]
-    / "systemd"
-    / "user"
-    / "omarchy-sesh-autosave.service"
+    Path(__file__).parents[1] / "systemd" / "user" / "omarchy-sesh-autosave.service"
 )
 RESTORE_SERVICE = (
     Path(__file__).parents[1] / "systemd" / "user" / "omarchy-sesh.service"
@@ -266,7 +263,7 @@ class OmarchySeshTests(unittest.TestCase):
             "snapshot_retention",
         ):
             with self.subTest(setting=setting):
-                self.write_config(f'{{"{setting}": {10 ** 100}}}')
+                self.write_config(f'{{"{setting}": {10**100}}}')
                 with self.assertRaisesRegex(self.module.ConfigError, setting):
                     self.module.load_config()
 
@@ -449,7 +446,9 @@ class OmarchySeshTests(unittest.TestCase):
             stdout='{"bool": true}\n\n{"bool": false}\n',
             stderr="",
         )
-        with mock.patch.object(self.module.subprocess, "run", return_value=result) as run:
+        with mock.patch.object(
+            self.module.subprocess, "run", return_value=result
+        ) as run:
             self.assertEqual(
                 [{"bool": True}, {"bool": False}],
                 self.module.hyprctl_batch_json("getoption one", "getoption two"),
@@ -513,8 +512,110 @@ class OmarchySeshTests(unittest.TestCase):
         self.assertIn("group_id", columns)
         self.assertIn("group_ord", columns)
         self.assertIn("workspace_layouts", tables)
-        self.assertEqual(5, version)
+        self.assertIn("named_sessions", tables)
+        self.assertEqual(6, version)
         self.assertEqual(("terminal", None, None), migrated)
+
+    def test_named_snapshot_is_retained_and_excluded_from_default_restore(self):
+        named_id = self.module.persist_snapshot(
+            "manual", "complete", "", [window(1, 0, "named", 1)], name="work"
+        )
+        automatic_ids = [
+            self.module.persist_snapshot(
+                "periodic", "complete", "", [window(index, 0, f"app-{index}", index)]
+            )
+            for index in range(2, 8)
+        ]
+
+        conn = self.module.db_conn()
+        self.assertEqual(
+            (named_id, "manual", mock.ANY), self.module.named_session(conn, "work")
+        )
+        self.assertEqual(automatic_ids[-1], self.module.latest_session(conn)[0])
+        retained = {row[0] for row in conn.execute("SELECT id FROM sessions")}
+        conn.close()
+
+        self.assertIn(named_id, retained)
+        self.assertNotIn(automatic_ids[0], retained)
+        self.assertEqual(6, len(retained))
+
+    def test_named_snapshot_rejects_an_existing_name(self):
+        self.module.persist_snapshot("manual", "complete", "", [], name="work")
+
+        with self.assertRaisesRegex(self.module.NamedSessionConflict, "work"):
+            self.module.persist_snapshot("manual", "complete", "", [], name="work")
+
+    def test_list_prints_named_sessions(self):
+        sid = self.module.persist_snapshot(
+            "manual", "complete", "", [window(1, 0, "terminal", 1)], name="work"
+        )
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            self.assertEqual(0, self.module.cmd_list())
+
+        self.assertIn(f"work: session {sid}", stdout.getvalue())
+        self.assertIn("1 windows", stdout.getvalue())
+
+    def test_delete_removes_named_snapshot_and_its_payload(self):
+        sid = self.module.persist_snapshot(
+            "manual",
+            "complete",
+            "",
+            [window(1, 0, "terminal", 1)],
+            [workspace_layout()],
+            name="work",
+        )
+
+        self.assertEqual(0, self.module.cmd_delete("work"))
+        conn = self.module.db_conn()
+        self.assertIsNone(self.module.named_session(conn, "work"))
+        self.assertIsNone(
+            conn.execute("SELECT 1 FROM sessions WHERE id = ?", (sid,)).fetchone()
+        )
+        self.assertIsNone(
+            conn.execute("SELECT 1 FROM windows WHERE session = ?", (sid,)).fetchone()
+        )
+        self.assertIsNone(
+            conn.execute(
+                "SELECT 1 FROM workspace_layouts WHERE session = ?", (sid,)
+            ).fetchone()
+        )
+        conn.close()
+
+    def test_delete_rejects_a_missing_named_session(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.assertEqual(1, self.module.cmd_delete("missing"))
+        self.assertIn("no saved session named 'missing'", stderr.getvalue())
+
+    def test_restore_selects_the_requested_named_snapshot(self):
+        sid = self.module.persist_snapshot(
+            "manual", "complete", "", [window(1, 0, "terminal", 1)], name="work"
+        )
+        lock_file = mock.Mock()
+        with (
+            mock.patch.dict(
+                os.environ, {"HYPRLAND_INSTANCE_SIGNATURE": "instance-1"}, clear=False
+            ),
+            mock.patch.object(
+                self.module, "acquire_operation_lock", return_value=lock_file
+            ),
+            mock.patch.object(self.module, "hyprctl_json", return_value=[]),
+            mock.patch.object(self.module, "restore_was_completed", return_value=False),
+            mock.patch.object(
+                self.module, "restore_windows", return_value=(1, 0, 1, False)
+            ) as restore_windows,
+            mock.patch.object(self.module, "mark_restore_completed", return_value=True),
+        ):
+            self.assertEqual(0, self.module.cmd_restore(name="work"))
+
+        self.assertEqual(sid, restore_windows.call_args.args[0][0]["session"])
+
+    def test_restore_rejects_a_missing_named_snapshot(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.assertEqual(1, self.module.cmd_restore(name="missing"))
+        self.assertIn("no saved session named 'missing'", stderr.getvalue())
 
     def test_empty_xdg_paths_migrate_relative_state_and_config(self):
         legacy = Path(self.tempdir.name) / "legacy" / "omarchy"
@@ -610,8 +711,7 @@ class OmarchySeshTests(unittest.TestCase):
             )
         conn = self.module.db_conn()
         retained = {
-            row[0]
-            for row in conn.execute("SELECT session FROM workspace_layouts")
+            row[0] for row in conn.execute("SELECT session FROM workspace_layouts")
         }
         conn.close()
         self.assertNotIn(session_ids[0], retained)
@@ -642,6 +742,35 @@ class OmarchySeshTests(unittest.TestCase):
             )
             self.assertTrue(self.module.restore_is_ready())
 
+    def test_named_save_prints_a_success_message(self):
+        stdout = io.StringIO()
+        with (
+            mock.patch.dict(
+                os.environ, {"HYPRLAND_INSTANCE_SIGNATURE": "instance-1"}, clear=False
+            ),
+            contextlib.redirect_stdout(stdout),
+        ):
+            self.assertEqual(
+                0,
+                self.module._save_clients(
+                    "manual", [], [], "complete", [], name="test"
+                ),
+            )
+
+        self.assertIn("Session saved under test", stdout.getvalue())
+        conn = self.module.db_conn()
+        self.assertIsNotNone(self.module.named_session(conn, "test"))
+        conn.close()
+
+    def test_save_reports_hyprland_ipc_failure(self):
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(self.module, "hyprctl_json", return_value=None),
+            contextlib.redirect_stderr(stderr),
+        ):
+            self.assertEqual(1, self.module.cmd_save(name="test"))
+        self.assertIn("save failed: Hyprland IPC is unavailable", stderr.getvalue())
+
     def test_logout_save_closes_autosave_gate_before_capture(self):
         responses = {
             "clients": [],
@@ -651,9 +780,7 @@ class OmarchySeshTests(unittest.TestCase):
             "workspacerules": [],
         }
         with (
-            mock.patch.dict(
-                os.environ, {"HYPRLAND_INSTANCE_SIGNATURE": "instance-1"}
-            ),
+            mock.patch.dict(os.environ, {"HYPRLAND_INSTANCE_SIGNATURE": "instance-1"}),
             mock.patch.object(
                 self.module,
                 "hyprctl_json",
@@ -879,13 +1006,13 @@ class OmarchySeshTests(unittest.TestCase):
             )
 
         saved = persist.call_args.args[3]
-        self.assertEqual([(1, 1), (1, 0)], [(r["group_id"], r["group_ord"]) for r in saved])
+        self.assertEqual(
+            [(1, 1), (1, 0)], [(r["group_id"], r["group_ord"]) for r in saved]
+        )
 
     def test_save_drops_incomplete_group_metadata(self):
         first = {"class": "terminal"}
-        self.module.assign_snapshot_groups(
-            [(first, "0xa", ["0xa", "0xb"])]
-        )
+        self.module.assign_snapshot_groups([(first, "0xa", ["0xa", "0xb"])])
         self.assertEqual((None, None), (first["group_id"], first["group_ord"]))
 
     def test_process_groups_share_pid_but_not_class(self):
@@ -990,9 +1117,7 @@ class OmarchySeshTests(unittest.TestCase):
             {"id": 1, "name": "DP-1"},
         ]
         with mock.patch.object(self.module, "log") as log:
-            targets = self.module.workspace_monitor_targets(
-                [row], monitors, "HDMI-A-1"
-            )
+            targets = self.module.workspace_monitor_targets([row], monitors, "HDMI-A-1")
 
         self.assertEqual({1: "eDP-1"}, targets)
         log.assert_called_once_with(
@@ -1033,9 +1158,7 @@ class OmarchySeshTests(unittest.TestCase):
 
     def test_placement_reports_failure_without_aborting_remaining_dispatches(self):
         row = window(1, 0, "terminal", 10)
-        with mock.patch.object(
-            self.module, "eval_lua", return_value=False
-        ) as evaluate:
+        with mock.patch.object(self.module, "eval_lua", return_value=False) as evaluate:
             self.assertFalse(self.module.place_window(row, "0x1"))
 
         script = evaluate.call_args.args[0]
@@ -1574,9 +1697,7 @@ class OmarchySeshTests(unittest.TestCase):
             mock.patch.object(self.module, "log"),
         ):
             self.assertTrue(
-                self.module.restore_window_groups(
-                    [first, second], {1: "0xa", 2: "0xb"}
-                )
+                self.module.restore_window_groups([first, second], {1: "0xa", 2: "0xb"})
             )
         hyprctl.assert_called_once_with("version")
         evaluate.assert_not_called()
@@ -1614,9 +1735,7 @@ class OmarchySeshTests(unittest.TestCase):
             mock.patch.object(self.module, "log") as log,
         ):
             self.assertTrue(
-                self.module.restore_window_groups(
-                    [first, second], {1: "0xa", 2: "0xb"}
-                )
+                self.module.restore_window_groups([first, second], {1: "0xa", 2: "0xb"})
             )
         evaluate.assert_not_called()
         log.assert_any_call(
@@ -1673,9 +1792,7 @@ class OmarchySeshTests(unittest.TestCase):
             mock.patch.object(self.module, "log"),
         ):
             self.assertTrue(
-                self.module.restore_window_groups(
-                    [first, second], {1: "0xa", 2: "0xb"}
-                )
+                self.module.restore_window_groups([first, second], {1: "0xa", 2: "0xb"})
             )
         evaluate.assert_not_called()
 
@@ -1698,9 +1815,7 @@ class OmarchySeshTests(unittest.TestCase):
             mock.patch.object(self.module, "log"),
         ):
             self.assertTrue(
-                self.module.restore_window_groups(
-                    [first, second], {1: "0xa", 2: "0xb"}
-                )
+                self.module.restore_window_groups([first, second], {1: "0xa", 2: "0xb"})
             )
         evaluate.assert_not_called()
 
@@ -1715,9 +1830,7 @@ class OmarchySeshTests(unittest.TestCase):
             mock.patch.object(self.module, "log"),
         ):
             self.assertTrue(
-                self.module.restore_window_groups(
-                    [first, second], {1: "0xa", 2: "0xb"}
-                )
+                self.module.restore_window_groups([first, second], {1: "0xa", 2: "0xb"})
             )
         hyprctl.assert_not_called()
         evaluate.assert_not_called()
@@ -1738,9 +1851,7 @@ class OmarchySeshTests(unittest.TestCase):
             mock.patch.object(self.module, "log"),
         ):
             self.assertFalse(
-                self.module.restore_window_groups(
-                    [first, second], {1: "0xa", 2: "0xb"}
-                )
+                self.module.restore_window_groups([first, second], {1: "0xa", 2: "0xb"})
             )
 
     def test_window_group_restore_skips_ambiguous_members(self):
@@ -1791,9 +1902,7 @@ class OmarchySeshTests(unittest.TestCase):
             mock.patch.object(self.module, "log"),
         ):
             self.assertTrue(
-                self.module.restore_window_groups(
-                    [first, second], {1: "0xa", 2: "0xb"}
-                )
+                self.module.restore_window_groups([first, second], {1: "0xa", 2: "0xb"})
             )
         evaluate.assert_not_called()
 
@@ -1832,9 +1941,7 @@ class OmarchySeshTests(unittest.TestCase):
             mock.patch.object(self.module, "log"),
         ):
             self.assertIsNone(
-                self.module.restore_window_groups(
-                    [first, second], {1: "0xa", 2: "0xb"}
-                )
+                self.module.restore_window_groups([first, second], {1: "0xa", 2: "0xb"})
             )
 
     def test_window_group_eval_failure_marks_restore_failed(self):
@@ -1853,9 +1960,7 @@ class OmarchySeshTests(unittest.TestCase):
             mock.patch.object(self.module, "log"),
         ):
             self.assertFalse(
-                self.module.restore_window_groups(
-                    [first, second], {1: "0xa", 2: "0xb"}
-                )
+                self.module.restore_window_groups([first, second], {1: "0xa", 2: "0xb"})
             )
 
     def test_window_groups_restore_after_tiled_correction(self):
@@ -1894,9 +1999,7 @@ class OmarchySeshTests(unittest.TestCase):
                 "load_focus_context",
                 return_value={"address": "0xa", "workspace_id": 1},
             ),
-            mock.patch.object(
-                self.module, "restore_focus_context", return_value=True
-            ),
+            mock.patch.object(self.module, "restore_focus_context", return_value=True),
         ):
             result = self.module.restore_windows(
                 [first, second], {1: "0xa", 2: "0xb"}, clients
@@ -1931,9 +2034,7 @@ class OmarchySeshTests(unittest.TestCase):
                 side_effect=lambda *_args: events.append("groups") or True,
             ),
             mock.patch.object(self.module, "load_focus_context", return_value=None),
-            mock.patch.object(
-                self.module, "restore_focus_context"
-            ) as restore_focus,
+            mock.patch.object(self.module, "restore_focus_context") as restore_focus,
             mock.patch.object(self.module, "log"),
         ):
             result = self.module.restore_windows([row], {1: "0xa"}, clients)
@@ -2035,9 +2136,7 @@ class OmarchySeshTests(unittest.TestCase):
                 self.module, "latest_session", return_value=(1, "periodic", "now")
             ),
             mock.patch.object(self.module, "load_windows", return_value=rows),
-            mock.patch.object(
-                self.module, "load_workspace_layouts", return_value={}
-            ),
+            mock.patch.object(self.module, "load_workspace_layouts", return_value={}),
             mock.patch.object(
                 self.module,
                 "hyprctl_json",
@@ -2079,9 +2178,7 @@ class OmarchySeshTests(unittest.TestCase):
                 "load_focus_context",
                 return_value={"address": "0xfocused", "workspace_id": 1},
             ),
-            mock.patch.object(
-                self.module, "restore_focus_context", return_value=True
-            ),
+            mock.patch.object(self.module, "restore_focus_context", return_value=True),
         ):
             result = self.module.cmd_restore()
         return result, dispatch, place
@@ -2106,9 +2203,7 @@ class OmarchySeshTests(unittest.TestCase):
         self.assertEqual(2, dispatch.call_count)
         self.assertEqual(2, place.call_count)
         self.assertTrue(sleep_intervals)
-        self.assertEqual(
-            {self.module.RESTORE_POLL_INTERVAL}, set(sleep_intervals)
-        )
+        self.assertEqual({self.module.RESTORE_POLL_INTERVAL}, set(sleep_intervals))
         self.assertEqual(0.05, self.module.RESTORE_POLL_INTERVAL)
 
     def test_existing_workspace_match_avoids_duplicate_launch(self):
@@ -2232,9 +2327,7 @@ class OmarchySeshTests(unittest.TestCase):
             (2, (875, 38, 1513, 643)),
             (3, (875, 695, 1513, 643)),
         ]
-        tree = self.module.infer_split_tree(
-            items, (10, 36, 2380, 1304), (5, 5, 5, 5)
-        )
+        tree = self.module.infer_split_tree(items, (10, 36, 2380, 1304), (5, 5, 5, 5))
         self.assertAlmostEqual((868 - 10) / 2380, tree[2])
         self.assertAlmostEqual(0.5, tree[4][2])
 
@@ -2326,7 +2419,9 @@ class OmarchySeshTests(unittest.TestCase):
             tiled_client(rows[1], "0xtop", [500, 0], [500, 500]),
             tiled_client(rows[2], "0xbottom", [500, 500], [500, 500]),
         ]
-        unrelated = tiled_client(window(4, 3, "other", 40), "0xother", [0, 0], [100, 100])
+        unrelated = tiled_client(
+            window(4, 3, "other", 40), "0xother", [0, 0], [100, 100]
+        )
         unrelated["workspace"] = {"id": 1}
         workspaces, monitors = live_workspace_context()
         with (
@@ -2477,9 +2572,7 @@ class OmarchySeshTests(unittest.TestCase):
                     rows, matches, clients, {1: workspace_layout()}, focus
                 )
             )
-        recover.assert_called_once_with(
-            1, ["0xleft", "0xtop", "0xbottom"], focus
-        )
+        recover.assert_called_once_with(1, ["0xleft", "0xtop", "0xbottom"], focus)
 
     def test_tiled_layout_helper_runs_slot_fallback_after_nested_failure(self):
         rows = self.nested_workspace()
@@ -2538,9 +2631,7 @@ class OmarchySeshTests(unittest.TestCase):
             }
         ]
         with (
-            mock.patch.object(
-                self.module, "hyprctl_json", side_effect=[clients, None]
-            ),
+            mock.patch.object(self.module, "hyprctl_json", side_effect=[clients, None]),
             mock.patch.object(self.module, "dispatch", return_value=False),
         ):
             self.assertIsNone(
@@ -2554,14 +2645,10 @@ class OmarchySeshTests(unittest.TestCase):
     def test_focus_restore_returns_to_empty_workspace(self):
         with (
             mock.patch.object(self.module, "dispatch", return_value=True) as dispatch,
-            mock.patch.object(
-                self.module, "hyprctl_json", return_value={"id": 5}
-            ),
+            mock.patch.object(self.module, "hyprctl_json", return_value={"id": 5}),
         ):
             self.assertTrue(
-                self.module.restore_focus_context(
-                    {"address": "", "workspace_id": 5}
-                )
+                self.module.restore_focus_context({"address": "", "workspace_id": 5})
             )
         dispatch.assert_called_once_with("hl.dsp.focus({ workspace = 5 })")
 
@@ -2649,7 +2736,9 @@ class OmarchySeshTests(unittest.TestCase):
             mock.patch.object(
                 self.module, "hyprctl_json", return_value={"version": "0.56.2"}
             ),
-            mock.patch.object(self.module, "hyprctl_batch_json", return_value=permanent),
+            mock.patch.object(
+                self.module, "hyprctl_batch_json", return_value=permanent
+            ),
             mock.patch.object(self.module, "log"),
         ):
             self.assertFalse(self.module.nested_replay_supported())
@@ -3961,18 +4050,18 @@ class OmarchySeshTests(unittest.TestCase):
             row = window(1, 0, "terminal", 10, title="acceptance")
             sid = module.persist_snapshot("logout", "complete", "", [row])
             module.RESTORE_MARKER_PATH.write_text(
-                '{"session": %d, "instance": "instance-1", "complete": true}' % sid
+                f'{{"session": {sid}, "instance": "instance-1", "complete": true}}'
             )
             client = tiled_client(row, "0x1", [0, 0], [1000, 1000])
             with (
                 mock.patch.dict(
-                    os.environ, {"HYPRLAND_INSTANCE_SIGNATURE": "instance-1"}, clear=False
+                    os.environ,
+                    {"HYPRLAND_INSTANCE_SIGNATURE": "instance-1"},
+                    clear=False,
                 ),
                 mock.patch.object(module, "systemd_unit_active", return_value=True),
                 mock.patch.object(module, "hyprctl_json", return_value=[client]),
-                mock.patch.object(
-                    module, "subprocess"
-                ) as subprocess_mock,
+                mock.patch.object(module, "subprocess") as subprocess_mock,
                 mock.patch("sys.stdout", new_callable=io.StringIO) as output,
             ):
                 subprocess_mock.run.return_value.returncode = 0
@@ -3989,11 +4078,13 @@ class OmarchySeshTests(unittest.TestCase):
             row = window(1, 0, "terminal", 10)
             sid = module.persist_snapshot("logout", "complete", "", [row])
             module.RESTORE_MARKER_PATH.write_text(
-                '{"session": %d, "instance": "instance-1", "complete": false}' % sid
+                f'{{"session": {sid}, "instance": "instance-1", "complete": false}}'
             )
             with (
                 mock.patch.dict(
-                    os.environ, {"HYPRLAND_INSTANCE_SIGNATURE": "instance-1"}, clear=False
+                    os.environ,
+                    {"HYPRLAND_INSTANCE_SIGNATURE": "instance-1"},
+                    clear=False,
                 ),
                 mock.patch.object(module, "systemd_unit_failed", return_value=True),
                 mock.patch.object(module, "systemd_unit_active", return_value=True),

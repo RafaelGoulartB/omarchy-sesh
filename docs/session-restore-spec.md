@@ -127,6 +127,14 @@ CREATE TABLE sessions (
     capture_error TEXT
 );
 
+-- Stable user-visible names for explicitly saved sessions. The referenced
+-- session owns the captured window and workspace-layout rows.
+CREATE TABLE named_sessions (
+    name       TEXT PRIMARY KEY,
+    session    INTEGER NOT NULL UNIQUE,
+    FOREIGN KEY (session) REFERENCES sessions(id)
+);
+
 CREATE TABLE workspace_layouts (
     session      INTEGER NOT NULL,
     workspace_id INTEGER NOT NULL,
@@ -142,13 +150,19 @@ CREATE TABLE workspace_layouts (
     FOREIGN KEY (session) REFERENCES sessions(id)
 );
 
-PRAGMA user_version = 5;
+PRAGMA user_version = 6;
 ```
 
 Rules:
 - Restore selects the newest `complete` capture. A healthy zero-window capture
   is authoritative; partial, failed, and ambiguous legacy captures are never
   restore sources.
+- Named snapshots are complete captures referenced by `named_sessions`. They
+  are excluded from automatic latest-session selection and ordinary retention;
+  `restore --name NAME` selects one explicitly. A name may be created only
+  once, and `delete --name NAME` removes its snapshot, windows, and layouts.
+  Names cannot be empty, padded with whitespace, contain control characters,
+  or exceed 128 characters.
 - Only save windows with `mapped == true` and non-empty `cmdline`. Drop the
   Omarchy shell, bars, panels, trays, polkit agents, and whatever the
   autostart already launches (exclude list in config, see §6).
@@ -179,6 +193,9 @@ Rules:
 4. Record the tiled layout name, tiled client bounds, and per-workspace capture
    completeness, then insert the session, window, and workspace-layout rows in
    one transaction.
+5. When `--name NAME` is supplied, reject an existing name before capture and,
+   only for a complete capture, insert its `named_sessions` reference in the
+   same transaction. Named sessions are not an automatic boot restore source.
 
 Triggers (any one fires a save):
 
@@ -193,7 +210,9 @@ Triggers (any one fires a save):
 Runs once from the systemd user service. Startup IPC failures return nonzero;
 the service retries after two seconds.
 
-1. Acquire an advisory operation lock and load the newest complete snapshot.
+1. Acquire an advisory operation lock and load the newest complete snapshot,
+   or the complete snapshot for `--name NAME`. Automatic restore never selects
+   a named snapshot.
    A complete empty snapshot restores nothing. Match existing windows
    one-to-one and compare class multiplicities for the already-restored guard.
 2. Build saved PID groups in window order and dispatch every missing group
@@ -351,10 +370,11 @@ All confirmed against the installed Omarchy defaults.
 
 `bin/omarchy-sesh` — python3, stdlib only (sqlite3, json, shlex). Subcommands:
 
-- `save [--label X]` — snapshots mapped clients + `/proc/<pid>` cmdline/cwd
+- `save [--label X] [--name NAME]` — snapshots mapped clients + `/proc/<pid>` cmdline/cwd
   into `${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/session.db` (WAL,
   status-aware snapshots).
-- `restore [--dry-run]` — loads the latest complete session, matches existing
+- `restore [--name NAME] [--dry-run]` — loads the latest complete or requested
+  named session, matches existing
   windows one-to-one, launches each saved PID group with bounded retries for
   missing windows, and places every matched window. Lua arguments use
   collision-free long strings.
@@ -365,6 +385,8 @@ All confirmed against the installed Omarchy defaults.
   synchronous shutdown markers keep autosave gated until restore succeeds or
   the user explicitly establishes a new baseline through manual/Active mode.
 - `status` — lists recent sessions.
+- `list` — lists retained named sessions.
+- `delete --name NAME` — removes a named session and its captured state.
 
 Verified end-to-end: save → close app → `restore` relaunched Nautilus and
 placed it at the exact saved `at [145,75] size [1000,700]` floating. Test
