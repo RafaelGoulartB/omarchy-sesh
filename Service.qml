@@ -6,6 +6,7 @@ Item {
   id: root
 
   readonly property string binaryPath: Quickshell.env("HOME") + "/.local/bin/omarchy-sesh"
+  readonly property string binarySourcePath: Qt.resolvedUrl("bin/omarchy-sesh").toString().replace(/^file:\/\//, "")
   readonly property string installPath: Qt.resolvedUrl("install.sh").toString().replace(/^file:\/\//, "")
   readonly property string manifestPath: Qt.resolvedUrl("manifest.json").toString().replace(/^file:\/\//, "")
   readonly property string stateHome: Quickshell.env("XDG_STATE_HOME") || Quickshell.env("HOME") + "/.local/state"
@@ -34,8 +35,8 @@ Item {
     if (checkProcess.running) return
     checkProcess.command = [
       "bash", "-c",
-      "version=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[\"version\"])' \"$3\") && [[ $(cat \"$1\" 2>/dev/null) == \"$version\" ]] && [[ -x \"$2\" && -f \"$4/omarchy-sesh.service\" && -f \"$4/omarchy-sesh-autosave.service\" ]] && systemctl --user is-enabled omarchy-sesh.service >/dev/null && \"$2\" mode >/dev/null",
-      "_", installMarker, binaryPath, manifestPath, unitDir
+      "version=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[\"version\"])' \"$3\") && [[ $(cat \"$1\" 2>/dev/null) == \"$version\" ]] && cmp -s \"$5\" \"$2\" && [[ -x \"$2\" && -f \"$4/omarchy-sesh.service\" && -f \"$4/omarchy-sesh-autosave.service\" ]] && systemctl --user is-enabled omarchy-sesh.service >/dev/null && \"$2\" mode >/dev/null",
+      "_", installMarker, binaryPath, manifestPath, unitDir, binarySourcePath
     ]
     checkProcess.running = true
   }

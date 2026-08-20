@@ -2,6 +2,19 @@
 
 All notable changes to `omarchy-sesh` are documented here.
 
+## v0.2.3 - 2026-08-20
+
+### Changed
+
+- The panel re-checks installation on every open and reinstalls from the
+  checkout when anything is out of date, so the installed `omarchy-sesh` binary
+  stays in sync with the project's `bin/omarchy-sesh` even between version
+  bumps. The freshness check now compares the checked-out binary against the
+  installed one with `cmp` in addition to the version marker, units, service,
+  and mode checks.
+- Removed the first-open special case in the panel; installation and mode
+  refresh share a single open path.
+
 ## v0.2.2 - 2026-08-20
 
 ### Added

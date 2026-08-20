@@ -3987,7 +3987,7 @@ class OmarchySeshTests(unittest.TestCase):
     def test_first_install_enables_autosave(self):
         calls, _, marker = self.run_installer(autosave_unit_exists=False)
         self.assertIn("--user enable omarchy-sesh-autosave.service", calls)
-        self.assertEqual("0.2.2", marker)
+        self.assertEqual("0.2.3", marker)
 
     def test_reinstall_preserves_manual_mode(self):
         calls, _, _ = self.run_installer(autosave_unit_exists=True)

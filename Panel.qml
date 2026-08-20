@@ -11,7 +11,6 @@ Panel {
   ipcTarget: "mrpbennett.sesh"
   manageIpc: false
 
-  property bool firstOpen: true
   property int selectedIndex: 0
   property bool cursorActive: false
   property bool showingSessions: false
@@ -54,15 +53,7 @@ Panel {
     selectedIndex = active ? 0 : 1
     cursorActive = false
     showingSessions = false
-    if (firstOpen) {
-      firstOpen = false
-      if (service.installed) service.refresh()
-      else service.ensureInstalled()
-    } else if (!service.installed) {
-      service.ensureInstalled()
-    } else {
-      service.refresh()
-    }
+    service.ensureInstalled(true)
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
   onActiveChanged: if (opened && !cursorActive) selectedIndex = active ? 0 : 1
