@@ -176,6 +176,10 @@ outputs are identified by monitor description. Workspaces from disconnected
 displays use the configured fallback: the focused monitor then the lowest
 monitor ID by default, the lowest monitor directly, or a preferred connector.
 An unavailable preferred connector safely returns to the default policy.
+Floating windows temporarily leave pinned/fullscreen state when necessary,
+resize before moving, and then return to their saved state. Restore verifies
+their final compositor geometry after a short settling interval and reapplies
+one mismatched placement pass.
 `--dry-run` prints the launch plan without executing it.
 
 On Hyprland 0.56 or newer, complete and uniquely matched window groups are

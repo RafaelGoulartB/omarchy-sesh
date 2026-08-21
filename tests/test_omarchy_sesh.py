@@ -1320,7 +1320,7 @@ class OmarchySeshTests(unittest.TestCase):
         evaluate.assert_not_called()
         dispatch.assert_not_called()
 
-    def test_matching_workspace_and_fullscreen_state_are_not_redispatched(self):
+    def test_fullscreen_is_cleared_before_floating_state_changes(self):
         row = window(1, 0, "terminal", 10)
         row.update(floating=1, fullscreen=2)
         current = {
@@ -1332,8 +1332,63 @@ class OmarchySeshTests(unittest.TestCase):
         }
         operations = self.module.window_placement_operations(row, "0x1", current)
         self.assertEqual(
-            ['hl.dsp.window.float({ action = "on", window = [[address:0x1]] })'],
+            [
+                (
+                    "hl.dsp.window.fullscreen_state({ internal = 0, client = 0, "
+                    "window = [[address:0x1]] })"
+                ),
+                'hl.dsp.window.float({ action = "on", window = [[address:0x1]] })',
+                (
+                    "hl.dsp.window.fullscreen_state({ internal = 2, client = 2, "
+                    "window = [[address:0x1]] })"
+                ),
+            ],
             operations,
+        )
+
+    def test_pin_is_temporarily_cleared_before_floating_geometry(self):
+        row = window(1, 0, "terminal", 10)
+        row.update(floating=1, pinned=1, at_x=100, at_y=200, size_w=800, size_h=600)
+        current = {
+            "workspace": {"id": 1},
+            "at": [0, 0],
+            "size": [400, 300],
+            "floating": True,
+            "fullscreen": 0,
+            "fullscreenClient": 0,
+            "pinned": True,
+        }
+
+        operations = self.module.window_placement_operations(row, "0x1", current)
+
+        self.assertEqual(2, sum("window.pin" in operation for operation in operations))
+        self.assertLess(
+            operations.index("hl.dsp.window.pin({ window = [[address:0x1]] })"),
+            next(
+                i
+                for i, operation in enumerate(operations)
+                if "window.resize" in operation
+            ),
+        )
+        self.assertEqual(
+            "hl.dsp.window.pin({ window = [[address:0x1]] })", operations[-1]
+        )
+
+    def test_matching_floating_geometry_is_not_redispatched(self):
+        row = window(1, 0, "terminal", 10)
+        row.update(floating=1, at_x=100, at_y=200, size_w=800, size_h=600)
+        current = {
+            "workspace": {"id": 1},
+            "at": [100, 200],
+            "size": [800, 600],
+            "floating": True,
+            "fullscreen": 0,
+            "fullscreenClient": 0,
+            "pinned": False,
+        }
+
+        self.assertEqual(
+            [], self.module.window_placement_operations(row, "0x1", current)
         )
 
     def test_divergent_client_fullscreen_state_is_still_corrected(self):
@@ -1363,17 +1418,71 @@ class OmarchySeshTests(unittest.TestCase):
         self.assertEqual(
             [
                 (
+                    "hl.dsp.window.fullscreen_state({ internal = 0, client = 0, "
+                    "window = [[address:0x1]] })"
+                ),
+                (
                     "hl.dsp.window.move({ workspace = 1, follow = false, "
                     "window = [[address:0x1]] })"
                 ),
                 'hl.dsp.window.float({ action = "off", window = [[address:0x1]] })',
-                (
-                    "hl.dsp.window.fullscreen_state({ internal = 0, client = 0, "
-                    "window = [[address:0x1]] })"
-                ),
                 "hl.dsp.window.pin({ window = [[address:0x1]] })",
             ],
             operations,
+        )
+
+    def test_floating_verification_reapplies_mismatched_geometry(self):
+        row = window(1, 0, "terminal", 10)
+        row.update(floating=1, at_x=100, at_y=200, size_w=800, size_h=600)
+        wrong = {
+            "address": "0x1",
+            "at": [0, 0],
+            "size": [400, 300],
+            "floating": True,
+        }
+        correct = dict(wrong, at=[100, 200], size=[800, 600])
+        with (
+            mock.patch.object(
+                self.module, "hyprctl_json", side_effect=[[wrong], [correct]]
+            ),
+            mock.patch.object(self.module, "place_window", return_value=True) as place,
+            mock.patch.object(self.module.time, "sleep"),
+        ):
+            result = self.module.verify_floating_placements([row], {1: "0x1"})
+
+        self.assertTrue(result)
+        place.assert_called_once_with(row, "0x1", wrong)
+
+    def test_floating_verification_ipc_failure_is_retryable(self):
+        row = window(1, 0, "terminal", 10)
+        row.update(floating=1, at_x=100, at_y=200, size_w=800, size_h=600)
+        with (
+            mock.patch.object(self.module, "hyprctl_json", return_value=None),
+            mock.patch.object(self.module, "place_window") as place,
+            mock.patch.object(self.module.time, "sleep"),
+        ):
+            result = self.module.verify_floating_placements([row], {1: "0x1"})
+
+        self.assertIsNone(result)
+        place.assert_not_called()
+
+    def test_floating_verification_reports_geometry_that_does_not_settle(self):
+        row = window(1, 0, "terminal", 10)
+        row.update(floating=1, at_x=100, at_y=200, size_w=800, size_h=600)
+        wrong = {"address": "0x1", "at": [0, 0], "size": [400, 300]}
+        with (
+            mock.patch.object(
+                self.module, "hyprctl_json", side_effect=[[wrong], [wrong]]
+            ),
+            mock.patch.object(self.module, "place_window", return_value=True),
+            mock.patch.object(self.module.time, "sleep"),
+            mock.patch.object(self.module, "log") as log,
+        ):
+            result = self.module.verify_floating_placements([row], {1: "0x1"})
+
+        self.assertFalse(result)
+        log.assert_called_once_with(
+            "restore: floating geometry did not settle for terminal"
         )
 
     def test_placement_without_an_address_fails(self):
@@ -1417,6 +1526,37 @@ class OmarchySeshTests(unittest.TestCase):
 
         dispatch.assert_not_called()
         self.assertEqual({1}, prepared)
+
+    def test_monitor_move_refreshes_client_before_placement(self):
+        row = window(1, 0, "terminal", 10)
+        row["floating"] = 1
+        stale = {"mapped": True, "address": "0x1", "fullscreen": 2}
+        refreshed = {"mapped": True, "address": "0x1", "fullscreen": 0}
+        with (
+            mock.patch.object(
+                self.module,
+                "load_workspace_monitor_context",
+                return_value=({1: "DP-1"}, {1: "eDP-1"}, False),
+            ),
+            mock.patch.object(
+                self.module, "prepare_workspace_monitor", return_value=True
+            ),
+            mock.patch.object(
+                self.module, "hyprctl_json", return_value=[refreshed]
+            ) as hyprctl,
+            mock.patch.object(self.module, "place_window", return_value=True) as place,
+            mock.patch.object(
+                self.module, "verify_floating_placements", return_value=True
+            ),
+            mock.patch.object(self.module, "restore_window_groups", return_value=True),
+            mock.patch.object(self.module, "load_focus_context", return_value={}),
+            mock.patch.object(self.module, "restore_focus_context", return_value=True),
+        ):
+            result = self.module.restore_windows([row], {1: "0x1"}, [stale])
+
+        self.assertEqual((1, 0, 0, False), result)
+        hyprctl.assert_called_once_with("clients")
+        place.assert_called_once_with(row, "0x1", refreshed)
 
     def test_monitor_move_failure_does_not_block_later_workspace(self):
         first = window(1, 0, "terminal", 10)
@@ -4136,7 +4276,7 @@ class OmarchySeshTests(unittest.TestCase):
     def test_first_install_enables_autosave(self):
         calls, _, marker = self.run_installer(autosave_unit_exists=False)
         self.assertIn("--user enable omarchy-sesh-autosave.service", calls)
-        self.assertEqual("0.2.3", marker)
+        self.assertEqual("0.2.4", marker)
 
     def test_installer_creates_owner_only_state(self):
         _, _, _, modes = self.run_installer(

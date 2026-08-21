@@ -1162,38 +1162,80 @@ def window_placement_operations(w, address, current=None):
     operations = []
     workspace_id = w.get("workspace_id")
     current_workspace = (current or {}).get("workspace") or {}
-    if workspace_id is not None and current_workspace.get("id") != workspace_id:
+    workspace_change = workspace_id is not None and (
+        current is None or current_workspace.get("id") != workspace_id
+    )
+    desired_floating = bool(w.get("floating"))
+    current_floating = bool(current and current.get("floating"))
+    floating_change = current is None or desired_floating != current_floating
+    current_geometry = window_geometry(current or {})
+    resize_change = (
+        desired_floating
+        and w.get("size_w") is not None
+        and w.get("size_h") is not None
+        and (
+            current_geometry is None
+            or current_geometry[2:] != (w["size_w"], w["size_h"])
+        )
+    )
+    move_change = (
+        desired_floating
+        and w.get("at_x") is not None
+        and w.get("at_y") is not None
+        and (
+            current_geometry is None
+            or current_geometry[:2] != (w["at_x"], w["at_y"])
+        )
+    )
+    disruptive_change = (
+        workspace_change or floating_change or resize_change or move_change
+    )
+    fs = w.get("fullscreen", 0)
+    current_internal_fs = None if current is None else current.get("fullscreen", 0)
+    current_client_fs = None if current is None else current.get("fullscreenClient", 0)
+    current_pinned = bool(current and current.get("pinned"))
+
+    # Pinning and fullscreen can reject or alter workspace/geometry mutations.
+    # Temporarily clear them and restore the requested final state afterward.
+    effective_pinned = current_pinned
+    if current_pinned and disruptive_change:
+        operations.append(f"hl.dsp.window.pin({{ window = {win} }})")
+        effective_pinned = False
+    effective_internal_fs = current_internal_fs
+    effective_client_fs = current_client_fs
+    if disruptive_change and (
+        current is None or current_internal_fs or current_client_fs
+    ):
+        operations.append(
+            f"hl.dsp.window.fullscreen_state({{ internal = 0, client = 0, window = {win} }})"
+        )
+        effective_internal_fs = 0
+        effective_client_fs = 0
+
+    if workspace_change:
         operations.append(
             f"hl.dsp.window.move({{ workspace = {workspace_id}, follow = false, window = {win} }})"
         )
-    desired_floating = bool(w.get("floating"))
-    current_floating = bool(current and current.get("floating"))
-    if current is None or desired_floating != current_floating:
+    if floating_change:
         float_action = "on" if desired_floating else "off"
         operations.append(
             f'hl.dsp.window.float({{ action = "{float_action}", window = {win} }})'
         )
     if desired_floating:
         # Resize before moving because Hyprland resize is center-anchored.
-        if w.get("size_w") is not None and w.get("size_h") is not None:
+        if resize_change:
             operations.append(
                 f"hl.dsp.window.resize({{ x = {w['size_w']}, y = {w['size_h']}, window = {win} }})"
             )
-        if w.get("at_x") is not None and w.get("at_y") is not None:
+        if move_change:
             operations.append(
                 f"hl.dsp.window.move({{ x = {w['at_x']}, y = {w['at_y']}, window = {win} }})"
             )
-    fs = w.get("fullscreen", 0)
-    if (
-        current is None
-        or current.get("fullscreen", 0) != fs
-        or current.get("fullscreenClient", 0) != fs
-    ):
+    if effective_internal_fs != fs or effective_client_fs != fs:
         operations.append(
             f"hl.dsp.window.fullscreen_state({{ internal = {fs}, client = {fs}, window = {win} }})"
         )
-    current_pinned = bool(current and current.get("pinned"))
-    if bool(w.get("pinned")) != current_pinned:
+    if bool(w.get("pinned")) != effective_pinned:
         operations.append(f"hl.dsp.window.pin({{ window = {win} }})")
     return operations
 
@@ -1204,10 +1246,9 @@ def place_window(w, address, current=None):
     operations = window_placement_operations(w, address, current)
     if not operations:
         return True
-    # One evaluation replaces one hyprctl process per property and applies the
-    # whole placement inside a single compositor frame, so the window never
-    # renders at an intermediate position. Every dispatch is still attempted so
-    # a single failed property does not skip the rest of the placement.
+    # One synchronous evaluation prevents separate IPC requests from
+    # interleaving. Every dispatch is still attempted so a single failed
+    # property does not skip the rest of the placement.
     script = [
         "local failed=0",
         *(
@@ -1217,6 +1258,49 @@ def place_window(w, address, current=None):
         "if failed>0 then error(failed..' placement dispatches failed') end",
     ]
     return bool(eval_lua(" ".join(script)))
+
+
+def verify_floating_placements(rows, matches):
+    expected = [
+        row
+        for row in rows
+        if row.get("floating")
+        and row.get("id") in matches
+        and saved_geometry(row) is not None
+    ]
+    if not expected:
+        return True
+
+    time.sleep(RESTORE_POLL_INTERVAL)
+    clients = hyprctl_json("clients")
+    if clients is None:
+        return None
+    current = {client.get("address"): client for client in clients}
+    mismatched = []
+    for row in expected:
+        actual = window_geometry(current.get(matches[row["id"]], {}))
+        if actual is None or not geometries_match(saved_geometry(row), actual):
+            mismatched.append(row)
+    if not mismatched:
+        return True
+
+    mutation_ok = True
+    for row in mismatched:
+        if not place_window(row, matches[row["id"]], current.get(matches[row["id"]])):
+            mutation_ok = False
+    time.sleep(RESTORE_POLL_INTERVAL)
+    clients = hyprctl_json("clients")
+    if clients is None:
+        return None
+    current = {client.get("address"): client for client in clients}
+    failed = []
+    for row in mismatched:
+        actual = window_geometry(current.get(matches[row["id"]], {}))
+        if actual is None or not geometries_match(saved_geometry(row), actual):
+            failed.append(row)
+    for row in failed:
+        log(f"restore: floating geometry did not settle for {row['class']}")
+    return mutation_ok and not failed
 
 
 def window_geometry(window):
@@ -2583,6 +2667,7 @@ def restore_windows(
     failures = 0
     launched_processes = 0
     handled = set()
+    placed = set()
     client_by_address = {
         client.get("address"): client
         for client in initial_clients
@@ -2598,13 +2683,31 @@ def restore_windows(
 
     for row_id, address in matches.items():
         row = row_by_id[row_id]
+        workspace_id = row.get("workspace_id")
+        target = monitor_targets.get(workspace_id)
+        monitor_will_move = (
+            target is not None
+            and workspace_id not in prepared_workspaces
+            and current_monitors.get(workspace_id) != target
+        )
         monitor_ok = prepare_workspace_monitor(
             row, address, monitor_targets, current_monitors, prepared_workspaces
         )
         if not monitor_ok:
-            failed_monitor_workspaces.add(row.get("workspace_id"))
+            failed_monitor_workspaces.add(workspace_id)
+        elif monitor_will_move:
+            clients = hyprctl_json("clients")
+            if clients is None:
+                log("restore: Hyprland IPC failed after remapping workspace monitors")
+                return restored, failures + 1, launched_processes, True
+            client_by_address = {
+                client.get("address"): client
+                for client in clients
+                if client.get("address")
+            }
         if monitor_ok and place_window(row, address, client_by_address.get(address)):
             restored += 1
+            placed.add(row_id)
         else:
             failures += 1
         handled.add(row_id)
@@ -2657,15 +2760,33 @@ def restore_windows(
             matches[row_id] = address
             used_addresses.add(address)
             row = row_by_id[row_id]
+            workspace_id = row.get("workspace_id")
+            target = monitor_targets.get(workspace_id)
+            monitor_will_move = (
+                target is not None
+                and workspace_id not in prepared_workspaces
+                and current_monitors.get(workspace_id) != target
+            )
             monitor_ok = prepare_workspace_monitor(
                 row, address, monitor_targets, current_monitors, prepared_workspaces
             )
             if not monitor_ok:
-                failed_monitor_workspaces.add(row.get("workspace_id"))
+                failed_monitor_workspaces.add(workspace_id)
+            elif monitor_will_move:
+                clients = hyprctl_json("clients")
+                if clients is None:
+                    log("restore: Hyprland IPC failed after remapping workspace monitors")
+                    return restored, failures + 1, launched_processes, True
+                client_by_address = {
+                    client.get("address"): client
+                    for client in clients
+                    if client.get("address")
+                }
             if monitor_ok and place_window(
                 row, address, client_by_address.get(address)
             ):
                 restored += 1
+                placed.add(row_id)
             else:
                 failures += 1
             handled.add(row_id)
@@ -2733,6 +2854,14 @@ def restore_windows(
             return restored, failures, launched_processes, True
         if not tiled_result:
             failures += 1
+    floating_result = verify_floating_placements(
+        rows, {row_id: matches[row_id] for row_id in placed}
+    )
+    if floating_result is None:
+        log("restore: Hyprland IPC failed while verifying floating geometry")
+        return restored, failures, launched_processes, True
+    if not floating_result:
+        failures += 1
     group_result = restore_window_groups(rows, matches, failed_monitor_workspaces)
     if group_result is None:
         log("restore: Hyprland IPC failed while restoring window groups")

@@ -4,11 +4,19 @@ All notable changes to `omarchy-sesh` are documented here.
 
 ## Unreleased
 
+## v0.2.4 - 2026-08-21
+
 ### Security
 
 - Runtime state directories and files are now owner-only, existing permissive
   installations are repaired during CLI use and upgrades, and application
   launch commands are redacted from restore failure logs.
+
+### Fixed
+
+- Floating restore now temporarily clears blocking pinned and fullscreen state,
+  refreshes client data after monitor remapping, and verifies final geometry
+  with one retry after the compositor settles.
 
 ## v0.2.3 - 2026-08-20
 

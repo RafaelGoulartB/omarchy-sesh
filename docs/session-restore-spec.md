@@ -246,17 +246,24 @@ the service retries after two seconds.
        directly, or a preferred connector. An unavailable preferred connector
        safely uses the default policy. Conflicting saved identities are skipped
        rather than guessed.
-    - Apply state through the Hyprland Lua dispatcher API: move to the saved
-      workspace, set floating state, resize before moving floating windows,
-      then restore fullscreen and pinned state. Monitor remapping happens first
-      so it cannot invalidate restored geometry or pinned state.
-    - Skip any property whose live client already matches the snapshot, and
-      apply the remaining dispatches for one window in a single `hyprctl eval`.
-      One evaluation replaces one process per property (~33 ms to ~8 ms for a
-      floating window) and lands the whole placement inside one compositor
-      frame, so the window never renders at an intermediate position. Every
-      dispatch is still attempted and failures are counted, so one failed
-      property cannot skip the rest of the placement.
+     - Apply state through the Hyprland Lua dispatcher API. After an actual
+       monitor remap, refresh the client state. Temporarily clear pinning and
+       fullscreen when they would block or alter a mutation, move to the saved
+       workspace, set floating state, resize before moving floating windows,
+       then restore fullscreen and pinned state. Monitor remapping happens first
+       so it cannot invalidate restored geometry or pinned state.
+     - Skip any property whose live client already matches the snapshot, and
+       apply the remaining dispatches for one window in a single `hyprctl eval`.
+       One evaluation replaces one process per property and prevents another IPC
+       request from interleaving with the sequential dispatches. It is not a
+       transaction or a compositor frame guarantee. Every dispatch is still
+       attempted and failures are counted, so one failed property cannot skip
+       the rest of the placement.
+     - After placement and tiled correction, wait one polling interval and
+       verify each matched floating window's compositor goal geometry within 2
+       logical pixels. Reapply mismatched floating placements once, wait one
+       more interval, and fail restore if geometry still differs. IPC loss during
+       either verification remains retryable.
     - Suppress `animations:enabled` for the duration of restore and put the
       previous value back afterwards, including when placement raises. Hyprland
       otherwise animates every move, resize, and workspace change — the default
