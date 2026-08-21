@@ -164,6 +164,76 @@ class OmarchySeshTests(unittest.TestCase):
         self.module.CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
         self.module.CONFIG_PATH.write_text(content, encoding="utf-8")
 
+    def assert_mode(self, path, expected):
+        self.assertEqual(expected, path.stat().st_mode & 0o777, path)
+
+    def test_runtime_state_is_owner_only_under_a_permissive_umask(self):
+        previous_umask = os.umask(0)
+        connection = None
+        lock_file = None
+        try:
+            self.module.log("private")
+            lock_file = self.module.acquire_operation_lock()
+            connection = self.module.db_conn()
+            with mock.patch.dict(
+                os.environ,
+                {"HYPRLAND_INSTANCE_SIGNATURE": "instance-1"},
+                clear=False,
+            ):
+                self.assertTrue(self.module.mark_restore_completed(1))
+
+            self.assert_mode(self.module.STATE_DIR, 0o700)
+            self.assert_mode(self.module.LOG_PATH.parent, 0o700)
+            for path in (
+                self.module.DB_PATH,
+                Path(f"{self.module.DB_PATH}-wal"),
+                Path(f"{self.module.DB_PATH}-shm"),
+                self.module.LOCK_PATH,
+                self.module.RESTORE_MARKER_PATH,
+                self.module.LOG_PATH,
+            ):
+                self.assertTrue(path.exists(), path)
+                self.assert_mode(path, 0o600)
+        finally:
+            if connection is not None:
+                connection.close()
+            if lock_file is not None:
+                lock_file.close()
+            os.umask(previous_umask)
+
+    def test_existing_permissive_state_permissions_are_repaired(self):
+        self.module.STATE_DIR.mkdir(mode=0o755, parents=True)
+        self.module.LOG_PATH.parent.mkdir(mode=0o755)
+        paths = (
+            self.module.DB_PATH,
+            Path(f"{self.module.DB_PATH}-wal"),
+            Path(f"{self.module.DB_PATH}-shm"),
+            Path(f"{self.module.DB_PATH}-journal"),
+            self.module.LOCK_PATH,
+            self.module.RESTORE_MARKER_PATH,
+            self.module.LOG_PATH,
+            self.module.STATE_DIR / "sesh-installed",
+            self.module.STATE_DIR / "sesh-menu-created",
+        )
+        for path in paths:
+            path.write_text("private")
+            path.chmod(0o644)
+
+        self.module.secure_state_storage()
+
+        self.assert_mode(self.module.STATE_DIR, 0o700)
+        self.assert_mode(self.module.LOG_PATH.parent, 0o700)
+        for path in paths:
+            self.assert_mode(path, 0o600)
+
+    def test_symlinked_state_directory_is_rejected(self):
+        target = Path(self.tempdir.name) / "target"
+        target.mkdir()
+        self.module.STATE_DIR.symlink_to(target, target_is_directory=True)
+
+        with self.assertRaisesRegex(OSError, "unsafe state directory"):
+            self.module.secure_state_storage()
+
     def test_config_defaults_preserve_existing_behavior(self):
         self.assertEqual(
             {
@@ -318,6 +388,10 @@ class OmarchySeshTests(unittest.TestCase):
         unit = AUTOSAVE_SERVICE.read_text()
         self.assertIn("Restart=on-failure", unit)
         self.assertNotIn("RestartPreventExitStatus", unit)
+
+    def test_services_use_an_owner_only_umask(self):
+        self.assertIn("UMask=0077", RESTORE_SERVICE.read_text())
+        self.assertIn("UMask=0077", AUTOSAVE_SERVICE.read_text())
 
     def test_lua_quote_uses_collision_free_long_string(self):
         value = "run 'quoted' ]] and ]=] command"
@@ -697,6 +771,9 @@ class OmarchySeshTests(unittest.TestCase):
         self.assertEqual(
             "database",
             (Path(self.tempdir.name) / "state" / "omarchy" / "session.db").read_text(),
+        )
+        self.assert_mode(
+            Path(self.tempdir.name) / "state" / "omarchy" / "session.db", 0o600
         )
         self.assertTrue(
             (
@@ -2112,6 +2189,7 @@ class OmarchySeshTests(unittest.TestCase):
         tiled_result=True,
         group_result=True,
         sleep_intervals=None,
+        log_messages=None,
     ):
         connection = mock.Mock()
         connection.close = mock.Mock()
@@ -2149,7 +2227,9 @@ class OmarchySeshTests(unittest.TestCase):
                     visible.append(make_client(row, wait_matches[row["id"]]))
             return visible
 
-        def run_dispatch(_lua):
+        def run_dispatch(_lua, failure_context=None):
+            if "exec_cmd" in _lua:
+                self.assertEqual("restore: application launch", failure_context)
             events.append("dispatch")
             return dispatch_result
 
@@ -2206,7 +2286,11 @@ class OmarchySeshTests(unittest.TestCase):
                 self.module.time, "monotonic", side_effect=lambda: clock[0]
             ),
             mock.patch.object(self.module.time, "sleep", side_effect=advance),
-            mock.patch.object(self.module, "log"),
+            mock.patch.object(
+                self.module,
+                "log",
+                side_effect=log_messages.append if log_messages is not None else None,
+            ),
             mock.patch.object(
                 self.module, "place_window", side_effect=run_place
             ) as place,
@@ -3383,6 +3467,33 @@ class OmarchySeshTests(unittest.TestCase):
         self.assertEqual(1, dispatch.call_count)
         place.assert_not_called()
 
+    def test_launch_failures_do_not_log_the_saved_command(self):
+        secret = "credential=do-not-log"
+        result = mock.Mock(returncode=1, stdout="", stderr=f"error: {secret}")
+        with mock.patch.object(self.module.subprocess, "run", return_value=result):
+            self.assertFalse(
+                self.module.dispatch(
+                    f"hl.dsp.exec_cmd([[app --token {secret}]])",
+                    failure_context="restore: application launch",
+                )
+            )
+
+        log_text = self.module.LOG_PATH.read_text()
+        self.assertNotIn(secret, log_text)
+        self.assertIn("request details redacted", log_text)
+
+    def test_restore_timeout_does_not_log_the_saved_command(self):
+        secret = "credential=do-not-log"
+        row = window(1, 0, "terminal", 10)
+        row["cmdline"] = f"/usr/bin/example --token {secret}"
+        messages = []
+
+        result, _, _ = self.run_restore([row], log_messages=messages)
+
+        self.assertEqual(1, result)
+        self.assertNotIn(secret, "\n".join(messages))
+        self.assertIn("restore: no window appeared for terminal", messages)
+
     def test_monitor_move_failure_makes_restore_nonretryable(self):
         row = window(1, 0, "terminal", 10)
         row.update(at_x=0, at_y=0, size_w=1000, size_h=1000)
@@ -3931,11 +4042,23 @@ class OmarchySeshTests(unittest.TestCase):
         autosave_enabled=False,
         completed_install=None,
         config_name=".config",
+        include_state_modes=False,
+        permissive_state=False,
     ):
         with tempfile.TemporaryDirectory() as home:
             home_path = Path(home)
             config_home = home_path / config_name
             state_home = home_path / ".local" / "state"
+            if permissive_state:
+                state_dir = state_home / "omarchy"
+                log_dir = state_dir / "log"
+                log_dir.mkdir(parents=True)
+                state_dir.chmod(0o755)
+                log_dir.chmod(0o755)
+                (state_dir / "session.db").write_text("database")
+                (state_dir / "session.db").chmod(0o644)
+                (log_dir / "omarchy-sesh.log").write_text("log")
+                (log_dir / "omarchy-sesh.log").chmod(0o644)
             unit_dir = config_home / "systemd" / "user"
             if autosave_unit_exists:
                 unit_dir.mkdir(parents=True)
@@ -3978,16 +4101,69 @@ class OmarchySeshTests(unittest.TestCase):
                 text=True,
                 env=environment,
             )
-            return (
+            result = (
                 calls.read_text().splitlines(),
                 menu.read_text(),
                 marker.read_text().strip(),
             )
+            if include_state_modes:
+                return result + (
+                    {
+                        "state": (state_home / "omarchy").stat().st_mode & 0o777,
+                        "log": (state_home / "omarchy" / "log").stat().st_mode
+                        & 0o777,
+                        "install_marker": marker.stat().st_mode & 0o777,
+                        "menu_marker": (
+                            state_home / "omarchy" / "sesh-menu-created"
+                        ).stat().st_mode
+                        & 0o777,
+                        "database": (state_home / "omarchy" / "session.db").stat().st_mode
+                        & 0o777
+                        if (state_home / "omarchy" / "session.db").exists()
+                        else None,
+                        "log_file": (
+                            state_home / "omarchy" / "log" / "omarchy-sesh.log"
+                        ).stat().st_mode
+                        & 0o777
+                        if (
+                            state_home / "omarchy" / "log" / "omarchy-sesh.log"
+                        ).exists()
+                        else None,
+                    },
+                )
+            return result
 
     def test_first_install_enables_autosave(self):
         calls, _, marker = self.run_installer(autosave_unit_exists=False)
         self.assertIn("--user enable omarchy-sesh-autosave.service", calls)
         self.assertEqual("0.2.3", marker)
+
+    def test_installer_creates_owner_only_state(self):
+        _, _, _, modes = self.run_installer(
+            autosave_unit_exists=False, include_state_modes=True
+        )
+        self.assertEqual(
+            {
+                "state": 0o700,
+                "log": 0o700,
+                "install_marker": 0o600,
+                "menu_marker": 0o600,
+                "database": None,
+                "log_file": None,
+            },
+            modes,
+        )
+
+    def test_installer_repairs_existing_permissive_state(self):
+        _, _, _, modes = self.run_installer(
+            autosave_unit_exists=False,
+            include_state_modes=True,
+            permissive_state=True,
+        )
+        self.assertEqual(0o700, modes["state"])
+        self.assertEqual(0o700, modes["log"])
+        self.assertEqual(0o600, modes["database"])
+        self.assertEqual(0o600, modes["log_file"])
 
     def test_reinstall_preserves_manual_mode(self):
         calls, _, _ = self.run_installer(autosave_unit_exists=True)
@@ -4031,6 +4207,9 @@ class OmarchySeshTests(unittest.TestCase):
         home = Path(temporary.name)
         config_home = home / "xdg-config"
         state_home = home / ".local" / "state"
+        journal = state_home / "omarchy" / "session.db-journal"
+        journal.parent.mkdir(parents=True)
+        journal.write_text("private")
         binary = home / ".local" / "bin" / "omarchy-sesh"
         binary.parent.mkdir(parents=True)
         binary.symlink_to(home / "missing-binary")
@@ -4081,6 +4260,9 @@ class OmarchySeshTests(unittest.TestCase):
             self.assertFalse(binary.is_symlink())
             self.assertFalse((unit_dir / "omarchy-sesh.service").is_symlink())
             self.assertNotIn("omarchy-sesh", legacy_menu.read_text())
+            self.assertFalse(
+                (Path(temporary.name) / ".local/state/omarchy/session.db-journal").exists()
+            )
         finally:
             temporary.cleanup()
 

@@ -139,6 +139,13 @@ from live addresses to snapshot-local metadata. Windows sharing a saved PID are
 kept as one launch group. By default, the latest five complete and five
 diagnostic snapshots are retained; retention is configurable.
 
+Complete command lines can contain credentials supplied as arguments. The
+state and log directories are therefore owner-only (`0700`), and runtime state
+files, including the SQLite database and sidecars, are owner-only (`0600`). The
+installer and CLI repair older permissive modes automatically. Restore failure
+logs omit launch commands; `restore --dry-run` intentionally prints them to the
+calling terminal for inspection.
+
 **Named save** (`omarchy-sesh save --name NAME`) captures the same state as a
 manual save and assigns it a unique name. Named sessions are independent from
 the automatic boot snapshot: they are retained until explicitly deleted and

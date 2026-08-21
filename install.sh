@@ -14,9 +14,10 @@ PLUGIN_VERSION="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]
 BIN="$HOME/.local/bin/omarchy-sesh"
 CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+STATE_DIR="$STATE_HOME/omarchy"
 UNIT_DIR="$CONFIG_HOME/systemd/user"
-INSTALL_MARKER="$STATE_HOME/omarchy/sesh-installed"
-MENU_CREATED_MARKER="$STATE_HOME/omarchy/sesh-menu-created"
+INSTALL_MARKER="$STATE_DIR/sesh-installed"
+MENU_CREATED_MARKER="$STATE_DIR/sesh-menu-created"
 AUTOSTART="$CONFIG_HOME/hypr/autostart.lua"
 MENU="$CONFIG_HOME/omarchy/extensions/omarchy-menu.jsonc"
 LEGACY_AUTOSTART="$HOME/.config/hypr/autostart.lua"
@@ -26,6 +27,32 @@ MARKER_COMMENT="# omarchy-sesh: restore saved windows after login (guard skips i
 LUA_MARKER_COMMENT="-- omarchy-sesh: restore saved windows after login (guard skips if already restored)"
 RESTORE_LINE='hl.exec_cmd("sleep 2 && omarchy-sesh restore")'
 SYSTEMCTL="${SYSTEMCTL:-systemctl}"
+
+for directory in "$STATE_DIR" "$STATE_DIR/log"; do
+  if [[ -L "$directory" ]]; then
+    echo "error: refusing unsafe state directory: $directory" >&2
+    exit 1
+  fi
+  install -d -m 700 "$directory"
+  chmod 700 "$directory"
+done
+
+for state_file in \
+  "$STATE_DIR/session.db" \
+  "$STATE_DIR/session.db-wal" \
+  "$STATE_DIR/session.db-shm" \
+  "$STATE_DIR/session.db-journal" \
+  "$STATE_DIR/session.lock" \
+  "$STATE_DIR/restore-complete.json" \
+  "$STATE_DIR/log/omarchy-sesh.log" \
+  "$INSTALL_MARKER" \
+  "$MENU_CREATED_MARKER"; do
+  if [[ -L "$state_file" || ( -e "$state_file" && ! -f "$state_file" ) ]]; then
+    echo "error: refusing unsafe state file: $state_file" >&2
+    exit 1
+  fi
+  [[ ! -f "$state_file" ]] || chmod 600 "$state_file"
+done
 
 install_was_complete=0
 autosave_was_enabled=0
@@ -108,6 +135,7 @@ if [[ ! -f "$MENU" ]]; then
   printf '{}\n' >"$MENU"
   install -d "$(dirname "$MENU_CREATED_MARKER")"
   : >"$MENU_CREATED_MARKER"
+  chmod 600 "$MENU_CREATED_MARKER"
 fi
 
 python3 - "$MENU" <<'PY'
@@ -242,7 +270,8 @@ else
   echo "enabled omarchy-sesh.service; preserved manual autosave mode"
 fi
 
-install -d "$(dirname "$INSTALL_MARKER")"
+install -d -m 700 "$(dirname "$INSTALL_MARKER")"
 printf '%s\n' "$PLUGIN_VERSION" >"$INSTALL_MARKER"
+chmod 600 "$INSTALL_MARKER"
 
 echo "omarchy-sesh: installed. Restore runs on next login; saves run before power-menu actions and periodically."

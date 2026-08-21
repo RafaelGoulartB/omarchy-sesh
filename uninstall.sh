@@ -146,8 +146,8 @@ if path.read_text().strip() == "{}":
 PY
 fi
 
-if [[ -f "$DB" || -f "$DB-wal" || -f "$DB-shm" || -f "$LOCK" || -f "$RESTORE_MARKER" || -f "$INSTALL_MARKER" || -f "$MENU_CREATED_MARKER" ]]; then
-  rm -f "$DB" "$DB-wal" "$DB-shm" "$LOCK" "$RESTORE_MARKER" "$INSTALL_MARKER" "$MENU_CREATED_MARKER"
+if [[ -f "$DB" || -f "$DB-wal" || -f "$DB-shm" || -f "$DB-journal" || -f "$LOCK" || -f "$RESTORE_MARKER" || -f "$INSTALL_MARKER" || -f "$MENU_CREATED_MARKER" ]]; then
+  rm -f "$DB" "$DB-wal" "$DB-shm" "$DB-journal" "$LOCK" "$RESTORE_MARKER" "$INSTALL_MARKER" "$MENU_CREATED_MARKER"
   removed=1
 fi
 

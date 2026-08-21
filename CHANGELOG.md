@@ -2,6 +2,14 @@
 
 All notable changes to `omarchy-sesh` are documented here.
 
+## Unreleased
+
+### Security
+
+- Runtime state directories and files are now owner-only, existing permissive
+  installations are repaired during CLI use and upgrades, and application
+  launch commands are redacted from restore failure logs.
+
 ## v0.2.3 - 2026-08-20
 
 ### Changed

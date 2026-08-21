@@ -88,6 +88,12 @@ dispatchers). Key facts confirmed live:
 
 DB path: `${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/session.db`.
 
+The complete command line is required for relaunch and may contain credentials.
+Create and repair the state and log directories as `0700`; create and repair the
+database, WAL/SHM/journal sidecars, lock, restore marker, and log as `0600`.
+Reject symlinked or non-user-owned state storage rather than writing through it.
+CLI processes and both systemd units use a `0077` umask as defense in depth.
+
 ```sql
 PRAGMA journal_mode = WAL;
 
@@ -299,7 +305,10 @@ the service retries after two seconds.
    application failure.
 
 Restore failures return nonzero so systemd can retry startup IPC failures. Log
-details to `${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/log/omarchy-sesh.log`.
+details to `${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/log/omarchy-sesh.log`,
+but never include application launch commands or dispatcher output that may
+echo them. Dry-run restore is an explicit diagnostic and prints launch commands
+to its calling terminal.
 
 ## 6. Omarchy integration points
 
@@ -319,6 +328,7 @@ All confirmed against the installed Omarchy defaults.
 
    [Service]
    Type=oneshot
+   UMask=0077
     ExecStart=%h/.local/bin/omarchy-sesh restore
     ExecStop=-%h/.local/bin/omarchy-sesh save --label logout --teardown
     RemainAfterExit=yes
