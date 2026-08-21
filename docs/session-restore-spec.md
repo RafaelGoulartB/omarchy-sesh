@@ -11,7 +11,7 @@ window back where it was.
 |---|---|
 | App relaunch | Exact — reconstruct launch command from `/proc/<pid>/cmdline` + cwd |
 | Floating window geometry | Exact — Hyprland dispatchers place/resize by pixel |
-| Tiled window placement | Best-effort — complete, uniquely matched and unambiguous nested dwindle layouts are rebuilt from inferred rectangle splits and verified. Simple two-window sizing and compatible-slot correction remain the fallback. Hyprland still exposes no split-tree import/export API |
+| Tiled window placement | Best-effort — complete, uniquely matched two-window ratios and unambiguous nested dwindle layouts are restored and verified. Compatible-slot correction remains the fallback. Hyprland still exposes no split-tree import/export API |
 | Workspace assignment | Yes — launch into the saved workspace and move the matched window there |
 | Monitor remapping | Yes — connector name, physical description, then deterministic fallback |
 | Window flags (float/fullscreen/pinned) | Yes — `setfloating`, `fullscreenstate`, `pin` |
@@ -272,8 +272,9 @@ the service retries after two seconds.
       Suppression is best-effort: an unreadable or already-disabled option
       leaves the setting untouched and restore proceeds unchanged. A process
       killed mid-restore cannot run its revert; `hyprctl reload` recovers.
-    - After discovery, infer a binary guillotine split tree from each saved
-      workspace's tiled rectangles. Nested replay requires schema-v5 metadata,
+     - After discovery, infer a binary guillotine split tree from each saved
+       workspace's tiled rectangles. Exact replay, including two-window ratios,
+       requires schema-v5 metadata,
       the saved and current dwindle layout, `use_active_for_splits` and
       `preserve_split`, disabled `permanent_direction_override`, complete
       bidirectionally unique matching, no unrelated or currently grouped tiled
@@ -290,9 +291,13 @@ the service retries after two seconds.
       Query clients afterward and require every work-area-relative rectangle to
       match within rounding tolerance. Recover staged leaves to the target
       workspace after a failed mutation; IPC loss remains retryable.
-    - For ineligible workspaces, retain the existing guarded two-window sizing
-      and exact compatible-slot swaps. A monitor-origin change alone does not
-      prevent either path.
+    - For eligible two-window dwindle workspaces, focus the known split, apply
+      its exact saved ratio, restore the prior focus in the same Lua evaluation,
+      and verify both resulting rectangles. Legacy or non-dwindle snapshots
+      retain guarded absolute sizing. A compositor-accepted operation that does
+      not settle to the saved geometry fails restore instead of silently leaving
+      the default 50/50 split. Exact compatible-slot swaps remain available, and
+      a monitor-origin change alone does not prevent either path.
 3. Rebuild or correct a tiled layout as soon as all of that workspace's saved
    windows are matched, without waiting for unrelated applications. Keep the
    final all-workspace pass after ordinary placement completes. Equivalent but

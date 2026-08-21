@@ -2389,7 +2389,7 @@ class OmarchySeshTests(unittest.TestCase):
                 return monitor_prepare_result
             return prepare_workspace_monitor(*args)
 
-        def run_tiled_restore(_rows, _matches, _clients):
+        def run_tiled_restore(_rows, _matches, _clients, *_args):
             events.append("tiled-restore")
             if tiled_matches is not None:
                 tiled_matches.append(dict(_matches))
@@ -2687,6 +2687,108 @@ class OmarchySeshTests(unittest.TestCase):
                 )
             )
         replay.assert_called_once()
+
+    def test_two_window_replay_restores_gap_aware_ratio_and_verifies(self):
+        left = window(1, 0, "left", 10)
+        right = window(2, 1, "right", 20)
+        left.update(at_x=12, at_y=12, size_w=287, size_h=976)
+        right.update(at_x=309, at_y=12, size_w=679, size_h=976)
+        rows = [left, right]
+        matches = {1: "0xleft", 2: "0xright"}
+        current = [
+            tiled_client(left, "0xleft", [12, 12], [483, 976]),
+            tiled_client(right, "0xright", [505, 12], [483, 976]),
+        ]
+        restored = [
+            tiled_client(left, "0xleft", [12, 12], [287, 976]),
+            tiled_client(right, "0xright", [309, 12], [679, 976]),
+        ]
+        layout = workspace_layout(width=976, height=976)
+        layout.update(
+            at_x=12,
+            at_y=12,
+            work_x=10,
+            work_y=10,
+            work_w=980,
+            work_h=980,
+            gap_top=5,
+            gap_right=5,
+            gap_bottom=5,
+            gap_left=5,
+        )
+        workspaces, monitors = live_workspace_context()
+
+        def response(endpoint, *args):
+            if endpoint == "workspacerules":
+                return []
+            if endpoint == "workspaces":
+                return workspaces
+            if endpoint == "monitors":
+                return monitors
+            if endpoint == "getoption":
+                return {"css": "10" if args == ("general:gaps_out",) else "5"}
+            if endpoint == "clients":
+                return restored
+            raise AssertionError(f"unexpected endpoint: {endpoint}")
+
+        with (
+            mock.patch.object(
+                self.module, "nested_replay_supported", return_value=True
+            ),
+            mock.patch.object(self.module, "hyprctl_json", side_effect=response),
+            mock.patch.object(
+                self.module,
+                "load_focus_context",
+                return_value={"address": "0xfocused", "workspace_id": 2},
+            ),
+            mock.patch.object(
+                self.module, "restore_focus_context", return_value=True
+            ) as restore_focus,
+            mock.patch.object(
+                self.module,
+                "replay_workspace_tree",
+                return_value=(True, list(matches.values())),
+            ) as replay,
+        ):
+            self.assertTrue(
+                self.module.restore_nested_tiled_layouts(
+                    rows,
+                    matches,
+                    current,
+                    {1: layout},
+                )
+            )
+
+        tree = replay.call_args.args[3]
+        self.assertEqual("x", tree[1])
+        self.assertAlmostEqual(0.3, tree[2])
+        restore_focus.assert_called_once_with(
+            {"address": "0xfocused", "workspace_id": 2}
+        )
+
+    def test_two_window_vertical_replay_uses_exact_saved_ratio(self):
+        top = window(1, 0, "top", 10)
+        bottom = window(2, 1, "bottom", 20)
+        top.update(at_x=0, at_y=0, size_w=1000, size_h=700)
+        bottom.update(at_x=0, at_y=700, size_w=1000, size_h=300)
+        rows = [top, bottom]
+        matches = {1: "0xtop", 2: "0xbottom"}
+        tree = self.module.infer_split_tree(
+            [(row["id"], self.module.saved_geometry(row)) for row in rows]
+        )
+
+        with mock.patch.object(self.module, "eval_lua", return_value=True) as evaluate:
+            self.module.replay_workspace_tree(
+                1,
+                rows,
+                matches,
+                tree,
+                {"address": "0xfocused", "workspace_id": 2},
+            )
+
+        lua = evaluate.call_args.args[0]
+        self.assertIn("preselect down", lua)
+        self.assertIn("splitratio 1.4 exact", lua)
 
     def test_nested_replay_skips_incomplete_or_incompatible_workspace(self):
         rows = self.nested_workspace()
@@ -3145,6 +3247,27 @@ class OmarchySeshTests(unittest.TestCase):
             [call.args[0] for call in dispatch.call_args_list],
         )
         hyprctl.assert_called_once_with("clients")
+
+    def test_tiled_slot_restore_rejects_ratio_that_does_not_settle(self):
+        left = window(1, 0, "left", 10)
+        right = window(2, 1, "right", 20)
+        left.update(at_x=0, at_y=0, size_w=300, size_h=1000)
+        right.update(at_x=300, at_y=0, size_w=700, size_h=1000)
+        matches = {1: "0xleft", 2: "0xright"}
+        clients = [
+            tiled_client(left, "0xleft", [0, 0], [500, 1000]),
+            tiled_client(right, "0xright", [500, 0], [500, 1000]),
+        ]
+
+        with (
+            mock.patch.object(self.module, "dispatch", return_value=True),
+            mock.patch.object(self.module, "hyprctl_json", return_value=clients),
+            mock.patch.object(self.module, "log") as log,
+        ):
+            self.assertFalse(
+                self.module.restore_tiled_slots([left, right], matches, clients)
+            )
+        log.assert_any_call("restore: tiled geometry did not settle on workspace 1")
 
     def test_tiled_slot_restore_resizes_after_workspace_origin_changes(self):
         chrome = window(1, 0, "chromium", 10)
@@ -4276,7 +4399,7 @@ class OmarchySeshTests(unittest.TestCase):
     def test_first_install_enables_autosave(self):
         calls, _, marker = self.run_installer(autosave_unit_exists=False)
         self.assertIn("--user enable omarchy-sesh-autosave.service", calls)
-        self.assertEqual("0.2.4", marker)
+        self.assertEqual("0.2.5", marker)
 
     def test_installer_creates_owner_only_state(self):
         _, _, _, modes = self.run_installer(

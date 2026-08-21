@@ -4,6 +4,22 @@ All notable changes to `omarchy-sesh` are documented here.
 
 ## Unreleased
 
+## v0.2.5 - 2026-08-21
+
+### Fixed
+
+- Two-window dwindle workspaces now use the same guarded, gap-aware exact tree
+  replay as nested layouts, preserving saved splits such as 30/70 instead of
+  accepting Hyprland's default 50/50 split.
+- Tiled ratio correction now verifies the resulting compositor geometry and
+  restores focus after incremental replay; a compositor mutation that has no
+  effect is reported as a restore failure instead of silent success.
+
+### Compatibility
+
+- This release does not change the SQLite schema or require a migration. It
+  reuses the existing `windows` geometry and `workspace_layouts` metadata.
+
 ## v0.2.4 - 2026-08-21
 
 ### Security

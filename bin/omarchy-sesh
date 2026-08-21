@@ -1651,7 +1651,7 @@ def nested_replay_supported():
         return None
     match = re.match(r"^v?(\d+)\.(\d+)\.(\d+)", str(version.get("version", "")))
     if not match or tuple(map(int, match.groups())) < (0, 56, 0):
-        log("restore: Hyprland 0.56+ is required for nested tiled replay")
+        log("restore: Hyprland 0.56+ is required for dwindle tree replay")
         return False
     required = {
         "dwindle:use_active_for_splits": True,
@@ -1664,7 +1664,7 @@ def nested_replay_supported():
     for (option, expected), value in zip(required.items(), values):
         if value.get("bool") is not expected:
             log(
-                f"restore: nested tiled replay requires {option} = "
+                f"restore: dwindle tree replay requires {option} = "
                 f"{str(expected).lower()}"
             )
             return False
@@ -1915,7 +1915,7 @@ def restore_nested_tiled_layouts(
             rows_by_workspace.setdefault(row["workspace_id"], []).append(row)
 
     if not any(
-        len(workspace_rows) >= 3 and layouts.get(workspace_id)
+        len(workspace_rows) >= 2 and layouts.get(workspace_id)
         for workspace_id, workspace_rows in rows_by_workspace.items()
     ):
         return True
@@ -1923,7 +1923,7 @@ def restore_nested_tiled_layouts(
     if workspace_rules is None:
         return None
     if workspace_rules:
-        log("restore: workspace-specific rules disable nested tiled replay")
+        log("restore: workspace-specific rules disable dwindle tree replay")
         return True
     live_workspaces = hyprctl_json("workspaces")
     live_monitors = hyprctl_json("monitors")
@@ -1945,7 +1945,7 @@ def restore_nested_tiled_layouts(
     candidates = []
     for workspace_id, workspace_rows in rows_by_workspace.items():
         layout = layouts.get(workspace_id)
-        if len(workspace_rows) < 3 or not layout:
+        if len(workspace_rows) < 2 or not layout:
             continue
         if (
             layout.get("layout") != "dwindle"
@@ -2052,6 +2052,7 @@ def restore_nested_tiled_layouts(
         return None
     if not supported:
         return True
+    restore_loaded_focus = focus_context is None
     focus_context = focus_context or load_focus_context()
     if focus_context is None:
         return None
@@ -2075,6 +2076,12 @@ def restore_nested_tiled_layouts(
                 workspace_id, addresses, focus_context
             )
             return None if recovery is None else False
+        if restore_loaded_focus:
+            focus_result = restore_focus_context(focus_context)
+            if focus_result is None:
+                return None
+            if not focus_result:
+                return False
         clients = refreshed
     return True
 
@@ -2123,6 +2130,30 @@ def tiled_slot_addresses(rows, current):
             return None
         slots.append(candidates[0])
     return slots if len(set(slots)) == len(rows) else None
+
+
+def two_window_geometry_matches(rows, matches, current):
+    saved = [saved_geometry(row) for row in rows]
+    actual = [window_geometry(client) for client in current]
+    saved_split = simple_split_order(saved)
+    actual_split = simple_split_order(actual)
+    if (
+        saved_split is None
+        or actual_split is None
+        or saved_split[0] != actual_split[0]
+        or not geometries_match(
+            geometry_dimensions(saved), geometry_dimensions(actual)
+        )
+    ):
+        return False
+    desired_order = [matches[rows[index]["id"]] for index in saved_split[1]]
+    occupant_order = [current[index]["address"] for index in actual_split[1]]
+    if desired_order != occupant_order:
+        return False
+    return all(
+        geometries_match(saved[saved_index][2:], actual[actual_index][2:])
+        for saved_index, actual_index in zip(saved_split[1], actual_split[1])
+    )
 
 
 def restore_tiled_slots(rows, matches, clients):
@@ -2224,17 +2255,25 @@ def restore_tiled_slots(rows, matches, clients):
                 failed_workspaces.add(workspace_id)
                 continue
 
+        if all(
+            geometries_match(
+                saved_geometry(row)[2:],
+                window_geometry(client_by_address[matches[row["id"]]])[2:],
+            )
+            for row in workspace_rows
+        ):
+            continue
         candidates = []
         for row in workspace_rows:
             client = client_by_address[matches[row["id"]]]
             desired = saved_geometry(row)
             actual = window_geometry(client)
             if not geometries_match(desired[2:], actual[2:]):
-                error = abs(desired[2] - actual[2]) + abs(desired[3] - actual[3])
-                candidates.append((error, row, client, desired))
-        if not candidates:
-            continue
-        _, _, client, desired = max(candidates, key=lambda candidate: candidate[0])
+                error = abs(desired[2] - actual[2]) + abs(
+                    desired[3] - actual[3]
+                )
+                candidates.append((error, client, desired))
+        _, client, desired = max(candidates, key=lambda candidate: candidate[0])
         window = lua_quote(f"address:{client['address']}")
         if not dispatch(
             "hl.dsp.window.resize({ "
@@ -2266,6 +2305,13 @@ def restore_tiled_slots(rows, matches, clients):
         current, _ = context
         slot_addresses = tiled_slot_addresses(workspace_rows, current)
         if slot_addresses is None:
+            if workspace_id in resizable_workspaces and not two_window_geometry_matches(
+                workspace_rows, matches, current
+            ):
+                log(
+                    f"restore: tiled geometry did not settle on workspace {workspace_id}"
+                )
+                all_ok = False
             continue
 
         for index, row in enumerate(workspace_rows):

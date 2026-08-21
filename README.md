@@ -171,6 +171,9 @@ browser command. After matching, eligible nested dwindle workspaces are rebuilt
 in one fast Lua evaluation: one seed remains on the target workspace while the
 other leaves pass through a temporary staging workspace. Focus, insertion
 direction, and split ratios recreate the saved geometry, which is then verified.
+Eligible two-window dwindle workspaces set their saved split ratio directly and
+also verify both resulting rectangles, so a 30/70 split is not silently accepted
+as Hyprland's default 50/50 split.
 Each saved workspace returns to the same connected monitor; renamed or rewired
 outputs are identified by monitor description. Workspaces from disconnected
 displays use the configured fallback: the focused monitor then the lowest
@@ -197,7 +200,8 @@ selecting Active mode captures the current desktop first when no successful
 restore marker exists. A synchronous logout, reboot, or shutdown save closes
 the gate before capture so a periodic save cannot supersede it during teardown.
 
-Nested replay requires a schema-v5 snapshot, `dwindle:use_active_for_splits =
+Exact dwindle tree replay, including two-window ratios, requires a schema-v5
+snapshot, `dwindle:use_active_for_splits =
 true`, `dwindle:preserve_split = true`,
 `dwindle:permanent_direction_override = false`, every saved tiled window to be
 present and uniquely identified, no unrelated tiled occupants, unchanged
@@ -206,7 +210,7 @@ continue to launch in parallel. Replay runs independently per workspace and
 restores the focused window or empty workspace afterward; because Hyprland
 layout messages act on the focused workspace, a very brief workspace change may
 still be visible during login.
-Ineligible workspaces retain the existing two-window ratio and compatible-slot
+Ineligible workspaces retain the guarded two-window and compatible-slot
 fallback without moving unrelated windows. Hyprland's `stableId` is only a live
 compositor window-object selector and resets with Hyprland, so ambiguous
 same-class windows still depend on title and workspace metadata. See
@@ -219,7 +223,7 @@ saved floating coordinates may require manual adjustment.
 - Hyprland >= 0.55 (uses the Lua dispatch API)
 - python3 (stdlib only — sqlite3, json, shlex)
 
-Nested tiled replay requires Hyprland >= 0.56 with the three dwindle options
+Exact dwindle tree replay requires Hyprland >= 0.56 with the three dwindle options
 listed above. Ordinary restore remains available when those conditions are not
 met.
 
