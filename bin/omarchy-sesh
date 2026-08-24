@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 STATE_DIR = (
@@ -2694,7 +2695,7 @@ def restore_window_groups(rows, matches, failed_monitor_workspaces=()):
     return True
 
 
-def restore_windows(
+def _restore_windows(
     rows,
     initial_matches,
     initial_clients,
@@ -2925,6 +2926,67 @@ def restore_windows(
     return restored, failures, launched_processes, False
 
 
+@dataclass(frozen=True)
+class RestoreOutcome:
+    restored_windows: int
+    permanent_failures: int
+    launched_processes: int
+    retryable_failure: bool
+
+
+class HyprlandRestoreAdapter:
+    """Production adapter for the private Hyprland restore implementation."""
+
+    def restore(self, rows, initial_matches, clients, layouts, timeout, monitor_fallback):
+        return _restore_windows(
+            rows, initial_matches, clients, layouts, timeout, monitor_fallback
+        )
+
+    def animations_disabled(self):
+        return animations_disabled()
+
+
+class RestoreRun:
+    """Apply one selected Snapshot through the restore-run seam."""
+
+    def __init__(
+        self,
+        rows,
+        initial_matches,
+        clients,
+        layouts,
+        timeout,
+        monitor_fallback,
+        compositor,
+    ):
+        self.rows = rows
+        self.initial_matches = initial_matches
+        self.clients = clients
+        self.layouts = layouts
+        self.timeout = timeout
+        self.monitor_fallback = monitor_fallback
+        self.compositor = compositor
+
+    def run(self):
+        with self.compositor.animations_disabled():
+            restored, failures, launched_processes, retryable_failure = (
+                self.compositor.restore(
+                    self.rows,
+                    self.initial_matches,
+                    self.clients,
+                    self.layouts,
+                    self.timeout,
+                    self.monitor_fallback,
+                )
+            )
+        return RestoreOutcome(
+            restored_windows=restored,
+            permanent_failures=failures,
+            launched_processes=launched_processes,
+            retryable_failure=retryable_failure,
+        )
+
+
 def cmd_restore(dry_run=False, name=None):
     if name is not None:
         session_name(name)
@@ -2995,24 +3057,24 @@ def cmd_restore(dry_run=False, name=None):
             print("restore deferred: could not persist restore state", file=sys.stderr)
             return 75
 
-        with animations_disabled():
-            restored, failures, launched_processes, ipc_failed = restore_windows(
-                rows,
-                initial_matches,
-                clients,
-                layouts,
-                cfg["restore_timeout_seconds"],
-                cfg["monitor_fallback"],
-            )
-        print(f"restored {restored}/{len(rows)} windows")
+        outcome = RestoreRun(
+            rows,
+            initial_matches,
+            clients,
+            layouts,
+            cfg["restore_timeout_seconds"],
+            cfg["monitor_fallback"],
+            HyprlandRestoreAdapter(),
+        ).run()
+        print(f"restored {outcome.restored_windows}/{len(rows)} windows")
         log(
-            f"restore: restored {restored}/{len(rows)} windows from "
-            f"{launched_processes} launched processes"
+            f"restore: restored {outcome.restored_windows}/{len(rows)} windows from "
+            f"{outcome.launched_processes} launched processes"
             + (f" (named session {name!r})" if name is not None else "")
         )
-        if ipc_failed:
+        if outcome.retryable_failure:
             return 75
-        if failures:
+        if outcome.permanent_failures:
             return 1
         return 0 if mark_restore_completed(sid) else 75
     finally:

@@ -4,6 +4,18 @@ All notable changes to `omarchy-sesh` are documented here.
 
 ## Unreleased
 
+## v0.2.6 - 2026-08-24
+
+### Changed
+
+- Restore orchestration now runs through a dedicated restore-run module with a
+  named outcome for restored windows, launched processes, permanent failures,
+  and retryable transport failures. Existing restore behavior and exit semantics
+  are unchanged.
+- Restore lifecycle tests can use an in-memory compositor adapter, while the
+  production adapter retains Hyprland animation suppression around the complete
+  restore run.
+
 ## v0.2.5 - 2026-08-21
 
 ### Fixed

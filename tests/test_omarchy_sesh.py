@@ -704,7 +704,7 @@ class OmarchySeshTests(unittest.TestCase):
             mock.patch.object(self.module, "hyprctl_json", return_value=[]),
             mock.patch.object(self.module, "restore_was_completed", return_value=False),
             mock.patch.object(
-                self.module, "restore_windows", return_value=(1, 0, 1, False)
+                self.module, "_restore_windows", return_value=(1, 0, 1, False)
             ) as restore_windows,
             mock.patch.object(self.module, "mark_restore_completed", return_value=True),
         ):
@@ -729,7 +729,7 @@ class OmarchySeshTests(unittest.TestCase):
                 self.module, "restore_was_completed", return_value=True
             ) as restore_was_completed,
             mock.patch.object(
-                self.module, "restore_windows", return_value=(1, 0, 1, False)
+                self.module, "_restore_windows", return_value=(1, 0, 1, False)
             ) as restore_windows,
             mock.patch.object(self.module, "mark_restore_completed", return_value=True),
         ):
@@ -1552,7 +1552,7 @@ class OmarchySeshTests(unittest.TestCase):
             mock.patch.object(self.module, "load_focus_context", return_value={}),
             mock.patch.object(self.module, "restore_focus_context", return_value=True),
         ):
-            result = self.module.restore_windows([row], {1: "0x1"}, [stale])
+            result = self.module._restore_windows([row], {1: "0x1"}, [stale])
 
         self.assertEqual((1, 0, 0, False), result)
         hyprctl.assert_called_once_with("clients")
@@ -1585,6 +1585,40 @@ class OmarchySeshTests(unittest.TestCase):
 
         self.assertEqual(4, dispatch.call_count)
         self.assertEqual({2}, prepared)
+
+    def test_restore_run_exposes_named_outcome_through_in_memory_adapter(self):
+        class InMemoryRestoreAdapter:
+            def __init__(self):
+                self.calls = []
+
+            @contextlib.contextmanager
+            def animations_disabled(self):
+                self.calls.append("animations-disabled")
+                yield
+
+            def restore(self, *args):
+                self.calls.append(args)
+                return 2, 1, 3, False
+
+        adapter = InMemoryRestoreAdapter()
+        rows = [window(1, 0, "terminal", 10)]
+
+        outcome = self.module.RestoreRun(
+            rows,
+            {1: "0xa"},
+            [{"mapped": True, "address": "0xa"}],
+            {},
+            20,
+            "focused",
+            adapter,
+        ).run()
+
+        self.assertEqual(
+            self.module.RestoreOutcome(2, 1, 3, False),
+            outcome,
+        )
+        self.assertEqual("animations-disabled", adapter.calls[0])
+        self.assertEqual(rows, adapter.calls[1][0])
 
     def test_monitor_remap_ipc_failure_is_retryable(self):
         with (
@@ -2034,7 +2068,7 @@ class OmarchySeshTests(unittest.TestCase):
             mock.patch.object(self.module, "eval_lua") as evaluate,
             mock.patch.object(self.module, "log") as log,
         ):
-            result = self.module.restore_windows(
+            result = self.module._restore_windows(
                 [first, second], {1: "0xa", 2: "0xb"}, clients
             )
         self.assertEqual((0, 2, 0, False), result)
@@ -2271,7 +2305,7 @@ class OmarchySeshTests(unittest.TestCase):
             ),
             mock.patch.object(self.module, "restore_focus_context", return_value=True),
         ):
-            result = self.module.restore_windows(
+            result = self.module._restore_windows(
                 [first, second], {1: "0xa", 2: "0xb"}, clients
             )
         self.assertEqual((2, 0, 0, False), result)
@@ -2307,7 +2341,7 @@ class OmarchySeshTests(unittest.TestCase):
             mock.patch.object(self.module, "restore_focus_context") as restore_focus,
             mock.patch.object(self.module, "log"),
         ):
-            result = self.module.restore_windows([row], {1: "0xa"}, clients)
+            result = self.module._restore_windows([row], {1: "0xa"}, clients)
         self.assertEqual((1, 1, 0, False), result)
         self.assertEqual(["tiled", "groups"], events)
         restore_focus.assert_not_called()
@@ -3852,7 +3886,7 @@ class OmarchySeshTests(unittest.TestCase):
             mock.patch.object(self.module, "restore_was_completed", return_value=False),
             mock.patch.object(
                 self.module,
-                "restore_windows",
+                "_restore_windows",
                 return_value=(1, 0, 1, False),
             ) as restore_windows,
             mock.patch.object(self.module, "mark_restore_completed", return_value=True),
@@ -3891,7 +3925,7 @@ class OmarchySeshTests(unittest.TestCase):
             ),
             mock.patch.object(
                 self.module,
-                "restore_windows",
+                "_restore_windows",
                 side_effect=lambda *_a: events.append("restore") or (1, 0, 1, False),
             ),
             mock.patch.object(self.module, "mark_restore_completed", return_value=True),
@@ -4399,7 +4433,7 @@ class OmarchySeshTests(unittest.TestCase):
     def test_first_install_enables_autosave(self):
         calls, _, marker = self.run_installer(autosave_unit_exists=False)
         self.assertIn("--user enable omarchy-sesh-autosave.service", calls)
-        self.assertEqual("0.2.5", marker)
+        self.assertEqual("0.2.6", marker)
 
     def test_installer_creates_owner_only_state(self):
         _, _, _, modes = self.run_installer(
