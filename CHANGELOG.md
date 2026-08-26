@@ -4,6 +4,37 @@ All notable changes to `omarchy-sesh` are documented here.
 
 ## Unreleased
 
+## v0.2.7 - 2026-08-26
+
+### Changed
+
+- The Restore run module now owns live observation, one-to-one matching, launch
+  scheduling, placement, tiled correction, group reconstruction, verification,
+  animation lifetime, and outcome construction. The command retains Snapshot
+  selection, dry-run rendering, restore-marker persistence, output, and exit
+  translation.
+- Selected Snapshots are copied into immutable values and restore settings are
+  validated at the module interface, preventing observation-to-execution state
+  from changing during a prepared Restore run.
+- Hyprland operations, monotonic time, sleeping, and logging now cross explicit
+  internal seams. Post-selection scenarios exercise the Restore run interface
+  with deterministic in-memory adapters instead of invoking private
+  orchestration or patching global time and compositor functions.
+- Restore ordering coverage now proves live observation precedes the incomplete
+  marker, animation suppression, desktop mutation, animation restoration, and
+  the final completion marker.
+
+### Compatibility
+
+- Restore behavior, CLI output, exit semantics, and the SQLite schema are
+  unchanged. Completed automatic restores still require live compositor IPC
+  before fast-skipping without loading Snapshot payload data.
+
+### Fixed
+
+- The README now correctly states that fresh installs enable Active autosave by
+  default; upgrades still preserve an existing Manual selection.
+
 ## v0.2.6 - 2026-08-24
 
 ### Changed

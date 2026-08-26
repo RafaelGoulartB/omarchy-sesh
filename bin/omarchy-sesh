@@ -17,6 +17,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 
 STATE_DIR = (
     Path(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"))
@@ -64,6 +65,92 @@ class ConfigError(ValueError):
 
 class NamedSessionConflict(ValueError):
     pass
+
+
+@dataclass(frozen=True)
+class Snapshot:
+    session_id: int
+    windows: tuple
+    workspace_layouts: object
+
+    def __post_init__(self):
+        object.__setattr__(
+            self,
+            "windows",
+            tuple(MappingProxyType(dict(row)) for row in self.windows),
+        )
+        object.__setattr__(
+            self,
+            "workspace_layouts",
+            MappingProxyType(
+                {
+                    workspace_id: MappingProxyType(dict(layout))
+                    for workspace_id, layout in self.workspace_layouts.items()
+                }
+            ),
+        )
+
+@dataclass(frozen=True)
+class RestoreSettings:
+    timeout_seconds: float
+    monitor_fallback: str
+
+    def __post_init__(self):
+        if (
+            type(self.timeout_seconds) not in (int, float)
+            or (
+                type(self.timeout_seconds) is float
+                and not math.isfinite(self.timeout_seconds)
+            )
+            or not RESTORE_RETRY_DELAY
+            <= self.timeout_seconds
+            <= MAX_CONFIG_SECONDS
+        ):
+            raise ValueError("invalid restore timeout")
+        if not isinstance(self.monitor_fallback, str) or (
+            self.monitor_fallback not in MONITOR_FALLBACK_POLICIES
+            and not MONITOR_CONNECTOR_RE.match(self.monitor_fallback)
+        ):
+            raise ValueError("invalid monitor fallback")
+
+
+class HyprlandRestoreAdapter:
+    """Primitive Hyprland operations used by a Restore run."""
+
+    def __init__(self, write_log=None):
+        self.write_log = write_log
+
+    def query_json(self, *args):
+        if self.write_log is None:
+            return hyprctl_json(*args)
+        return hyprctl_json(*args, write_log=self.write_log)
+
+    def query_batch_json(self, *commands):
+        if self.write_log is None:
+            return hyprctl_batch_json(*commands)
+        return hyprctl_batch_json(*commands, write_log=self.write_log)
+
+    def dispatch(self, lua, failure_context=None):
+        if self.write_log is None:
+            if failure_context is None:
+                return dispatch(lua)
+            return dispatch(lua, failure_context=failure_context)
+        return dispatch(
+            lua, failure_context=failure_context, write_log=self.write_log
+        )
+
+    def evaluate(self, lua):
+        if self.write_log is None:
+            return eval_lua(lua)
+        return eval_lua(lua, write_log=self.write_log)
+
+
+class SystemClockAdapter:
+    def monotonic(self):
+        return time.monotonic()
+
+    def sleep(self, seconds):
+        time.sleep(seconds)
 
 
 def private_directory(path):
@@ -125,12 +212,13 @@ def log(msg):
         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
 
 
-def hyprctl_json(*args):
+def hyprctl_json(*args, write_log=None):
+    write_log = log if write_log is None else write_log
     out = subprocess.run(
         ["hyprctl", "-j", *args], capture_output=True, text=True, check=False
     )
     if out.returncode != 0:
-        log(f"hyprctl -j {' '.join(args)} failed: {out.stderr.strip()}")
+        write_log(f"hyprctl -j {' '.join(args)} failed: {out.stderr.strip()}")
         return None
     try:
         return json.loads(out.stdout)
@@ -138,7 +226,8 @@ def hyprctl_json(*args):
         return None
 
 
-def hyprctl_batch_json(*commands):
+def hyprctl_batch_json(*commands, write_log=None):
+    write_log = log if write_log is None else write_log
     out = subprocess.run(
         ["hyprctl", "-j", "--batch", "; ".join(commands)],
         capture_output=True,
@@ -146,7 +235,7 @@ def hyprctl_batch_json(*commands):
         check=False,
     )
     if out.returncode != 0:
-        log(f"hyprctl -j --batch failed: {out.stderr.strip()}")
+        write_log(f"hyprctl -j --batch failed: {out.stderr.strip()}")
         return None
     decoder = json.JSONDecoder()
     values = []
@@ -164,7 +253,8 @@ def hyprctl_batch_json(*commands):
     return values if len(values) == len(commands) else None
 
 
-def dispatch(lua, failure_context=None):
+def dispatch(lua, failure_context=None, *, write_log=None):
+    write_log = log if write_log is None else write_log
     out = subprocess.run(
         ["hyprctl", "dispatch", lua], capture_output=True, text=True, check=False
     )
@@ -173,22 +263,25 @@ def dispatch(lua, failure_context=None):
     )
     if out.returncode != 0 or "error" in output.lower():
         if failure_context is not None:
-            log(f"{failure_context}: dispatch failed (request details redacted)")
+            write_log(
+                f"{failure_context}: dispatch failed (request details redacted)"
+            )
         else:
-            log(f"dispatch failed ({lua}): {output}")
+            write_log(f"dispatch failed ({lua}): {output}")
         return False
     return True
 
 
-def animations_enabled():
-    option = hyprctl_json("getoption", "animations:enabled")
+def animations_enabled(*, compositor=None):
+    compositor = compositor or HyprlandRestoreAdapter()
+    option = compositor.query_json("getoption", "animations:enabled")
     if not isinstance(option, dict):
         return None
     value = option.get("int", option.get("bool"))
     return None if value is None else bool(value)
 
 
-def set_animations_enabled(enabled):
+def set_animations_enabled(enabled, *, compositor=None):
     """Toggle `animations:enabled` through the Lua configuration API.
 
     `hyprctl keyword` is not usable here: Hyprland 0.56 answers it with
@@ -196,9 +289,10 @@ def set_animations_enabled(enabled):
     so the write must go through `hl.config` and be read back to confirm it
     actually landed.
     """
+    compositor = compositor or HyprlandRestoreAdapter()
     value = "true" if enabled else "false"
     return bool(
-        eval_lua(
+        compositor.evaluate(
             f"hl.config({{ animations = {{ enabled = {value} }} }}) "
             f"if hl.get_config('animations:enabled') ~= {value} then "
             "error('animations:enabled did not change') end"
@@ -207,7 +301,7 @@ def set_animations_enabled(enabled):
 
 
 @contextlib.contextmanager
-def animations_disabled():
+def animations_disabled(*, compositor=None, write_log=None):
     """Place restored windows without animating each one into position.
 
     Hyprland animates every move, resize, and workspace change, so an
@@ -216,16 +310,24 @@ def animations_disabled():
     cannot be read or cleared the restore proceeds with animations on rather
     than failing, and the previous value is always put back.
     """
-    previous = animations_enabled()
-    suppressed = bool(previous) and set_animations_enabled(False)
+    compositor = compositor or HyprlandRestoreAdapter()
+    write_log = log if write_log is None else write_log
+    previous = animations_enabled(compositor=compositor)
+    suppressed = bool(previous) and set_animations_enabled(
+        False, compositor=compositor
+    )
     try:
         yield
     finally:
-        if suppressed and not set_animations_enabled(True):
-            log("restore: could not re-enable animations; run 'hyprctl reload'")
+        restored = not suppressed or set_animations_enabled(
+            True, compositor=compositor
+        )
+        if not restored:
+            write_log("restore: could not re-enable animations; run 'hyprctl reload'")
 
 
-def eval_lua(lua):
+def eval_lua(lua, *, write_log=None):
+    write_log = log if write_log is None else write_log
     out = subprocess.run(
         ["hyprctl", "eval", lua], capture_output=True, text=True, check=False
     )
@@ -233,7 +335,7 @@ def eval_lua(lua):
         part.strip() for part in (out.stdout, out.stderr) if part.strip()
     )
     if out.returncode != 0 or out.stdout.strip() != "ok":
-        log(f"eval failed ({lua}): {output}")
+        write_log(f"eval failed ({lua}): {output}")
         if out.returncode < 0 or 1 <= out.returncode <= 6:
             return None
         return False
@@ -1241,7 +1343,7 @@ def window_placement_operations(w, address, current=None):
     return operations
 
 
-def place_window(w, address, current=None):
+def place_window(w, address, current=None, *, compositor=None):
     if not address:
         return False
     operations = window_placement_operations(w, address, current)
@@ -1258,10 +1360,16 @@ def place_window(w, address, current=None):
         ),
         "if failed>0 then error(failed..' placement dispatches failed') end",
     ]
-    return bool(eval_lua(" ".join(script)))
+    compositor = compositor or HyprlandRestoreAdapter()
+    return bool(compositor.evaluate(" ".join(script)))
 
 
-def verify_floating_placements(rows, matches):
+def verify_floating_placements(
+    rows, matches, *, compositor=None, clock=None, write_log=None
+):
+    compositor = compositor or HyprlandRestoreAdapter()
+    clock = clock or SystemClockAdapter()
+    write_log = log if write_log is None else write_log
     expected = [
         row
         for row in rows
@@ -1272,8 +1380,8 @@ def verify_floating_placements(rows, matches):
     if not expected:
         return True
 
-    time.sleep(RESTORE_POLL_INTERVAL)
-    clients = hyprctl_json("clients")
+    clock.sleep(RESTORE_POLL_INTERVAL)
+    clients = compositor.query_json("clients")
     if clients is None:
         return None
     current = {client.get("address"): client for client in clients}
@@ -1287,10 +1395,16 @@ def verify_floating_placements(rows, matches):
 
     mutation_ok = True
     for row in mismatched:
-        if not place_window(row, matches[row["id"]], current.get(matches[row["id"]])):
+        placed = place_window(
+            row,
+            matches[row["id"]],
+            current.get(matches[row["id"]]),
+            compositor=compositor,
+        )
+        if not placed:
             mutation_ok = False
-    time.sleep(RESTORE_POLL_INTERVAL)
-    clients = hyprctl_json("clients")
+    clock.sleep(RESTORE_POLL_INTERVAL)
+    clients = compositor.query_json("clients")
     if clients is None:
         return None
     current = {client.get("address"): client for client in clients}
@@ -1300,7 +1414,7 @@ def verify_floating_placements(rows, matches):
         if actual is None or not geometries_match(saved_geometry(row), actual):
             failed.append(row)
     for row in failed:
-        log(f"restore: floating geometry did not settle for {row['class']}")
+        write_log(f"restore: floating geometry did not settle for {row['class']}")
     return mutation_ok and not failed
 
 
@@ -1329,7 +1443,10 @@ def monitor_sort_key(monitor):
     return monitor_id, monitor.get("name") or ""
 
 
-def workspace_monitor_targets(rows, monitors, monitor_fallback="focused"):
+def workspace_monitor_targets(
+    rows, monitors, monitor_fallback="focused", *, write_log=None
+):
+    write_log = log if write_log is None else write_log
     monitors = [monitor for monitor in monitors if monitor.get("name")]
     by_name = {monitor["name"]: monitor for monitor in monitors}
     lowest = min(monitors, key=monitor_sort_key, default=None)
@@ -1348,7 +1465,7 @@ def workspace_monitor_targets(rows, monitors, monitor_fallback="focused"):
     else:
         fallback = by_name.get(monitor_fallback)
         if fallback is None:
-            log(
+            write_log(
                 f"restore: configured fallback monitor {monitor_fallback!r} "
                 "is unavailable"
             )
@@ -1369,7 +1486,7 @@ def workspace_monitor_targets(rows, monitors, monitor_fallback="focused"):
             if row.get("monitor_description")
         }
         if len(saved_names) > 1 or len(saved_descriptions) > 1:
-            log(
+            write_log(
                 f"restore: workspace {workspace_id} has conflicting saved monitor identities"
             )
             continue
@@ -1398,24 +1515,33 @@ def workspace_monitor_targets(rows, monitors, monitor_fallback="focused"):
     return targets
 
 
-def load_workspace_monitor_context(rows, monitor_fallback="focused"):
-    monitors = hyprctl_json("monitors")
-    workspaces = hyprctl_json("workspaces")
+def load_workspace_monitor_context(
+    rows, monitor_fallback="focused", *, compositor=None, write_log=None
+):
+    compositor = compositor or HyprlandRestoreAdapter()
+    write_log = log if write_log is None else write_log
+    monitors = compositor.query_json("monitors")
+    workspaces = compositor.query_json("workspaces")
     if monitors is None or workspaces is None or not monitors:
-        log("restore: Hyprland IPC failed while remapping workspace monitors")
+        write_log("restore: Hyprland IPC failed while remapping workspace monitors")
         return {}, {}, True
 
     current_monitors = {
         workspace.get("id"): workspace.get("monitor") for workspace in workspaces
     }
     return (
-        workspace_monitor_targets(rows, monitors, monitor_fallback),
+        workspace_monitor_targets(
+            rows, monitors, monitor_fallback, write_log=write_log
+        ),
         current_monitors,
         False,
     )
 
 
-def prepare_workspace_monitor(row, address, targets, current_monitors, prepared):
+def prepare_workspace_monitor(
+    row, address, targets, current_monitors, prepared, *, compositor=None
+):
+    compositor = compositor or HyprlandRestoreAdapter()
     workspace_id = row.get("workspace_id")
     target = targets.get(workspace_id)
     if target is None or workspace_id in prepared:
@@ -1425,11 +1551,11 @@ def prepare_workspace_monitor(row, address, targets, current_monitors, prepared)
         return True
 
     win = lua_quote(f"address:{address}")
-    if not dispatch(
+    if not compositor.dispatch(
         f"hl.dsp.window.move({{ workspace = {workspace_id}, follow = false, window = {win} }})"
     ):
         return False
-    if not dispatch(
+    if not compositor.dispatch(
         "hl.dsp.workspace.move({ "
         f"workspace = {workspace_id}, monitor = {lua_quote(target)} "
         "})"
@@ -1646,25 +1772,29 @@ def split_tree_seed(tree):
     return tree[1]
 
 
-def nested_replay_supported():
-    version = hyprctl_json("version")
+def nested_replay_supported(*, compositor=None, write_log=None):
+    compositor = compositor or HyprlandRestoreAdapter()
+    write_log = log if write_log is None else write_log
+    version = compositor.query_json("version")
     if version is None:
         return None
     match = re.match(r"^v?(\d+)\.(\d+)\.(\d+)", str(version.get("version", "")))
     if not match or tuple(map(int, match.groups())) < (0, 56, 0):
-        log("restore: Hyprland 0.56+ is required for dwindle tree replay")
+        write_log("restore: Hyprland 0.56+ is required for dwindle tree replay")
         return False
     required = {
         "dwindle:use_active_for_splits": True,
         "dwindle:preserve_split": True,
         "dwindle:permanent_direction_override": False,
     }
-    values = hyprctl_batch_json(*(f"getoption {option}" for option in required))
+    values = compositor.query_batch_json(
+        *(f"getoption {option}" for option in required)
+    )
     if values is None:
         return None
     for (option, expected), value in zip(required.items(), values):
         if value.get("bool") is not expected:
-            log(
+            write_log(
                 f"restore: dwindle tree replay requires {option} = "
                 f"{str(expected).lower()}"
             )
@@ -1710,7 +1840,10 @@ def workspace_geometry_matches(
     return True
 
 
-def replay_workspace_tree(workspace_id, rows, matches, tree, focus_context):
+def replay_workspace_tree(
+    workspace_id, rows, matches, tree, focus_context, *, compositor=None
+):
+    compositor = compositor or HyprlandRestoreAdapter()
     addresses = [matches[row["id"]] for row in rows]
     variable_by_id = {
         row["id"]: f"w{index}" for index, row in enumerate(rows, start=1)
@@ -1782,14 +1915,15 @@ def replay_workspace_tree(workspace_id, rows, matches, tree, focus_context):
     if focus_action:
         script.append(f"local focus={focus_action}")
     script.append("if not ok then error(err) end")
-    result = eval_lua(" ".join(script))
+    result = compositor.evaluate(" ".join(script))
     return result, addresses
 
 
-def load_focus_context():
-    active_window = hyprctl_json("activewindow")
-    active_workspace = hyprctl_json("activeworkspace")
-    monitors = hyprctl_json("monitors")
+def load_focus_context(*, compositor=None):
+    compositor = compositor or HyprlandRestoreAdapter()
+    active_window = compositor.query_json("activewindow")
+    active_workspace = compositor.query_json("activeworkspace")
+    monitors = compositor.query_json("monitors")
     if active_window is None or active_workspace is None or monitors is None:
         return None
     focused_monitor = next(
@@ -1804,7 +1938,8 @@ def load_focus_context():
     }
 
 
-def restore_focus_context(context):
+def restore_focus_context(context, *, compositor=None):
+    compositor = compositor or HyprlandRestoreAdapter()
     if not context:
         return True
     address = context.get("address")
@@ -1812,14 +1947,16 @@ def restore_focus_context(context):
     special_workspace = context.get("special_workspace")
     if address:
         lua = f"hl.dsp.focus({{ window = {lua_quote(f'address:{address}')} }})"
-        dispatched = dispatch(lua)
-        current = hyprctl_json("activewindow")
+        dispatched = compositor.dispatch(lua)
+        current = compositor.query_json("activewindow")
         if current is None:
             return None
         if dispatched and current.get("address") == address:
             return True
         if special_workspace:
-            return restore_focus_context(dict(context, address=None))
+            return restore_focus_context(
+                dict(context, address=None), compositor=compositor
+            )
         if workspace_id is None:
             return False
         lua = f"hl.dsp.focus({{ workspace = {workspace_id} }})"
@@ -1827,7 +1964,7 @@ def restore_focus_context(context):
         expected = workspace_id
         field = "id"
     elif special_workspace:
-        monitors = hyprctl_json("monitors")
+        monitors = compositor.query_json("monitors")
         if monitors is None:
             return None
         monitor_name = context.get("monitor_name")
@@ -1848,11 +1985,11 @@ def restore_focus_context(context):
 
         if special_is_focused(monitors):
             return True
-        if not monitor_name or not dispatch(
+        if not monitor_name or not compositor.dispatch(
             f"hl.dsp.focus({{ monitor = {lua_quote(monitor_name)} }})"
         ):
-            return None if hyprctl_json("monitors") is None else False
-        monitors = hyprctl_json("monitors")
+            return None if compositor.query_json("monitors") is None else False
+        monitors = compositor.query_json("monitors")
         if monitors is None:
             return None
         if not any(
@@ -1862,13 +1999,13 @@ def restore_focus_context(context):
             for monitor in monitors
         ):
             toggle_name = special_workspace.removeprefix("special:")
-            if not dispatch(
+            if not compositor.dispatch(
                 "hl.dsp.workspace.toggle_special("
                 f"{lua_quote(toggle_name)}"
                 ")"
             ):
-                return None if hyprctl_json("monitors") is None else False
-            monitors = hyprctl_json("monitors")
+                return None if compositor.query_json("monitors") is None else False
+            monitors = compositor.query_json("monitors")
             if monitors is None:
                 return None
         return special_is_focused(monitors)
@@ -1879,15 +2016,18 @@ def restore_focus_context(context):
         field = "id"
     else:
         return True
-    dispatched = dispatch(lua)
-    current = hyprctl_json(endpoint)
+    dispatched = compositor.dispatch(lua)
+    current = compositor.query_json(endpoint)
     if current is None:
         return None
     return dispatched and current.get(field) == expected
 
 
-def recover_replay_workspace(workspace_id, addresses, focus_context):
-    clients = hyprctl_json("clients")
+def recover_replay_workspace(
+    workspace_id, addresses, focus_context, *, compositor=None
+):
+    compositor = compositor or HyprlandRestoreAdapter()
+    clients = compositor.query_json("clients")
     if clients is None:
         return None
     workspace_by_address = {
@@ -1896,20 +2036,29 @@ def recover_replay_workspace(workspace_id, addresses, focus_context):
     }
     for address in addresses:
         if workspace_by_address.get(address) != workspace_id:
-            moved = dispatch(
+            moved = compositor.dispatch(
                 "hl.dsp.window.move({ "
                 f"workspace = {workspace_id}, follow = false, "
                 f"window = {lua_quote(f'address:{address}')} "
                 "})"
             )
             if not moved:
-                return None if hyprctl_json("clients") is None else False
-    return restore_focus_context(focus_context)
+                return None if compositor.query_json("clients") is None else False
+    return restore_focus_context(focus_context, compositor=compositor)
 
 
 def restore_nested_tiled_layouts(
-    rows, matches, clients, layouts, focus_context=None
+    rows,
+    matches,
+    clients,
+    layouts,
+    focus_context=None,
+    *,
+    compositor=None,
+    write_log=None,
 ):
+    compositor = compositor or HyprlandRestoreAdapter()
+    write_log = log if write_log is None else write_log
     rows_by_workspace = {}
     for row in rows:
         if not row.get("floating") and row.get("workspace_id") is not None:
@@ -1920,16 +2069,16 @@ def restore_nested_tiled_layouts(
         for workspace_id, workspace_rows in rows_by_workspace.items()
     ):
         return True
-    workspace_rules = hyprctl_json("workspacerules")
+    workspace_rules = compositor.query_json("workspacerules")
     if workspace_rules is None:
         return None
     if workspace_rules:
-        log("restore: workspace-specific rules disable dwindle tree replay")
+        write_log("restore: workspace-specific rules disable dwindle tree replay")
         return True
-    live_workspaces = hyprctl_json("workspaces")
-    live_monitors = hyprctl_json("monitors")
-    gaps_out = hyprctl_json("getoption", "general:gaps_out")
-    gaps_in = hyprctl_json("getoption", "general:gaps_in")
+    live_workspaces = compositor.query_json("workspaces")
+    live_monitors = compositor.query_json("monitors")
+    gaps_out = compositor.query_json("getoption", "general:gaps_out")
+    gaps_in = compositor.query_json("getoption", "general:gaps_in")
     if any(value is None for value in (live_workspaces, live_monitors, gaps_out, gaps_in)):
         return None
     gaps_out = css_gaps(gaps_out)
@@ -2003,7 +2152,9 @@ def restore_nested_tiled_layouts(
             saved_gaps_in,
         )
         if tree is None:
-            log(f"restore: workspace {workspace_id} has ambiguous tiled geometry")
+            write_log(
+                f"restore: workspace {workspace_id} has ambiguous tiled geometry"
+            )
             continue
         saved_bounds = geometry_bounds(
             [saved_geometry(row) for row in workspace_rows]
@@ -2048,37 +2199,52 @@ def restore_nested_tiled_layouts(
 
     if not candidates:
         return True
-    supported = nested_replay_supported()
+    supported = nested_replay_supported(
+        compositor=compositor, write_log=write_log
+    )
     if supported is None:
         return None
     if not supported:
         return True
     restore_loaded_focus = focus_context is None
-    focus_context = focus_context or load_focus_context()
+    focus_context = focus_context or load_focus_context(compositor=compositor)
     if focus_context is None:
         return None
 
     for workspace_id, workspace_rows, layout, current_workarea, tree in candidates:
         result, addresses = replay_workspace_tree(
-            workspace_id, workspace_rows, matches, tree, focus_context
+            workspace_id,
+            workspace_rows,
+            matches,
+            tree,
+            focus_context,
+            compositor=compositor,
         )
         if result is None:
-            recover_replay_workspace(workspace_id, addresses, focus_context)
+            recover_replay_workspace(
+                workspace_id, addresses, focus_context, compositor=compositor
+            )
             return None
-        refreshed = hyprctl_json("clients")
+        refreshed = compositor.query_json("clients")
         if refreshed is None:
-            recover_replay_workspace(workspace_id, addresses, focus_context)
+            recover_replay_workspace(
+                workspace_id, addresses, focus_context, compositor=compositor
+            )
             return None
         if not result or not workspace_geometry_matches(
             workspace_rows, matches, refreshed, layout, current_workarea
         ):
-            log(f"restore: tiled replay verification failed on workspace {workspace_id}")
+            write_log(
+                f"restore: tiled replay verification failed on workspace {workspace_id}"
+            )
             recovery = recover_replay_workspace(
-                workspace_id, addresses, focus_context
+                workspace_id, addresses, focus_context, compositor=compositor
             )
             return None if recovery is None else False
         if restore_loaded_focus:
-            focus_result = restore_focus_context(focus_context)
+            focus_result = restore_focus_context(
+                focus_context, compositor=compositor
+            )
             if focus_result is None:
                 return None
             if not focus_result:
@@ -2157,7 +2323,11 @@ def two_window_geometry_matches(rows, matches, current):
     )
 
 
-def restore_tiled_slots(rows, matches, clients):
+def restore_tiled_slots(
+    rows, matches, clients, *, compositor=None, write_log=None
+):
+    compositor = compositor or HyprlandRestoreAdapter()
+    write_log = log if write_log is None else write_log
     rows_by_workspace = {}
     all_ok = True
     for row in rows:
@@ -2201,11 +2371,13 @@ def restore_tiled_slots(rows, matches, clients):
         if desired_order != occupant_order:
             window = lua_quote(f"address:{desired_order[0]}")
             target = lua_quote(f"address:{occupant_order[0]}")
-            if not dispatch(
+            if not compositor.dispatch(
                 f"hl.dsp.window.swap({{ window = {window}, target = {target} }})"
             ):
-                if hyprctl_json("clients") is None:
-                    log("restore: Hyprland IPC failed while arranging tiled windows")
+                if compositor.query_json("clients") is None:
+                    write_log(
+                        "restore: Hyprland IPC failed while arranging tiled windows"
+                    )
                     return None
                 all_ok = False
                 failed_workspaces.add(workspace_id)
@@ -2213,9 +2385,9 @@ def restore_tiled_slots(rows, matches, clients):
             swapped_workspaces.add(workspace_id)
 
     if swapped_workspaces:
-        clients = hyprctl_json("clients")
+        clients = compositor.query_json("clients")
         if clients is None:
-            log("restore: Hyprland IPC failed after arranging tiled windows")
+            write_log("restore: Hyprland IPC failed after arranging tiled windows")
             return None
 
     resized = False
@@ -2276,13 +2448,15 @@ def restore_tiled_slots(rows, matches, clients):
                 candidates.append((error, client, desired))
         _, client, desired = max(candidates, key=lambda candidate: candidate[0])
         window = lua_quote(f"address:{client['address']}")
-        if not dispatch(
+        if not compositor.dispatch(
             "hl.dsp.window.resize({ "
             f"x = {desired[2]}, y = {desired[3]}, window = {window} "
             "})"
         ):
-            if hyprctl_json("clients") is None:
-                log("restore: Hyprland IPC failed while resizing tiled windows")
+            if compositor.query_json("clients") is None:
+                write_log(
+                    "restore: Hyprland IPC failed while resizing tiled windows"
+                )
                 return None
             all_ok = False
             failed_workspaces.add(workspace_id)
@@ -2290,9 +2464,9 @@ def restore_tiled_slots(rows, matches, clients):
         resized = True
 
     if resized:
-        clients = hyprctl_json("clients")
+        clients = compositor.query_json("clients")
         if clients is None:
-            log("restore: Hyprland IPC failed after resizing tiled windows")
+            write_log("restore: Hyprland IPC failed after resizing tiled windows")
             return None
 
     for workspace_id, workspace_rows in rows_by_workspace.items():
@@ -2309,7 +2483,7 @@ def restore_tiled_slots(rows, matches, clients):
             if workspace_id in resizable_workspaces and not two_window_geometry_matches(
                 workspace_rows, matches, current
             ):
-                log(
+                write_log(
                     f"restore: tiled geometry did not settle on workspace {workspace_id}"
                 )
                 all_ok = False
@@ -2321,14 +2495,16 @@ def restore_tiled_slots(rows, matches, clients):
             if desired == occupant:
                 continue
             other_index = slot_addresses.index(desired)
-            if not dispatch(
+            if not compositor.dispatch(
                 "hl.dsp.window.swap({ "
                 f"window = {lua_quote(f'address:{desired}')}, "
                 f"target = {lua_quote(f'address:{occupant}')} "
                 "})"
             ):
-                if hyprctl_json("clients") is None:
-                    log("restore: Hyprland IPC failed while correcting tiled slots")
+                if compositor.query_json("clients") is None:
+                    write_log(
+                        "restore: Hyprland IPC failed while correcting tiled slots"
+                    )
                     return None
                 all_ok = False
                 break
@@ -2339,17 +2515,36 @@ def restore_tiled_slots(rows, matches, clients):
     return all_ok
 
 
-def restore_tiled_layouts(rows, matches, clients, layouts, focus_context=None):
+def restore_tiled_layouts(
+    rows,
+    matches,
+    clients,
+    layouts,
+    focus_context=None,
+    *,
+    compositor=None,
+    write_log=None,
+):
+    compositor = compositor or HyprlandRestoreAdapter()
+    write_log = log if write_log is None else write_log
     nested_result = restore_nested_tiled_layouts(
-        rows, matches, clients, layouts or {}, focus_context
+        rows,
+        matches,
+        clients,
+        layouts or {},
+        focus_context,
+        compositor=compositor,
+        write_log=write_log,
     )
     if nested_result is None:
         return None
-    clients = hyprctl_json("clients")
+    clients = compositor.query_json("clients")
     if clients is None:
-        log("restore: Hyprland IPC failed after replaying tiled layouts")
+        write_log("restore: Hyprland IPC failed after replaying tiled layouts")
         return None
-    slots_result = restore_tiled_slots(rows, matches, clients)
+    slots_result = restore_tiled_slots(
+        rows, matches, clients, compositor=compositor, write_log=write_log
+    )
     if slots_result is None:
         return None
     return nested_result and slots_result
@@ -2548,13 +2743,17 @@ def launch_request(row):
     return command, rules_str, lua
 
 
-def hyprland_supports_group_restore():
-    version = hyprctl_json("version")
+def hyprland_supports_group_restore(*, compositor=None, write_log=None):
+    compositor = compositor or HyprlandRestoreAdapter()
+    write_log = log if write_log is None else write_log
+    version = compositor.query_json("version")
     if version is None:
         return None
     match = re.match(r"^v?(\d+)\.(\d+)\.(\d+)", str(version.get("version", "")))
     if not match:
-        log("restore: cannot verify Hyprland group API version; skipping groups")
+        write_log(
+            "restore: cannot verify Hyprland group API version; skipping groups"
+        )
         return False
     return tuple(map(int, match.groups())) >= (0, 56, 0)
 
@@ -2569,41 +2768,52 @@ def saved_window_groups(rows):
     )
 
 
-def restore_window_groups(rows, matches, failed_monitor_workspaces=()):
+def restore_window_groups(
+    rows,
+    matches,
+    failed_monitor_workspaces=(),
+    *,
+    compositor=None,
+    write_log=None,
+):
+    compositor = compositor or HyprlandRestoreAdapter()
+    write_log = log if write_log is None else write_log
     eligible = []
     for group in saved_window_groups(rows):
         ordered = sorted(group, key=lambda row: row.get("group_ord", -1))
         if [row.get("group_ord") for row in ordered] != list(range(len(ordered))):
-            log("restore: skipping group with invalid saved member order")
+            write_log("restore: skipping group with invalid saved member order")
             continue
         if any(row["id"] not in matches for row in ordered):
-            log("restore: skipping incomplete saved window group")
+            write_log("restore: skipping incomplete saved window group")
             continue
         if any(row.get("fullscreen") or row.get("pinned") for row in ordered):
-            log("restore: skipping fullscreen or pinned window group")
+            write_log("restore: skipping fullscreen or pinned window group")
             continue
         if any(
             row.get("workspace_id") in failed_monitor_workspaces for row in ordered
         ):
-            log("restore: skipping group after failed monitor placement")
+            write_log("restore: skipping group after failed monitor placement")
             continue
         if len({row.get("workspace_id") for row in ordered}) != 1 or len(
             {bool(row.get("floating")) for row in ordered}
         ) != 1:
-            log("restore: skipping group with inconsistent saved placement")
+            write_log("restore: skipping group with inconsistent saved placement")
             continue
         eligible.append(ordered)
 
     if not eligible:
         return True
-    supported = hyprland_supports_group_restore()
+    supported = hyprland_supports_group_restore(
+        compositor=compositor, write_log=write_log
+    )
     if supported is None:
         return None
     if not supported:
-        log("restore: Hyprland 0.56+ is required to restore window groups")
+        write_log("restore: Hyprland 0.56+ is required to restore window groups")
         return True
 
-    clients = hyprctl_json("clients")
+    clients = compositor.query_json("clients")
     if clients is None:
         return None
     client_by_address = {
@@ -2616,26 +2826,28 @@ def restore_window_groups(rows, matches, failed_monitor_workspaces=()):
         addresses = [matches[row["id"]] for row in group]
         current = [client_by_address.get(address) for address in addresses]
         if any(client is None for client in current):
-            log("restore: skipping group whose matched member disappeared")
+            write_log("restore: skipping group whose matched member disappeared")
             continue
         if any(
             (client.get("workspace") or {}).get("id") != row.get("workspace_id")
             for row, client in zip(group, current)
         ):
-            log("restore: skipping group whose members are not on their saved workspace")
+            write_log(
+                "restore: skipping group whose members are not on their saved workspace"
+            )
             continue
         if any(
             not client_match_is_unique(row, client, rows)
             or not row_match_is_unique(row, client, clients)
             for row, client in zip(group, current)
         ):
-            log("restore: skipping group with ambiguous matched members")
+            write_log("restore: skipping group with ambiguous matched members")
             continue
         grouped = [client.get("grouped") for client in current]
         if all(value == addresses for value in grouped):
             continue
         if any(value not in (None, []) for value in grouped):
-            log("restore: skipping group with conflicting current membership")
+            write_log("restore: skipping group with conflicting current membership")
             continue
 
         selectors = [lua_quote(f"address:{address}") for address in addresses]
@@ -2668,7 +2880,7 @@ def restore_window_groups(rows, matches, failed_monitor_workspaces=()):
                 for index in range(1, len(addresses) + 1)
             ),
         ]
-        eval_result = eval_lua(" ".join(operations))
+        eval_result = compositor.evaluate(" ".join(operations))
         if eval_result is None:
             return None
         if not eval_result:
@@ -2677,7 +2889,7 @@ def restore_window_groups(rows, matches, failed_monitor_workspaces=()):
 
     if not expected_groups:
         return True
-    clients = hyprctl_json("clients")
+    clients = compositor.query_json("clients")
     if clients is None:
         return None
     client_by_address = {
@@ -2690,19 +2902,21 @@ def restore_window_groups(rows, matches, failed_monitor_workspaces=()):
             client_by_address.get(address, {}).get("grouped") != addresses
             for address in addresses
         ):
-            log("restore: reconstructed window group failed verification")
+            write_log("restore: reconstructed window group failed verification")
             return False
     return True
 
 
-def _restore_windows(
-    rows,
-    initial_matches,
-    initial_clients,
-    layouts=None,
-    restore_timeout=RESTORE_TIMEOUT,
-    monitor_fallback="focused",
-):
+def _execute_restore(prepared):
+    rows = prepared._snapshot.windows
+    initial_matches = prepared._initial_matches
+    initial_clients = prepared._initial_clients
+    layouts = prepared._snapshot.workspace_layouts
+    restore_timeout = prepared._settings.timeout_seconds
+    monitor_fallback = prepared._settings.monitor_fallback
+    compositor = prepared._compositor
+    clock = prepared._clock
+    write_log = prepared._write_log
     row_by_id = {row["id"]: row for row in rows}
     matches = dict(initial_matches)
     used_addresses = {
@@ -2721,7 +2935,12 @@ def _restore_windows(
         if client.get("address")
     }
     monitor_targets, current_monitors, monitor_ipc_failed = (
-        load_workspace_monitor_context(rows, monitor_fallback)
+        load_workspace_monitor_context(
+            rows,
+            monitor_fallback,
+            compositor=compositor,
+            write_log=write_log,
+        )
     )
     if monitor_ipc_failed:
         return restored, len(rows), launched_processes, True
@@ -2738,21 +2957,33 @@ def _restore_windows(
             and current_monitors.get(workspace_id) != target
         )
         monitor_ok = prepare_workspace_monitor(
-            row, address, monitor_targets, current_monitors, prepared_workspaces
+            row,
+            address,
+            monitor_targets,
+            current_monitors,
+            prepared_workspaces,
+            compositor=compositor,
         )
         if not monitor_ok:
             failed_monitor_workspaces.add(workspace_id)
         elif monitor_will_move:
-            clients = hyprctl_json("clients")
+            clients = compositor.query_json("clients")
             if clients is None:
-                log("restore: Hyprland IPC failed after remapping workspace monitors")
+                write_log(
+                    "restore: Hyprland IPC failed after remapping workspace monitors"
+                )
                 return restored, failures + 1, launched_processes, True
             client_by_address = {
                 client.get("address"): client
                 for client in clients
                 if client.get("address")
             }
-        if monitor_ok and place_window(row, address, client_by_address.get(address)):
+        if monitor_ok and place_window(
+            row,
+            address,
+            client_by_address.get(address),
+            compositor=compositor,
+        ):
             restored += 1
             placed.add(row_id)
         else:
@@ -2769,28 +3000,30 @@ def _restore_windows(
             "rows": group,
             "attempts": 0,
             "max_attempts": len(missing),
-            "next_retry": time.monotonic(),
+            "next_retry": clock.monotonic(),
             "launch_row": launch_row,
         }
         states.append(state)
 
         # A partially restored process may still be creating its other windows.
         if any(row["id"] in matches for row in group):
-            state["next_retry"] = time.monotonic() + RESTORE_RETRY_DELAY
+            state["next_retry"] = clock.monotonic() + RESTORE_RETRY_DELAY
             continue
         _, _, lua = launch_request(launch_row)
-        if dispatch(lua, failure_context="restore: application launch"):
+        if compositor.dispatch(
+            lua, failure_context="restore: application launch"
+        ):
             state["attempts"] = 1
-            state["next_retry"] = time.monotonic() + RESTORE_RETRY_DELAY
+            state["next_retry"] = clock.monotonic() + RESTORE_RETRY_DELAY
             launched_processes += 1
         else:
             state["attempts"] = state["max_attempts"]
 
-    deadline = time.monotonic() + restore_timeout
-    while len(handled) < len(rows) and time.monotonic() < deadline:
-        clients = hyprctl_json("clients")
+    deadline = clock.monotonic() + restore_timeout
+    while len(handled) < len(rows) and clock.monotonic() < deadline:
+        clients = compositor.query_json("clients")
         if clients is None:
-            log("restore: Hyprland IPC failed while waiting for windows")
+            write_log("restore: Hyprland IPC failed while waiting for windows")
             return (
                 restored,
                 failures + len(rows) - len(handled),
@@ -2815,14 +3048,21 @@ def _restore_windows(
                 and current_monitors.get(workspace_id) != target
             )
             monitor_ok = prepare_workspace_monitor(
-                row, address, monitor_targets, current_monitors, prepared_workspaces
+                row,
+                address,
+                monitor_targets,
+                current_monitors,
+                prepared_workspaces,
+                compositor=compositor,
             )
             if not monitor_ok:
                 failed_monitor_workspaces.add(workspace_id)
             elif monitor_will_move:
-                clients = hyprctl_json("clients")
+                clients = compositor.query_json("clients")
                 if clients is None:
-                    log("restore: Hyprland IPC failed after remapping workspace monitors")
+                    write_log(
+                        "restore: Hyprland IPC failed after remapping workspace monitors"
+                    )
                     return restored, failures + 1, launched_processes, True
                 client_by_address = {
                     client.get("address"): client
@@ -2830,7 +3070,10 @@ def _restore_windows(
                     if client.get("address")
                 }
             if monitor_ok and place_window(
-                row, address, client_by_address.get(address)
+                row,
+                address,
+                client_by_address.get(address),
+                compositor=compositor,
             ):
                 restored += 1
                 placed.add(row_id)
@@ -2845,15 +3088,22 @@ def _restore_windows(
             for row in rows
         ):
             tiled_result = restore_tiled_layouts(
-                rows, matches, clients, layouts or {}
+                rows,
+                matches,
+                clients,
+                layouts or {},
+                compositor=compositor,
+                write_log=write_log,
             )
             if tiled_result is None:
-                log("restore: Hyprland IPC failed while replaying tiled layouts")
+                write_log(
+                    "restore: Hyprland IPC failed while replaying tiled layouts"
+                )
                 return restored, failures, launched_processes, True
             if not tiled_result:
                 failures += 1
 
-        now = time.monotonic()
+        now = clock.monotonic()
         for state in states:
             missing = [row for row in state["rows"] if row["id"] not in handled]
             if (
@@ -2862,7 +3112,9 @@ def _restore_windows(
                 and now >= state["next_retry"]
             ):
                 _, _, lua = launch_request(state["launch_row"])
-                if dispatch(lua, failure_context="restore: application launch"):
+                if compositor.dispatch(
+                    lua, failure_context="restore: application launch"
+                ):
                     launched_processes += 1
                     state["attempts"] += 1
                     state["next_retry"] = now + RESTORE_RETRY_DELAY
@@ -2870,23 +3122,23 @@ def _restore_windows(
                     state["attempts"] = state["max_attempts"]
 
         if len(handled) < len(rows):
-            time.sleep(RESTORE_POLL_INTERVAL)
+            clock.sleep(RESTORE_POLL_INTERVAL)
 
     for row in rows:
         if row["id"] not in handled:
             failures += 1
-            log(f"restore: no window appeared for {row['class']}")
-    focus_context = load_focus_context()
+            write_log(f"restore: no window appeared for {row['class']}")
+    focus_context = load_focus_context(compositor=compositor)
     if focus_context is None:
-        log(
+        write_log(
             "restore: Hyprland IPC failed while recording focus; "
             "tiled/group correction will still run"
         )
         failures += 1
     if any(not row.get("floating") and saved_geometry(row) is not None for row in rows):
-        clients = hyprctl_json("clients")
+        clients = compositor.query_json("clients")
         if clients is None:
-            log("restore: Hyprland IPC failed while correcting tiled slots")
+            write_log("restore: Hyprland IPC failed while correcting tiled slots")
             return restored, failures, launched_processes, True
         tiled_matches = {
             row_id: address
@@ -2894,34 +3146,52 @@ def _restore_windows(
             if row_by_id[row_id].get("workspace_id") not in failed_monitor_workspaces
         }
         tiled_result = restore_tiled_layouts(
-            rows, tiled_matches, clients, layouts or {}, focus_context
+            rows,
+            tiled_matches,
+            clients,
+            layouts or {},
+            focus_context,
+            compositor=compositor,
+            write_log=write_log,
         )
         if tiled_result is None:
-            log("restore: Hyprland IPC failed while replaying tiled layouts")
+            write_log("restore: Hyprland IPC failed while replaying tiled layouts")
             return restored, failures, launched_processes, True
         if not tiled_result:
             failures += 1
     floating_result = verify_floating_placements(
-        rows, {row_id: matches[row_id] for row_id in placed}
+        rows,
+        {row_id: matches[row_id] for row_id in placed},
+        compositor=compositor,
+        clock=clock,
+        write_log=write_log,
     )
     if floating_result is None:
-        log("restore: Hyprland IPC failed while verifying floating geometry")
+        write_log("restore: Hyprland IPC failed while verifying floating geometry")
         return restored, failures, launched_processes, True
     if not floating_result:
         failures += 1
-    group_result = restore_window_groups(rows, matches, failed_monitor_workspaces)
+    group_result = restore_window_groups(
+        rows,
+        matches,
+        failed_monitor_workspaces,
+        compositor=compositor,
+        write_log=write_log,
+    )
     if group_result is None:
-        log("restore: Hyprland IPC failed while restoring window groups")
+        write_log("restore: Hyprland IPC failed while restoring window groups")
         return restored, failures, launched_processes, True
     if not group_result:
         failures += 1
     if focus_context is not None:
-        focus_result = restore_focus_context(focus_context)
+        focus_result = restore_focus_context(
+            focus_context, compositor=compositor
+        )
         if focus_result is None:
-            log("restore: Hyprland IPC failed while restoring focus")
+            write_log("restore: Hyprland IPC failed while restoring focus")
             return restored, failures, launched_processes, True
         if not focus_result:
-            log("restore: failed to restore the previously focused workspace")
+            write_log("restore: failed to restore the previously focused workspace")
             failures += 1
     return restored, failures, launched_processes, False
 
@@ -2934,50 +3204,60 @@ class RestoreOutcome:
     retryable_failure: bool
 
 
-class HyprlandRestoreAdapter:
-    """Production adapter for the private Hyprland restore implementation."""
-
-    def restore(self, rows, initial_matches, clients, layouts, timeout, monitor_fallback):
-        return _restore_windows(
-            rows, initial_matches, clients, layouts, timeout, monitor_fallback
-        )
-
-    def animations_disabled(self):
-        return animations_disabled()
-
-
-class RestoreRun:
-    """Apply one selected Snapshot through the restore-run seam."""
+class PreparedRestore:
+    __slots__ = (
+        "_clock",
+        "_compositor",
+        "_executed",
+        "_initial_clients",
+        "_initial_matches",
+        "_settings",
+        "_snapshot",
+        "_write_log",
+    )
 
     def __init__(
         self,
-        rows,
+        snapshot,
+        settings,
         initial_matches,
-        clients,
-        layouts,
-        timeout,
-        monitor_fallback,
+        initial_clients,
         compositor,
+        clock,
+        write_log,
     ):
-        self.rows = rows
-        self.initial_matches = initial_matches
-        self.clients = clients
-        self.layouts = layouts
-        self.timeout = timeout
-        self.monitor_fallback = monitor_fallback
-        self.compositor = compositor
+        self._snapshot = snapshot
+        self._settings = settings
+        self._initial_matches = initial_matches
+        self._initial_clients = initial_clients
+        self._compositor = compositor
+        self._clock = clock
+        self._write_log = write_log
+        self._executed = False
 
-    def run(self):
-        with self.compositor.animations_disabled():
+    def preview(self):
+        launches = []
+        maximum_processes = 0
+        for group in process_groups(self._snapshot.windows):
+            missing = [
+                row for row in group if row["id"] not in self._initial_matches
+            ]
+            if not missing:
+                continue
+            command, rules, _ = launch_request(process_launch_row(group))
+            launches.append((group[0]["class"], command, rules, len(missing)))
+            maximum_processes += len(missing)
+        return tuple(launches), maximum_processes
+
+    def execute(self):
+        if self._executed:
+            raise RuntimeError("a prepared Restore run can execute only once")
+        self._executed = True
+        with animations_disabled(
+            compositor=self._compositor, write_log=self._write_log
+        ):
             restored, failures, launched_processes, retryable_failure = (
-                self.compositor.restore(
-                    self.rows,
-                    self.initial_matches,
-                    self.clients,
-                    self.layouts,
-                    self.timeout,
-                    self.monitor_fallback,
-                )
+                _execute_restore(self)
             )
         return RestoreOutcome(
             restored_windows=restored,
@@ -2985,6 +3265,49 @@ class RestoreRun:
             launched_processes=launched_processes,
             retryable_failure=retryable_failure,
         )
+
+
+class RestoreObservation:
+    __slots__ = ("_clients", "_runner")
+
+    def __init__(self, runner, clients):
+        self._runner = runner
+        self._clients = clients
+
+    def prepare(self, snapshot, settings):
+        initial_matches = match_windows(snapshot.windows, self._clients, max_rank=2)
+        return PreparedRestore(
+            snapshot,
+            settings,
+            initial_matches,
+            self._clients,
+            self._runner._compositor,
+            self._runner._clock,
+            self._runner._write_log,
+        )
+
+
+class RestoreRun:
+    """Observe and prepare one selected Snapshot for a Restore run."""
+
+    __slots__ = ("_clock", "_compositor", "_write_log")
+
+    def __init__(self, compositor=None, clock=None, write_log=None):
+        self._write_log = log if write_log is None else write_log
+        self._compositor = compositor or HyprlandRestoreAdapter(
+            write_log=write_log
+        )
+        self._clock = clock or SystemClockAdapter()
+
+    def observe(self):
+        clients = self._compositor.query_json("clients")
+        if clients is None:
+            return None
+        return RestoreObservation(self, clients)
+
+    def prepare(self, snapshot, settings):
+        observation = self.observe()
+        return None if observation is None else observation.prepare(snapshot, settings)
 
 
 def cmd_restore(dry_run=False, name=None):
@@ -3013,8 +3336,12 @@ def cmd_restore(dry_run=False, name=None):
                 return 75
             return 0 if dry_run or mark_restore_completed(None) else 75
         sid, _, _ = sess
-        clients = hyprctl_json("clients")
-        if not os.environ.get("HYPRLAND_INSTANCE_SIGNATURE") or clients is None:
+        if not os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+            print("restore failed: Hyprland IPC is unavailable", file=sys.stderr)
+            conn.close()
+            return 75
+        observation = RestoreRun().observe()
+        if observation is None:
             print("restore failed: Hyprland IPC is unavailable", file=sys.stderr)
             conn.close()
             return 75
@@ -3031,41 +3358,35 @@ def cmd_restore(dry_run=False, name=None):
             conn.close()
             print("saved session is empty; nothing to restore")
             return 0 if dry_run or mark_restore_completed(sid) else 75
-        initial_matches = match_windows(rows, clients, max_rank=2)
-
+        layouts = load_workspace_layouts(conn, sid)
+        snapshot = Snapshot(sid, rows, layouts)
+        prepared = observation.prepare(
+            snapshot,
+            RestoreSettings(
+                timeout_seconds=cfg["restore_timeout_seconds"],
+                monitor_fallback=cfg["monitor_fallback"],
+            ),
+        )
         if dry_run:
-            launched_processes = 0
-            for group in process_groups(rows):
-                missing = [row for row in group if row["id"] not in initial_matches]
-                if missing:
-                    launch_cmd, rules_str, _ = launch_request(process_launch_row(group))
-                    print(
-                        f"[dry-run] {group[0]['class']}: {launch_cmd}  "
-                        f"rules={{ {rules_str} }}  launches<= {len(missing)}"
-                    )
-                    launched_processes += len(missing)
+            launches, launched_processes = prepared.preview()
+            for class_name, launch_cmd, rules_str, maximum_launches in launches:
+                print(
+                    f"[dry-run] {class_name}: {launch_cmd}  "
+                    f"rules={{ {rules_str} }}  launches<= {maximum_launches}"
+                )
             print(
                 f"would launch up to {launched_processes} processes for {len(rows)} windows"
             )
             conn.close()
             return 0
 
-        layouts = load_workspace_layouts(conn, sid)
         conn.close()
 
         if not mark_restore_completed(sid, complete=False):
             print("restore deferred: could not persist restore state", file=sys.stderr)
             return 75
 
-        outcome = RestoreRun(
-            rows,
-            initial_matches,
-            clients,
-            layouts,
-            cfg["restore_timeout_seconds"],
-            cfg["monitor_fallback"],
-            HyprlandRestoreAdapter(),
-        ).run()
+        outcome = prepared.execute()
         print(f"restored {outcome.restored_windows}/{len(rows)} windows")
         log(
             f"restore: restored {outcome.restored_windows}/{len(rows)} windows from "

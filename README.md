@@ -60,10 +60,12 @@ After installation the widget shows three actions:
 - **Manual** — disables autosave and saves the current session immediately.
 - **Restore** — opens a picker of named sessions to relaunch.
 
-On a fresh install autosave defaults to manual mode. Selecting **Active**
-captures the current desktop once and enables the periodic saver. A restore then
-runs at the next graphical login via `omarchy-sesh.service`; the autosave
-service is ordered after it and waits one interval before its first capture.
+On a fresh install autosave defaults to Active mode. Selecting **Manual**
+disables periodic autosave and captures the current desktop immediately;
+selecting **Active** again captures a new baseline and re-enables the periodic
+saver. A restore runs at the next graphical login via `omarchy-sesh.service`;
+the autosave service is ordered after it and waits one interval before its first
+capture.
 Saves before logout, reboot, or shutdown happen synchronously so the reboot
 snapshot is never superseded by a periodic capture during teardown.
 
