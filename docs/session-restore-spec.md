@@ -241,9 +241,10 @@ the service retries after two seconds.
      launch each through `omarchy-launch-webapp`, because the base Chromium
      process does not reopen those windows after reboot. Chromium's `Default`
      and `Profile_N` class suffixes are treated as the same web-app identity.
-   - Zen receives at most one launch per saved process group. Zen's own session
-     restoration must recreate the group's remaining windows; generic retries
-     would create empty browser windows instead.
+   - Zen and normal Chromium-family browsers receive at most one launch per
+     saved process group. If any window from such a group is already present,
+     no launch is sent. The browser's own session restoration must recreate the
+     remaining windows; generic retries would create empty windows instead.
    - Launch through `hl.dsp.exec_cmd` with the saved silent workspace and
      floating rules.
    - Discover windows by polling and matching class, initial class/title,

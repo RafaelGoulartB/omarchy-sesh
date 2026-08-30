@@ -49,15 +49,14 @@ DEFAULT_CONFIG = {
 
 DEFAULT_EXCLUDE = set(DEFAULT_CONFIG["exclude_classes"])
 CHROMIUM_NORMAL_CLASSES = {"chromium", "chromium-browser"}
-SINGLE_LAUNCH_CLASSES = {"zen"}
-GRACEFUL_QUIT_CLASSES = {
-    "chromium",
-    "chromium-browser",
+GOOGLE_CHROME_NORMAL_CLASSES = {
     "google-chrome",
     "google-chrome-beta",
     "google-chrome-unstable",
-    "zen",
 }
+NORMAL_BROWSER_CLASSES = CHROMIUM_NORMAL_CLASSES | GOOGLE_CHROME_NORMAL_CLASSES
+SINGLE_LAUNCH_CLASSES = NORMAL_BROWSER_CLASSES | {"zen"}
+GRACEFUL_QUIT_CLASSES = SINGLE_LAUNCH_CLASSES
 RESTORE_TIMEOUT = 20.0
 RESTORE_RETRY_DELAY = 2.0
 RESTORE_POLL_INTERVAL = 0.05
@@ -2941,14 +2940,19 @@ def process_groups(rows):
 
 def process_launch_row(rows):
     return next(
-        (row for row in rows if row.get("class") in CHROMIUM_NORMAL_CLASSES),
+        (row for row in rows if row.get("class") in NORMAL_BROWSER_CLASSES),
         rows[0],
     )
 
 
+def session_aware_browser_group(rows):
+    return bool(rows) and all(
+        row.get("class") in SINGLE_LAUNCH_CLASSES for row in rows
+    )
+
+
 def process_launch_attempts(rows, missing_count):
-    launch_row = process_launch_row(rows)
-    if launch_row.get("class") in SINGLE_LAUNCH_CLASSES:
+    if session_aware_browser_group(rows):
         return min(1, missing_count)
     return missing_count
 
@@ -2970,7 +2974,7 @@ def launch_command(row):
     if webapp_url:
         return shlex.join(["omarchy-launch-webapp", webapp_url])
     command = normalized_cmdline(row["cmdline"])
-    if row.get("class") in CHROMIUM_NORMAL_CLASSES:
+    if row.get("class") in NORMAL_BROWSER_CLASSES:
         try:
             argv = shlex.split(command)
             filtered = []
@@ -3272,8 +3276,12 @@ def _execute_restore(prepared):
         }
         states.append(state)
 
-        # A partially restored process may still be creating its other windows.
+        # Session-aware browsers create all of their saved windows from one
+        # process launch. Once any window exists, another launch only creates
+        # an unwanted empty browser window, so wait for the process instead.
         if any(row["id"] in matches for row in group):
+            if session_aware_browser_group(group):
+                state["attempts"] = state["max_attempts"]
             state["next_retry"] = clock.monotonic() + RESTORE_RETRY_DELAY
             continue
         _, _, lua = launch_request(launch_row)

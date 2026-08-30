@@ -235,6 +235,11 @@ and `kill -9`: browsers use many subprocesses, and force-killing them can turn a
 normal session save into crash recovery. Chrome still needs **Continue where
 you left off** enabled for tab restoration.
 
+Zen and normal Chromium-family browsers are launched at most once for each
+saved process group. Their own session manager is responsible for creating all
+saved browser windows; if one of those windows is already present, the restore
+waits for the remaining windows instead of launching another empty one.
+
 Exact dwindle tree replay, including two-window ratios, requires a schema-v5
 snapshot, `dwindle:use_active_for_splits =
 true`, `dwindle:preserve_split = true`,

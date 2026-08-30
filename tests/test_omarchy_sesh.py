@@ -1919,6 +1919,11 @@ class OmarchySeshTests(unittest.TestCase):
         }
         self.assertEqual(1, self.module.client_matches(row, client))
 
+    def test_google_chrome_does_not_alias_a_separate_chromium_browser(self):
+        self.assertFalse(
+            self.module.window_classes_match("google-chrome", "chromium")
+        )
+
     def test_match_prefers_current_title_when_initial_titles_are_blank(self):
         rows = [
             window(1, 0, "terminal", 10, title="Second"),
@@ -2641,6 +2646,43 @@ class OmarchySeshTests(unittest.TestCase):
         self.assertEqual(1, result)
         self.assertEqual(1, dispatch.call_count)
         self.assertEqual(1, place.call_count)
+
+    def test_google_chrome_launches_once_for_three_saved_windows(self):
+        rows = [
+            window(1, 0, "google-chrome", 10),
+            window(2, 1, "google-chrome", 10),
+            window(3, 2, "google-chrome", 10),
+        ]
+        result, dispatch, place = self.run_restore(
+            rows,
+            wait_matches={1: "0x1"},
+            appearances={1: 1},
+        )
+        self.assertEqual(1, result)
+        self.assertEqual(1, dispatch.call_count)
+        self.assertEqual(1, place.call_count)
+
+    def test_partially_restored_google_chrome_is_not_launched_again(self):
+        rows = [
+            window(1, 0, "google-chrome", 10, title="First"),
+            window(2, 1, "google-chrome", 10, title="Second"),
+            window(3, 2, "google-chrome", 10, title="Third"),
+        ]
+        clients = [
+            {
+                "mapped": True,
+                "address": "0x1",
+                "class": "google-chrome",
+                "initialClass": "google-chrome",
+                "title": "First",
+                "initialTitle": "",
+                "workspace": {"id": 1},
+            }
+        ]
+        result, dispatch, place = self.run_restore(rows, clients=clients)
+        self.assertEqual(1, result)
+        dispatch.assert_not_called()
+        place.assert_called_once()
 
     def test_existing_workspace_match_avoids_duplicate_launch(self):
         row = window(1, 0, "terminal", 10, title="Saved")

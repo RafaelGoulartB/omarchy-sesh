@@ -4,6 +4,12 @@ All notable changes to `omarchy-sesh` are documented here.
 
 ## Unreleased
 
+### Fixed
+
+- Google Chrome now launches only once for a saved multi-window process and is
+  not launched again after any restored window appears, preventing one extra
+  empty window per saved Chrome window.
+
 ## v0.3.0 - 2026-08-30
 
 ### Added
