@@ -112,6 +112,7 @@ def workspace_layout(workspace_id=1, width=1000, height=1000, complete=1):
         "gap_right": 0,
         "gap_bottom": 0,
         "gap_left": 0,
+        "focused_ord": None,
         "complete": complete,
     }
 
@@ -602,6 +603,12 @@ class OmarchySeshTests(unittest.TestCase):
             "SELECT capture_status FROM sessions WHERE id = 1"
         ).fetchone()[0]
         columns = {row[1] for row in conn.execute("PRAGMA table_info(windows)")}
+        session_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(sessions)")
+        }
+        layout_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(workspace_layouts)")
+        }
         tables = {
             row[0]
             for row in conn.execute(
@@ -619,9 +626,11 @@ class OmarchySeshTests(unittest.TestCase):
         self.assertIn("monitor_description", columns)
         self.assertIn("group_id", columns)
         self.assertIn("group_ord", columns)
+        self.assertIn("active_workspace_id", session_columns)
+        self.assertIn("focused_ord", layout_columns)
         self.assertIn("workspace_layouts", tables)
         self.assertIn("named_sessions", tables)
-        self.assertEqual(6, version)
+        self.assertEqual(7, version)
         self.assertEqual(("terminal", None, None), migrated)
 
     def test_named_snapshot_is_retained_and_excluded_from_default_restore(self):
@@ -857,6 +866,14 @@ class OmarchySeshTests(unittest.TestCase):
         conn.close()
         self.assertEqual((1, 0), (loaded[0]["group_id"], loaded[0]["group_ord"]))
 
+    def test_session_active_workspace_persists_round_trip(self):
+        sid = self.module.persist_snapshot(
+            "periodic", "complete", "", [], active_workspace_id=6
+        )
+        conn = self.module.db_conn()
+        self.assertEqual(6, self.module.load_active_workspace_id(conn, sid))
+        conn.close()
+
     def test_workspace_layout_metadata_persists_round_trip(self):
         layout = workspace_layout()
         sid = self.module.persist_snapshot(
@@ -1085,17 +1102,28 @@ class OmarchySeshTests(unittest.TestCase):
                         dict(
                             live_workspace_context()[1][0],
                             description="Dell Display",
+                            focused=True,
+                            activeWorkspace={"id": 1},
                         )
                     ],
                     "complete",
                     [],
-                    workspaces=[{"id": 1, "tiledLayout": "dwindle"}],
+                    workspaces=[
+                        {
+                            "id": 1,
+                            "tiledLayout": "dwindle",
+                            "lastwindow": "0x2",
+                        }
+                    ],
                     gaps_out=[0, 0, 0, 0],
                     gaps_in=[0, 0, 0, 0],
                 ),
             )
 
-        self.assertEqual([workspace_layout()], persist.call_args.args[4])
+        expected_layout = workspace_layout()
+        expected_layout["focused_ord"] = 1
+        self.assertEqual([expected_layout], persist.call_args.args[4])
+        self.assertEqual(1, persist.call_args.kwargs["active_workspace_id"])
 
     def test_workspace_layout_is_incomplete_when_tiled_client_is_not_captured(self):
         clients = [
@@ -2603,6 +2631,17 @@ class OmarchySeshTests(unittest.TestCase):
         self.assertEqual({self.module.RESTORE_POLL_INTERVAL}, set(sleep_intervals))
         self.assertEqual(0.05, self.module.RESTORE_POLL_INTERVAL)
 
+    def test_zen_process_is_launched_only_once_when_windows_remain_missing(self):
+        rows = [window(1, 0, "zen", 10), window(2, 1, "zen", 10)]
+        result, dispatch, place = self.run_restore(
+            rows,
+            wait_matches={1: "0x1"},
+            appearances={1: 1},
+        )
+        self.assertEqual(1, result)
+        self.assertEqual(1, dispatch.call_count)
+        self.assertEqual(1, place.call_count)
+
     def test_existing_workspace_match_avoids_duplicate_launch(self):
         row = window(1, 0, "terminal", 10, title="Saved")
         client = {
@@ -2684,6 +2723,40 @@ class OmarchySeshTests(unittest.TestCase):
         polls = [index for index, event in enumerate(events) if event == "poll"]
         self.assertGreaterEqual(len(polls), 2)
         self.assertLess(events.index("tiled"), polls[1])
+
+    def test_appimage_capture_replaces_transient_mount_executable(self):
+        executable = Path(self.tempdir.name) / "T3-Code.AppImage"
+        executable.write_text("appimage")
+        executable.chmod(0o755)
+        with mock.patch.object(
+            self.module,
+            "proc_environ",
+            return_value={
+                "APPIMAGE": str(executable),
+                "APPDIR": "/tmp/.mount_T3-Code",
+            },
+        ):
+            argv = self.module.canonical_appimage_argv(
+                10, ["/tmp/.mount_T3-Code/t3code", "--no-sandbox"]
+            )
+        self.assertEqual([str(executable), "--no-sandbox"], argv)
+
+    def test_appimage_capture_rejects_unrelated_environment_path(self):
+        executable = Path(self.tempdir.name) / "T3-Code.AppImage"
+        executable.write_text("appimage")
+        executable.chmod(0o755)
+        original = ["/usr/bin/terminal", "--new-window"]
+        with mock.patch.object(
+            self.module,
+            "proc_environ",
+            return_value={
+                "APPIMAGE": str(executable),
+                "APPDIR": "/tmp/.mount_T3-Code",
+            },
+        ):
+            self.assertEqual(
+                original, self.module.canonical_appimage_argv(10, original)
+            )
 
     def test_launched_window_is_discovered_before_workspace_placement(self):
         row = window(1, 0, "terminal", 10, title="Saved")
@@ -3022,7 +3095,9 @@ class OmarchySeshTests(unittest.TestCase):
         ]
         with (
             mock.patch.object(
-                self.module, "hyprctl_json", return_value=[{"workspaceString": "1"}]
+                self.module,
+                "hyprctl_json",
+                return_value=[{"workspaceString": "1", "gapsOut": [0]}],
             ) as hyprctl,
             mock.patch.object(self.module, "replay_workspace_tree") as replay,
             mock.patch.object(self.module, "log"),
@@ -3038,6 +3113,21 @@ class OmarchySeshTests(unittest.TestCase):
             )
         hyprctl.assert_called_once_with("workspacerules")
         replay.assert_not_called()
+
+    def test_enabled_only_workspace_rules_do_not_disable_geometry_restore(self):
+        self.assertFalse(
+            self.module.workspace_rules_have_effects(
+                [
+                    {"workspaceString": "2", "enabled": True},
+                    {"workspaceString": "6", "enabled": True},
+                ]
+            )
+        )
+        self.assertTrue(
+            self.module.workspace_rules_have_effects(
+                [{"workspaceString": "2", "enabled": True, "gapsOut": [0]}]
+            )
+        )
 
     def test_nested_replay_failure_recovers_staged_windows(self):
         rows = self.nested_workspace()
@@ -3157,6 +3247,82 @@ class OmarchySeshTests(unittest.TestCase):
                 self.module.restore_focus_context({"address": "", "workspace_id": 5})
             )
         dispatch.assert_called_once_with("hl.dsp.focus({ workspace = 5 })")
+
+    def test_scrolling_viewport_restores_uniform_saved_translation(self):
+        first = window(1, 0, "zen", 10)
+        second = window(2, 1, "terminal", 20)
+        first.update(at_x=0, at_y=0, size_w=500, size_h=1000)
+        second.update(at_x=500, at_y=0, size_w=500, size_h=1000)
+        shifted = [
+            tiled_client(first, "0xa", [-100, 0], [500, 1000]),
+            tiled_client(second, "0xb", [400, 0], [500, 1000]),
+        ]
+        restored = [
+            tiled_client(first, "0xa", [0, 0], [500, 1000]),
+            tiled_client(second, "0xb", [500, 0], [500, 1000]),
+        ]
+        dispatch = mock.Mock(return_value=True)
+
+        class Compositor:
+            def query_json(self, endpoint, *_args):
+                self.assert_endpoint = endpoint
+                return shifted if self.queries == 0 else restored
+
+            queries = 0
+
+            def dispatch(self, lua, failure_context=None):
+                if "focus({ window" in lua:
+                    self.queries = 0
+                if "layout([[move" in lua:
+                    self.queries = 1
+                return dispatch(lua, failure_context=failure_context)
+
+        layout = workspace_layout()
+        layout.update(layout="scrolling", focused_ord=0)
+        self.assertTrue(
+            self.module.restore_scrolling_viewports(
+                [first, second],
+                {1: "0xa", 2: "0xb"},
+                shifted,
+                {1: layout},
+                compositor=Compositor(),
+            )
+        )
+        self.assertTrue(
+            any(
+                "hl.dsp.layout([[move +100]])" in call.args[0]
+                for call in dispatch.call_args_list
+            )
+        )
+
+    def test_scrolling_viewport_reports_failure_when_inhibition_cannot_release(self):
+        row = window(1, 0, "zen", 10)
+        row.update(at_x=0, at_y=0, size_w=500, size_h=1000)
+        shifted = [tiled_client(row, "0xa", [-100, 0], [500, 1000])]
+        restored = [tiled_client(row, "0xa", [0, 0], [500, 1000])]
+
+        class Compositor:
+            queries = 0
+
+            def query_json(self, endpoint, *_args):
+                self.queries += 1
+                return shifted if self.queries == 1 else restored
+
+            def dispatch(self, lua, failure_context=None):
+                return "inhibit_scroll false" not in lua
+
+        layout = workspace_layout()
+        layout.update(layout="scrolling", focused_ord=0)
+        self.assertFalse(
+            self.module.restore_scrolling_viewports(
+                [row],
+                {1: "0xa"},
+                shifted,
+                {1: layout},
+                compositor=Compositor(),
+                write_log=lambda _message: None,
+            )
+        )
 
     def test_focus_restore_reopens_special_workspace_on_saved_monitor(self):
         before = [
@@ -4326,6 +4492,141 @@ class OmarchySeshTests(unittest.TestCase):
             self.module.mark_restore_completed(7, complete=False)
             self.assertFalse(self.module.restore_is_ready())
 
+    def test_autosave_recovers_gate_after_missing_window_appears(self):
+        row = window(1, 0, "t3code", 10)
+        sid = self.module.persist_snapshot("logout", "complete", "", [row])
+        client = tiled_client(row, "0x1", [0, 0], [1000, 1000])
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"HYPRLAND_INSTANCE_SIGNATURE": "instance-1"},
+                clear=False,
+            ),
+            mock.patch.object(self.module, "hyprctl_json", return_value=[client]),
+        ):
+            self.module.mark_restore_completed(sid, complete=False)
+            self.assertTrue(self.module.recover_completed_restore_gate())
+            self.assertTrue(self.module.restore_is_ready())
+
+    def test_graceful_power_quit_sends_one_ctrl_q_per_zen_process(self):
+        clients = [
+            {
+                "mapped": True,
+                "class": "zen",
+                "pid": 10,
+                "address": "0xa",
+            },
+            {
+                "mapped": True,
+                "class": "zen",
+                "pid": 10,
+                "address": "0xb",
+            },
+        ]
+
+        class Compositor:
+            def __init__(self):
+                self.queries = 0
+                self.requests = []
+
+            def query_json(self, endpoint, *_args):
+                self.queries += 1
+                return clients if self.queries == 1 else []
+
+            def dispatch(self, lua, failure_context=None):
+                self.requests.append(lua)
+                return True
+
+        class Clock:
+            def monotonic(self):
+                return 0
+
+            def sleep(self, _seconds):
+                pass
+
+        compositor = Compositor()
+        self.assertTrue(
+            self.module.graceful_quit_applications(
+                compositor=compositor, clock=Clock(), write_log=lambda _msg: None
+            )
+        )
+        self.assertEqual(1, len(compositor.requests))
+        self.assertIn("mods = [[CTRL]]", compositor.requests[0])
+        self.assertIn("key = [[Q]]", compositor.requests[0])
+
+    def test_graceful_power_quit_waits_for_replacement_zen_process(self):
+        initial = [
+            {"mapped": True, "class": "zen", "pid": 10, "address": "0xa"}
+        ]
+        replacement = [
+            {"mapped": True, "class": "zen", "pid": 20, "address": "0xb"}
+        ]
+
+        class Compositor:
+            responses = iter((initial, replacement, []))
+
+            def query_json(self, endpoint, *_args):
+                return next(self.responses)
+
+            def dispatch(self, lua, failure_context=None):
+                return True
+
+        class Clock:
+            ticks = 0
+
+            def monotonic(self):
+                self.ticks += 1
+                return self.ticks * 0.05
+
+            def sleep(self, _seconds):
+                pass
+
+        clock = Clock()
+        self.assertTrue(
+            self.module.graceful_quit_applications(
+                compositor=Compositor(), clock=clock, write_log=lambda _msg: None
+            )
+        )
+        self.assertGreaterEqual(clock.ticks, 3)
+
+    def test_prepare_power_active_mode_quits_apps_even_when_snapshot_fails(self):
+        with (
+            mock.patch.object(
+                self.module, "power_snapshot_mode", return_value="active"
+            ),
+            mock.patch.object(self.module, "cmd_save", return_value=1) as save,
+            mock.patch.object(
+                self.module, "graceful_quit_applications", return_value=True
+            ) as quit_apps,
+        ):
+            self.assertEqual(1, self.module.cmd_prepare_power())
+        save.assert_called_once_with("logout", wait=True)
+        quit_apps.assert_called_once()
+
+    def test_prepare_power_manual_mode_preserves_selected_snapshot(self):
+        with (
+            mock.patch.object(
+                self.module, "power_snapshot_mode", return_value="manual"
+            ),
+            mock.patch.object(self.module, "cmd_save") as save,
+            mock.patch.object(self.module, "graceful_quit_applications") as quit_apps,
+            mock.patch.object(self.module, "log") as logged,
+        ):
+            self.assertEqual(0, self.module.cmd_prepare_power())
+        save.assert_not_called()
+        quit_apps.assert_not_called()
+        self.assertIn("manual snapshot", logged.call_args.args[0])
+
+    def test_power_snapshot_mode_reads_systemd_enablement(self):
+        enabled = mock.Mock(returncode=0, stdout="enabled\n")
+        disabled = mock.Mock(returncode=1, stdout="disabled\n")
+        with mock.patch.object(
+            self.module.subprocess, "run", side_effect=[enabled, disabled]
+        ) as run:
+            self.assertEqual("active", self.module.power_snapshot_mode())
+            self.assertEqual("manual", self.module.power_snapshot_mode())
+        self.assertEqual(2, run.call_count)
+
     def test_autosave_refreshes_compositor_instance_from_user_manager(self):
         result = mock.Mock(
             returncode=0,
@@ -4578,7 +4879,7 @@ class OmarchySeshTests(unittest.TestCase):
     def test_first_install_enables_autosave(self):
         calls, _, marker = self.run_installer(autosave_unit_exists=False)
         self.assertIn("--user enable omarchy-sesh-autosave.service", calls)
-        self.assertEqual("0.2.7", marker)
+        self.assertEqual("0.3.0", marker)
 
     def test_installer_creates_owner_only_state(self):
         _, _, _, modes = self.run_installer(
@@ -4642,7 +4943,7 @@ class OmarchySeshTests(unittest.TestCase):
 
     def test_power_action_quotes_home_binary_path(self):
         _, menu, _ = self.run_installer(autosave_unit_exists=False)
-        self.assertIn(r"\"$HOME/.local/bin/omarchy-sesh\" save", menu)
+        self.assertIn(r"\"$HOME/.local/bin/omarchy-sesh\" prepare-power", menu)
 
     def run_uninstaller(self, stop_status=0, active_status=3):
         temporary = tempfile.TemporaryDirectory()

@@ -23,7 +23,7 @@ Panel {
   readonly property bool modeKnown: service.modeKnown
   readonly property var options: [
     { title: "Active", detail: "Enable automatic session snapshots", icon: "󰐊" },
-    { title: "Manual", detail: "Disable autosave and save now", icon: "󰆓" },
+    { title: "Manual", detail: "Save now and preserve it through shutdown", icon: "󰆓" },
     { title: "Restore", detail: "Choose a saved session to restore", icon: "󰑓" }
   ]
 

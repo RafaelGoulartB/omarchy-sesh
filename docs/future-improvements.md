@@ -11,7 +11,8 @@
 - [ ] **Omarchy plugin**: load the widget in the live shell, inspect both shield
       states, and exercise Active, Manual, and Restore.
 - [ ] **Power menu**: confirm Omarchy logout, reboot, and shutdown actions save
-      before Hyprland destroys its clients.
+      and gracefully quit Zen in Active mode, while Manual mode preserves its
+      explicit snapshot after the user closes Zen.
 - [ ] **Failure recovery**: force one application launch to fail and confirm
       autosave does not replace the last complete snapshot.
 
@@ -61,6 +62,14 @@
 - [x] **Chromium app-mode launcher**: strictly recognized web-app windows launch
       individually through `omarchy-launch-webapp` when Chromium cannot recreate
       them through a bounded generic relaunch.
+- [x] **Zen multi-window lifecycle**: launch a saved Zen process only once and
+      gracefully quit it before Omarchy's close-all teardown so Zen can own tab
+      and window persistence without producing empty retry windows.
+- [x] **AppImage command stability**: replace transient `/tmp/.mount_*`
+      executables with validated persistent AppImage paths during capture.
+- [x] **Scrolling viewport correction**: capture focus and correct a complete
+      scrolling workspace when its restored rectangles differ by one uniform
+      layout translation, with final geometry verification.
 - [ ] **Additional launchers**: add more application-specific handling only for
       apps proven not to recreate their saved windows through bounded generic
       relaunches.
