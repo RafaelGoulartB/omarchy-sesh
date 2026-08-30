@@ -1354,6 +1354,29 @@ class OmarchySeshTests(unittest.TestCase):
         self.assertIn('hl.dsp.window.float({ action = "on"', script)
         self.assertIn("failed=failed+1", script)
 
+    def test_special_workspace_placement_uses_its_stable_name(self):
+        row = window(1, 0, "kiro", 10)
+        row.update(workspace_id=-98, workspace_name="special:scratchpad")
+        current = {
+            "workspace": {"id": 1, "name": "1"},
+            "floating": False,
+            "fullscreen": 0,
+            "fullscreenClient": 0,
+            "pinned": False,
+        }
+
+        operations = self.module.window_placement_operations(
+            row, "0x1", current
+        )
+
+        self.assertEqual(
+            (
+                "hl.dsp.window.move({ workspace = [[special:scratchpad]], "
+                "follow = false, window = [[address:0x1]] })"
+            ),
+            operations[0],
+        )
+
     def test_placement_reports_failure_without_aborting_remaining_dispatches(self):
         row = window(1, 0, "terminal", 10)
         with mock.patch.object(self.module, "eval_lua", return_value=False) as evaluate:
@@ -1596,6 +1619,35 @@ class OmarchySeshTests(unittest.TestCase):
         dispatch.assert_not_called()
         self.assertEqual({1}, prepared)
 
+    def test_prepare_special_workspace_monitor_uses_stable_name(self):
+        row = window(1, 0, "kiro", 10)
+        row.update(workspace_id=-98, workspace_name="special:scratchpad")
+        prepared = set()
+        with mock.patch.object(self.module, "dispatch", return_value=True) as dispatch:
+            self.assertTrue(
+                self.module.prepare_workspace_monitor(
+                    row,
+                    "0x1",
+                    {-98: "DP-1"},
+                    {-98: "eDP-1"},
+                    prepared,
+                )
+            )
+
+        self.assertEqual(
+            [
+                (
+                    "hl.dsp.window.move({ workspace = [[special:scratchpad]], "
+                    "follow = false, window = [[address:0x1]] })"
+                ),
+                (
+                    "hl.dsp.workspace.move({ workspace = [[special:scratchpad]], "
+                    "monitor = [[DP-1]] })"
+                ),
+            ],
+            [call.args[0] for call in dispatch.call_args_list],
+        )
+
     def test_monitor_move_refreshes_client_before_placement(self):
         row = window(1, 0, "terminal", 10)
         row["floating"] = 1
@@ -1801,6 +1853,15 @@ class OmarchySeshTests(unittest.TestCase):
             self.module.launch_command(browser),
         )
 
+    def test_special_workspace_launch_rule_uses_stable_name(self):
+        row = window(1, 0, "kiro", 10)
+        row.update(workspace_id=-98, workspace_name="special:scratchpad")
+
+        _command, rules, lua = self.module.launch_request(row)
+
+        self.assertEqual("workspace = [[special:scratchpad silent]]", rules)
+        self.assertIn("workspace = [[special:scratchpad silent]]", lua)
+
     def test_nautilus_launch_strips_gapplication_service(self):
         nautilus = window(1, 0, "org.gnome.Nautilus", 10)
         nautilus["cmdline"] = "/usr/bin/nautilus --gapplication-service --new-window"
@@ -1939,6 +2000,21 @@ class OmarchySeshTests(unittest.TestCase):
         self.assertFalse(
             self.module.window_classes_match("google-chrome", "chromium")
         )
+
+    def test_special_workspace_matching_uses_name_across_internal_id_changes(self):
+        row = window(1, 0, "kiro", 10, title="Project")
+        row.update(workspace_id=-98, workspace_name="special:scratchpad")
+        client = {
+            "mapped": True,
+            "address": "0x1",
+            "class": "kiro",
+            "initialClass": "kiro",
+            "title": "Project",
+            "initialTitle": "",
+            "workspace": {"id": -105, "name": "special:scratchpad"},
+        }
+
+        self.assertEqual(0, self.module.client_matches(row, client))
 
     def test_match_prefers_current_title_when_initial_titles_are_blank(self):
         rows = [

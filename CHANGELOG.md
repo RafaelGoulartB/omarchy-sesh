@@ -14,6 +14,9 @@ All notable changes to `omarchy-sesh` are documented here.
   are excluded.
 - Browser quit now uses Chrome's Ctrl+Shift+Q chord and falls back to SIGTERM on
   only a lingering Chromium main PID, while Zen continues to receive Ctrl+Q.
+- Scratchpad and other special-workspace windows now launch, match, move, and
+  restore by their stable `special:*` name instead of a session-local negative
+  workspace ID.
 
 ## v0.3.0 - 2026-08-30
 

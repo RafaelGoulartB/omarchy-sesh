@@ -110,7 +110,7 @@ CREATE TABLE windows (
     cmdline       TEXT NOT NULL,            -- argv join(' ') from /proc/pid/cmdline
     cwd           TEXT,                     -- /proc/pid/cwd
     workspace_id  INTEGER,                  -- numeric workspace at save time
-    workspace_name TEXT,
+    workspace_name TEXT,                    -- stable selector for special workspaces
     monitor_name  TEXT,                     -- hyprctl monitor name (e.g. DP-2)
     monitor_description TEXT,                -- physical display description
     at_x          INTEGER, at_y INTEGER,    -- exact float position or tiled slot metadata
@@ -199,7 +199,8 @@ Rules:
    only `argv[0]` with the validated, executable persistent `APPIMAGE`/`ARGV0`
    path. Skip windows whose cmdline is empty, is `hyprctl`, or is in the exclude
    list.
-3. Group windows by saved PID. Determine numeric `workspace_id`; resolve the
+3. Group windows by saved PID. Determine numeric `workspace_id` and retain the
+   stable `special:*` name for special workspaces; resolve the
    monitor connector name and description via `hyprctl -j monitors` (map
    `monitor` id to its monitor record). Retain `at` and `size` for tiled windows
    as slot identity metadata and inputs to guarded post-launch sizing.
@@ -248,7 +249,9 @@ the service retries after two seconds.
      Normal Chromium-family launches add `--restore-last-session`; guest and
      incognito commands are excluded from this behavior.
    - Launch through `hl.dsp.exec_cmd` with the saved silent workspace and
-     floating rules.
+     floating rules. Normal workspaces use their numeric ID; special workspaces
+     use their stable name, such as `special:scratchpad`, for launch, matching,
+     placement, and monitor movement.
    - Discover windows by polling and matching class, initial class/title,
      title, and workspace one-to-one.
     - Before applying the first window's state on each workspace, move the

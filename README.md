@@ -178,9 +178,12 @@ appear during one shared bounded polling window. If a process does not recreate
 all of its saved windows, its command is retried independently. Chromium app-mode
 windows are restored individually through
 Omarchy's web-app launcher because Chromium does not reopen them from the base
-browser command. Zen is launched only once per saved process group: its own
-session restoration is responsible for recreating all saved browser windows,
-which avoids retries opening empty windows. After matching, eligible nested
+browser command. Zen and normal Chromium-family browsers are launched only once
+per saved process group; their own session restoration recreates all saved
+browser windows, avoiding retries that open empty windows. Special workspaces
+such as `special:scratchpad` are matched, launched, and placed by their stable
+name instead of Hyprland's session-local negative workspace ID. After matching,
+eligible nested
 dwindle workspaces are rebuilt
 in one fast Lua evaluation: one seed remains on the target workspace while the
 other leaves pass through a temporary staging workspace. Focus, insertion

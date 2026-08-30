@@ -1197,6 +1197,25 @@ def window_classes_match(saved, current):
     )
 
 
+def saved_workspace_selector(row):
+    workspace_name = row.get("workspace_name")
+    if isinstance(workspace_name, str) and workspace_name.startswith("special:"):
+        return workspace_name
+    return row.get("workspace_id")
+
+
+def workspace_selector_lua(row):
+    selector = saved_workspace_selector(row)
+    return lua_quote(selector) if isinstance(selector, str) else str(selector)
+
+
+def saved_workspace_matches(row, workspace):
+    selector = saved_workspace_selector(row)
+    if isinstance(selector, str):
+        return workspace.get("name") == selector
+    return selector is None or workspace.get("id") == selector
+
+
 def client_matches(row, client):
     cls = row["class"]
     initial_cls = row.get("initial_class") or cls
@@ -1207,9 +1226,7 @@ def client_matches(row, client):
     if not class_matches and not initial_class_matches:
         return None
     workspace = client.get("workspace") or {}
-    workspace_matches = row.get("workspace_id") is None or row.get(
-        "workspace_id"
-    ) == workspace.get("id")
+    workspace_matches = saved_workspace_matches(row, workspace)
     title_matches = (
         bool(row.get("title")) and class_matches and row["title"] == client.get("title")
     )
@@ -1367,10 +1384,10 @@ def window_placement_operations(w, address, current=None):
     """
     win = lua_quote(f"address:{address}")
     operations = []
-    workspace_id = w.get("workspace_id")
+    workspace_selector = saved_workspace_selector(w)
     current_workspace = (current or {}).get("workspace") or {}
-    workspace_change = workspace_id is not None and (
-        current is None or current_workspace.get("id") != workspace_id
+    workspace_change = workspace_selector is not None and (
+        current is None or not saved_workspace_matches(w, current_workspace)
     )
     desired_floating = bool(w.get("floating"))
     current_floating = bool(current and current.get("floating"))
@@ -1421,7 +1438,8 @@ def window_placement_operations(w, address, current=None):
 
     if workspace_change:
         operations.append(
-            f"hl.dsp.window.move({{ workspace = {workspace_id}, follow = false, window = {win} }})"
+            "hl.dsp.window.move({ workspace = "
+            f"{workspace_selector_lua(w)}, follow = false, window = {win} }})"
         )
     if floating_change:
         float_action = "on" if desired_floating else "off"
@@ -1655,13 +1673,15 @@ def prepare_workspace_monitor(
         return True
 
     win = lua_quote(f"address:{address}")
+    workspace_selector = workspace_selector_lua(row)
     if not compositor.dispatch(
-        f"hl.dsp.window.move({{ workspace = {workspace_id}, follow = false, window = {win} }})"
+        "hl.dsp.window.move({ workspace = "
+        f"{workspace_selector}, follow = false, window = {win} }})"
     ):
         return False
     if not compositor.dispatch(
         "hl.dsp.workspace.move({ "
-        f"workspace = {workspace_id}, monitor = {lua_quote(target)} "
+        f"workspace = {workspace_selector}, monitor = {lua_quote(target)} "
         "})"
     ):
         return False
@@ -3014,8 +3034,9 @@ def launch_command(row):
 def launch_request(row):
     command = launch_command(row)
     rules = []
-    if row.get("workspace_id") is not None:
-        workspace = f"{row['workspace_id']} silent"
+    workspace_selector = saved_workspace_selector(row)
+    if workspace_selector is not None:
+        workspace = f"{workspace_selector} silent"
         rules.append(f"workspace = {lua_quote(workspace)}")
     if row.get("floating"):
         rules.append("float = true")
