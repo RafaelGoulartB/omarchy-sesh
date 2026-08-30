@@ -11,8 +11,8 @@
 - [ ] **Omarchy plugin**: load the widget in the live shell, inspect both shield
       states, and exercise Active, Manual, and Restore.
 - [ ] **Power menu**: confirm Omarchy logout, reboot, and shutdown actions save
-      and gracefully quit Zen in Active mode, while Manual mode preserves its
-      explicit snapshot after the user closes Zen.
+      and gracefully quit Zen and Chrome in Active mode, while Manual mode
+      preserves its explicit snapshot after the user closes the browsers.
 - [ ] **Failure recovery**: force one application launch to fail and confirm
       autosave does not replace the last complete snapshot.
 

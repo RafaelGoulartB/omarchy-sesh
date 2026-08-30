@@ -50,7 +50,14 @@ DEFAULT_CONFIG = {
 DEFAULT_EXCLUDE = set(DEFAULT_CONFIG["exclude_classes"])
 CHROMIUM_NORMAL_CLASSES = {"chromium", "chromium-browser"}
 SINGLE_LAUNCH_CLASSES = {"zen"}
-GRACEFUL_QUIT_CLASSES = {"zen"}
+GRACEFUL_QUIT_CLASSES = {
+    "chromium",
+    "chromium-browser",
+    "google-chrome",
+    "google-chrome-beta",
+    "google-chrome-unstable",
+    "zen",
+}
 RESTORE_TIMEOUT = 20.0
 RESTORE_RETRY_DELAY = 2.0
 RESTORE_POLL_INTERVAL = 0.05
@@ -3726,6 +3733,14 @@ def graceful_quit_applications(*, compositor=None, clock=None, write_log=None):
     return False
 
 
+def cmd_quit_browsers():
+    if graceful_quit_applications():
+        print("browsers closed cleanly")
+        return 0
+    print("browser quit failed or timed out", file=sys.stderr)
+    return 1
+
+
 def power_snapshot_mode():
     result = subprocess.run(
         ["systemctl", "--user", "is-enabled", AUTOSAVE_UNIT],
@@ -4050,6 +4065,11 @@ def main():
         help="prepare the selected session mode for logout or poweroff",
     )
 
+    sub.add_parser(
+        "quit-browsers",
+        help="gracefully quit Zen and Chromium-family browsers",
+    )
+
     sub.add_parser("status", help="list saved sessions")
 
     p_list = sub.add_parser("list", help="list named sessions")
@@ -4079,6 +4099,8 @@ def main():
             return cmd_autosave(args.interval)
         if args.command == "prepare-power":
             return cmd_prepare_power()
+        if args.command == "quit-browsers":
+            return cmd_quit_browsers()
         if args.command == "status":
             return cmd_status()
         if args.command == "list":

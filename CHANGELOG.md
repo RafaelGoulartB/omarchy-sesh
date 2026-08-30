@@ -8,9 +8,11 @@ All notable changes to `omarchy-sesh` are documented here.
 
 ### Added
 
+- `quit-browsers` automates a clean Ctrl+Q for each Zen and Chromium-family
+  browser process after a Manual snapshot, avoiding unsafe process-wide kills.
 - Power-menu preparation now saves synchronously and gracefully quits each Zen
-  process before Omarchy's stock close-all teardown, giving Zen time to persist
-  all windows and tabs.
+  or Chromium-family browser process before Omarchy's stock close-all teardown,
+  giving browsers time to persist all windows and tabs.
 - Complete scrolling workspaces can restore a uniformly shifted viewport and
   now return to the saved active workspace and focused tiled window.
 - Autosave can safely recover an incomplete startup gate after every saved
@@ -36,7 +38,7 @@ All notable changes to `omarchy-sesh` are documented here.
   actions; user-authored power actions remain untouched.
 - `prepare-power` is mode-aware: Manual mode preserves the explicit snapshot
   without saving again or closing Zen, while Active mode retains the automatic
-  shutdown save and graceful Zen quit.
+  shutdown save and graceful browser quit.
 
 ## v0.2.7 - 2026-08-26
 

@@ -12,15 +12,23 @@ modo Manual/Active. Ele troca somente a origem do código do plugin.
 
 Use esta ordem antes de desligar:
 
-1. Deixe o Zen aberto com todas as janelas que devem voltar.
+1. Deixe Zen e Chrome abertos com todas as janelas que devem voltar.
 2. Selecione **Manual** no painel e aguarde a confirmação do snapshot.
-3. Feche o Zen normalmente com Quit/Ctrl+Q para que ele grave abas e janelas.
+3. Feche Zen e Chrome de forma segura pelo terminal:
+
+   ```bash
+   omarchy-sesh quit-browsers
+   ```
+
+   O comando automatiza Quit/Ctrl+Q uma vez por processo principal e aguarda o
+   encerramento. Não use `pkill` ou `kill -9`, que podem transformar a sessão em
+   recuperação de crash.
 4. Reinicie ou desligue pelo menu do Omarchy.
 
-Em Manual, a ação de energia não salva novamente e não envia atalhos ao Zen.
-Assim, o snapshot feito no passo 2 continua contendo o Zen. Em Active, o plugin
-continua fazendo o snapshot de desligamento e o encerramento gracioso
-automaticamente.
+Em Manual, a ação de energia não salva novamente e não envia atalhos aos
+navegadores. Assim, o snapshot feito no passo 2 continua contendo Zen e Chrome.
+Em Active, o plugin continua fazendo o snapshot de desligamento e o encerramento
+gracioso automaticamente.
 
 ## Instalar a branch local
 

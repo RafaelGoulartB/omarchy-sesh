@@ -376,10 +376,11 @@ All confirmed against the installed Omarchy defaults.
 
 3. **Power-menu / logout wiring** — marker-delimited user menu overrides invoke
    `prepare-power`. In Active mode it saves synchronously and then sends one
-   Ctrl+Q per Zen process, waiting up to ten seconds for a clean exit before invoking
+   Ctrl+Q per distinct Zen or Chromium-family browser process, waiting up to ten
+   seconds for a clean exit before invoking
    `omarchy-system-logout`, `omarchy-system-reboot`, or
    `omarchy-system-shutdown`. This runs before Omarchy's stock close-all helper,
-   allowing Zen to persist its multi-window session. The save closes the current
+   allowing browsers to persist their multi-window sessions. The save closes the current
    compositor's autosave gate while holding the operation lock and before
    querying Hyprland;
    periodic saves recheck that gate after acquiring the same lock. This ordering
@@ -440,6 +441,9 @@ All confirmed against the installed Omarchy defaults.
 - `prepare-power` — preserves the selected snapshot untouched in Manual mode;
   in Active mode, synchronously saves the logout snapshot and gracefully quits
   session-aware applications before the stock Omarchy power command.
+- `quit-browsers` — sends one Ctrl+Q through Hyprland to each distinct main Zen
+  or Chromium-family browser PID and waits for all matching windows to close.
+  It does not signal renderer processes or provide a force-kill mode.
 - `status` — lists recent sessions.
 - `list` — lists retained named sessions.
 - `delete --name NAME` — removes a named session and its captured state.

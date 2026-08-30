@@ -67,13 +67,13 @@ saver. A restore runs at the next graphical login via `omarchy-sesh.service`;
 the autosave service is ordered after it and waits one interval before its first
 capture.
 Before logout, reboot, or shutdown, the menu integration saves synchronously
-and then asks session-aware applications such as Zen to quit cleanly. This lets
-Zen persist all of its windows and tabs before Omarchy closes the remaining
-Hyprland clients, while the autosave gate keeps the reboot snapshot from being
+and then asks Zen and Chromium-family browsers to quit cleanly. This lets the
+browsers persist all of their windows and tabs before Omarchy closes the
+remaining Hyprland clients, while the autosave gate keeps the reboot snapshot from being
 superseded during teardown. This applies only in Active mode. Manual mode keeps
 the explicit snapshot selected with **Manual** authoritative: power actions do
-not save again or send Zen a shortcut, so you can save, close Zen yourself, and
-then shut down without replacing that snapshot with one that omits Zen.
+not save again or send browsers a shortcut, so you can save, close them yourself,
+and then shut down without replacing that snapshot with one that omits Zen.
 
 See [How it works](#how-it-works) for the full save/restore behavior and
 `install.sh`/`Service.qml` for the installation and first-open wiring.
@@ -85,6 +85,7 @@ omarchy-sesh save [--label manual|logout] [--name NAME]                 # snapsh
 omarchy-sesh restore [--name NAME] [--dry-run]                          # restore latest or named snapshot
 omarchy-sesh autosave [--interval 60]                                   # periodic save (crash cover)
 omarchy-sesh prepare-power                                              # preserve Manual, or prepare Active for shutdown
+omarchy-sesh quit-browsers                                              # gracefully quit Zen and Chrome from the terminal
 omarchy-sesh status                                                     # list saved sessions
 omarchy-sesh list                                                       # list named sessions
 omarchy-sesh delete --name NAME                                         # delete a named session
@@ -226,6 +227,13 @@ the gate before capture so a periodic save cannot supersede it during teardown.
 In Manual mode, the same power action deliberately skips both this final save
 and automatic application quit, preserving the snapshot created when Manual was
 selected.
+
+After a Manual snapshot, `omarchy-sesh quit-browsers` sends one Ctrl+Q through
+Hyprland to each main Zen or Chromium-family browser process and waits up to ten
+seconds for all browser windows to disappear. It deliberately avoids `pkill`
+and `kill -9`: browsers use many subprocesses, and force-killing them can turn a
+normal session save into crash recovery. Chrome still needs **Continue where
+you left off** enabled for tab restoration.
 
 Exact dwindle tree replay, including two-window ratios, requires a schema-v5
 snapshot, `dwindle:use_active_for_splits =

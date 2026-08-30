@@ -4554,6 +4554,71 @@ class OmarchySeshTests(unittest.TestCase):
         self.assertIn("mods = [[CTRL]]", compositor.requests[0])
         self.assertIn("key = [[Q]]", compositor.requests[0])
 
+    def test_graceful_browser_quit_targets_chrome_and_zen_main_processes(self):
+        clients = [
+            {"mapped": True, "class": "zen", "pid": 10, "address": "0xa"},
+            {"mapped": True, "class": "zen", "pid": 10, "address": "0xb"},
+            {
+                "mapped": True,
+                "class": "google-chrome",
+                "pid": 20,
+                "address": "0xc",
+            },
+            {
+                "mapped": True,
+                "class": "google-chrome",
+                "pid": 20,
+                "address": "0xd",
+            },
+        ]
+
+        class Compositor:
+            def __init__(self):
+                self.queries = 0
+                self.requests = []
+
+            def query_json(self, endpoint, *_args):
+                self.queries += 1
+                return clients if self.queries == 1 else []
+
+            def dispatch(self, lua, failure_context=None):
+                self.requests.append(lua)
+                return True
+
+        class Clock:
+            def monotonic(self):
+                return 0
+
+            def sleep(self, _seconds):
+                pass
+
+        compositor = Compositor()
+        self.assertTrue(
+            self.module.graceful_quit_applications(
+                compositor=compositor, clock=Clock(), write_log=lambda _msg: None
+            )
+        )
+        self.assertEqual(2, len(compositor.requests))
+        self.assertTrue(any("address:0xa" in lua for lua in compositor.requests))
+        self.assertTrue(any("address:0xc" in lua for lua in compositor.requests))
+
+    def test_quit_browsers_command_reports_success_and_failure(self):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                self.module,
+                "graceful_quit_applications",
+                side_effect=[True, False],
+            ),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            self.assertEqual(0, self.module.cmd_quit_browsers())
+            self.assertEqual(1, self.module.cmd_quit_browsers())
+        self.assertIn("closed cleanly", stdout.getvalue())
+        self.assertIn("failed or timed out", stderr.getvalue())
+
     def test_graceful_power_quit_waits_for_replacement_zen_process(self):
         initial = [
             {"mapped": True, "class": "zen", "pid": 10, "address": "0xa"}
