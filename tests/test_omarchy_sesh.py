@@ -1781,7 +1781,23 @@ class OmarchySeshTests(unittest.TestCase):
             "/usr/lib/chromium/chromium --app=https://example.com --flag"
         )
         self.assertEqual(
-            "cd -- /tmp && /usr/lib/chromium/chromium --flag",
+            "cd -- /tmp && /usr/lib/chromium/chromium --flag --restore-last-session",
+            self.module.launch_command(browser),
+        )
+
+    def test_google_chrome_launch_forces_last_session_restore(self):
+        browser = window(1, 0, "google-chrome", 10)
+        browser["cmdline"] = "/opt/google/chrome/chrome --flag"
+        self.assertEqual(
+            "cd -- /tmp && /opt/google/chrome/chrome --flag --restore-last-session",
+            self.module.launch_command(browser),
+        )
+
+    def test_private_chromium_launch_does_not_restore_regular_session(self):
+        browser = window(1, 0, "google-chrome", 10)
+        browser["cmdline"] = "/opt/google/chrome/chrome --incognito"
+        self.assertEqual(
+            "cd -- /tmp && /opt/google/chrome/chrome --incognito",
             self.module.launch_command(browser),
         )
 
@@ -1872,7 +1888,7 @@ class OmarchySeshTests(unittest.TestCase):
             self.module.launch_command(slack),
         )
         self.assertEqual(
-            "cd -- /tmp && /usr/lib/chromium/chromium",
+            "cd -- /tmp && /usr/lib/chromium/chromium --restore-last-session",
             self.module.launch_command(browser),
         )
 
@@ -1894,7 +1910,7 @@ class OmarchySeshTests(unittest.TestCase):
         group = self.module.process_groups([unrecognized, browser])[0]
         self.assertIs(browser, self.module.process_launch_row(group))
         self.assertEqual(
-            "cd -- /tmp && /usr/lib/chromium/chromium",
+            "cd -- /tmp && /usr/lib/chromium/chromium --restore-last-session",
             self.module.launch_command(self.module.process_launch_row(group)),
         )
 
@@ -4642,7 +4658,48 @@ class OmarchySeshTests(unittest.TestCase):
         )
         self.assertEqual(2, len(compositor.requests))
         self.assertTrue(any("address:0xa" in lua for lua in compositor.requests))
-        self.assertTrue(any("address:0xc" in lua for lua in compositor.requests))
+        chrome_request = next(
+            lua for lua in compositor.requests if "address:0xc" in lua
+        )
+        self.assertIn("mods = [[CTRL SHIFT]]", chrome_request)
+
+    def test_lingering_chrome_receives_sigterm_after_shortcut_grace_period(self):
+        chrome = {
+            "mapped": True,
+            "class": "google-chrome",
+            "pid": 20,
+            "address": "0xc",
+        }
+
+        class Compositor:
+            responses = iter(([chrome], [chrome], [chrome], []))
+
+            def query_json(self, endpoint, *_args):
+                return next(self.responses)
+
+            def dispatch(self, lua, failure_context=None):
+                return True
+
+        class Clock:
+            ticks = 0
+
+            def monotonic(self):
+                self.ticks += 1
+                return self.ticks
+
+            def sleep(self, _seconds):
+                pass
+
+        terminated = []
+        self.assertTrue(
+            self.module.graceful_quit_applications(
+                compositor=Compositor(),
+                clock=Clock(),
+                write_log=lambda _msg: None,
+                terminate_process=terminated.append,
+            )
+        )
+        self.assertEqual([20], terminated)
 
     def test_quit_browsers_command_reports_success_and_failure(self):
         stdout = io.StringIO()

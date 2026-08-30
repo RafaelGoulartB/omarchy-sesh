@@ -245,6 +245,8 @@ the service retries after two seconds.
      saved process group. If any window from such a group is already present,
      no launch is sent. The browser's own session restoration must recreate the
      remaining windows; generic retries would create empty windows instead.
+     Normal Chromium-family launches add `--restore-last-session`; guest and
+     incognito commands are excluded from this behavior.
    - Launch through `hl.dsp.exec_cmd` with the saved silent workspace and
      floating rules.
    - Discover windows by polling and matching class, initial class/title,
@@ -442,9 +444,11 @@ All confirmed against the installed Omarchy defaults.
 - `prepare-power` — preserves the selected snapshot untouched in Manual mode;
   in Active mode, synchronously saves the logout snapshot and gracefully quits
   session-aware applications before the stock Omarchy power command.
-- `quit-browsers` — sends one Ctrl+Q through Hyprland to each distinct main Zen
-  or Chromium-family browser PID and waits for all matching windows to close.
-  It does not signal renderer processes or provide a force-kill mode.
+- `quit-browsers` — sends Ctrl+Q to each distinct main Zen PID and
+  Ctrl+Shift+Q to each distinct main Chromium-family browser PID. After a
+  three-second shortcut grace period, a lingering Chromium main PID receives
+  SIGTERM. Renderer processes are never targeted directly and there is no
+  SIGKILL mode.
 - `status` — lists recent sessions.
 - `list` — lists retained named sessions.
 - `delete --name NAME` — removes a named session and its captured state.

@@ -228,17 +228,20 @@ In Manual mode, the same power action deliberately skips both this final save
 and automatic application quit, preserving the snapshot created when Manual was
 selected.
 
-After a Manual snapshot, `omarchy-sesh quit-browsers` sends one Ctrl+Q through
-Hyprland to each main Zen or Chromium-family browser process and waits up to ten
-seconds for all browser windows to disappear. It deliberately avoids `pkill`
-and `kill -9`: browsers use many subprocesses, and force-killing them can turn a
-normal session save into crash recovery. Chrome still needs **Continue where
-you left off** enabled for tab restoration.
+After a Manual snapshot, `omarchy-sesh quit-browsers` sends one Ctrl+Q to each
+main Zen process and Ctrl+Shift+Q to each main Chromium-family browser process,
+then waits up to ten seconds for all browser windows to disappear. If Chrome
+ignores its shortcut, the command sends SIGTERM only to its main PID after a
+three-second grace period. It deliberately avoids `pkill` and `kill -9` across
+browser subprocesses.
 
 Zen and normal Chromium-family browsers are launched at most once for each
 saved process group. Their own session manager is responsible for creating all
 saved browser windows; if one of those windows is already present, the restore
 waits for the remaining windows instead of launching another empty one.
+Normal Chrome/Chromium launches also receive `--restore-last-session`, so the
+saved browser windows reopen without requiring repeated Ctrl+Shift+T. Guest and
+incognito launches never receive this option.
 
 Exact dwindle tree replay, including two-window ratios, requires a schema-v5
 snapshot, `dwindle:use_active_for_splits =

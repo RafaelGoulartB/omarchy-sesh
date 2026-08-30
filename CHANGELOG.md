@@ -9,6 +9,11 @@ All notable changes to `omarchy-sesh` are documented here.
 - Google Chrome now launches only once for a saved multi-window process and is
   not launched again after any restored window appears, preventing one extra
   empty window per saved Chrome window.
+- Normal Chrome/Chromium restores add `--restore-last-session`, reopening saved
+  browser windows without repeated Ctrl+Shift+T; guest and incognito launches
+  are excluded.
+- Browser quit now uses Chrome's Ctrl+Shift+Q chord and falls back to SIGTERM on
+  only a lingering Chromium main PID, while Zen continues to receive Ctrl+Q.
 
 ## v0.3.0 - 2026-08-30
 

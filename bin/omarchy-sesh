@@ -9,6 +9,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import sqlite3
 import stat
 import subprocess
@@ -61,6 +62,7 @@ RESTORE_TIMEOUT = 20.0
 RESTORE_RETRY_DELAY = 2.0
 RESTORE_POLL_INTERVAL = 0.05
 GRACEFUL_QUIT_TIMEOUT = 10.0
+CHROME_SHORTCUT_QUIT_TIMEOUT = 3.0
 MAX_CONFIG_SECONDS = 2_147_483_647
 MAX_SNAPSHOT_RETENTION = 9_223_372_036_854_775_807
 MAX_SESSION_NAME_LENGTH = 128
@@ -2986,6 +2988,14 @@ def launch_command(row):
                     skip_next = True
                 elif not argument.startswith("--app="):
                     filtered.append(argument)
+            if not any(
+                argument in {"--guest", "--incognito"}
+                for argument in filtered
+            ) and not any(
+                argument == "--restore-last-session"
+                for argument in filtered
+            ):
+                filtered.append("--restore-last-session")
             command = shlex.join(filtered)
         except ValueError:
             pass
@@ -3696,10 +3706,15 @@ def cmd_restore(dry_run=False, name=None):
         lock_file.close()
 
 
-def graceful_quit_applications(*, compositor=None, clock=None, write_log=None):
+def graceful_quit_applications(
+    *, compositor=None, clock=None, write_log=None, terminate_process=None
+):
     compositor = compositor or HyprlandRestoreAdapter()
     clock = clock or SystemClockAdapter()
     write_log = log if write_log is None else write_log
+    terminate_process = terminate_process or (
+        lambda pid: os.kill(pid, signal.SIGTERM)
+    )
     clients = compositor.query_json("clients")
     if clients is None:
         write_log("power: Hyprland IPC unavailable before graceful application quit")
@@ -3714,29 +3729,61 @@ def graceful_quit_applications(*, compositor=None, clock=None, write_log=None):
             process_key = client.get("pid")
             if not isinstance(process_key, int):
                 process_key = client["address"]
-            targets.setdefault(process_key, client["address"])
+            targets.setdefault(process_key, client)
     if not targets:
         return True
-    for address in targets.values():
+    for target in targets.values():
+        modifiers = (
+            "CTRL SHIFT"
+            if target.get("class") in NORMAL_BROWSER_CLASSES
+            else "CTRL"
+        )
         request = (
-            "hl.dsp.send_shortcut({ mods = [[CTRL]], key = [[Q]], "
-            f"window = {lua_quote(f'address:{address}')} }})"
+            f"hl.dsp.send_shortcut({{ mods = {lua_quote(modifiers)}, key = [[Q]], "
+            f"window = {lua_quote(f'address:{target["address"]}')} }})"
         )
         if not compositor.dispatch(request, failure_context="power: graceful quit"):
             return False
     deadline = clock.monotonic() + GRACEFUL_QUIT_TIMEOUT
+    chrome_fallback_at = clock.monotonic() + CHROME_SHORTCUT_QUIT_TIMEOUT
+    chrome_fallback_sent = False
     while clock.monotonic() < deadline:
         clock.sleep(RESTORE_POLL_INTERVAL)
         clients = compositor.query_json("clients")
         if clients is None:
             return False
-        if not any(
+        remaining = [
+            client
+            for client in clients
+            if (
             client.get("mapped")
             and client.get("class") in GRACEFUL_QUIT_CLASSES
-            for client in clients
-        ):
+            )
+        ]
+        if not remaining:
             write_log("power: gracefully quit session-aware applications")
             return True
+        if not chrome_fallback_sent and clock.monotonic() >= chrome_fallback_at:
+            chrome_pids = {
+                client.get("pid")
+                for client in remaining
+                if client.get("class") in NORMAL_BROWSER_CLASSES
+                and isinstance(client.get("pid"), int)
+            }
+            for pid in chrome_pids:
+                try:
+                    terminate_process(pid)
+                except (OSError, ValueError) as error:
+                    write_log(
+                        "power: could not terminate a lingering Chromium browser: "
+                        f"{error}"
+                    )
+                    return False
+            if chrome_pids:
+                write_log(
+                    "power: sent SIGTERM to lingering Chromium browser processes"
+                )
+            chrome_fallback_sent = True
     write_log("power: timed out waiting for graceful application quit")
     return False
 

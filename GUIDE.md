@@ -20,15 +20,21 @@ Use esta ordem antes de desligar:
    omarchy-sesh quit-browsers
    ```
 
-   O comando automatiza Quit/Ctrl+Q uma vez por processo principal e aguarda o
-   encerramento. Não use `pkill` ou `kill -9`, que podem transformar a sessão em
-   recuperação de crash.
+   O comando envia Ctrl+Q ao Zen e Ctrl+Shift+Q ao Chrome uma vez por processo
+   principal. Se o Chrome ignorar o atalho, após três segundos ele envia
+   SIGTERM somente ao PID principal e continua aguardando. Não use `pkill` ou
+   `kill -9` nos subprocessos do navegador.
 4. Reinicie ou desligue pelo menu do Omarchy.
 
 Em Manual, a ação de energia não salva novamente e não envia atalhos aos
 navegadores. Assim, o snapshot feito no passo 2 continua contendo Zen e Chrome.
 Em Active, o plugin continua fazendo o snapshot de desligamento e o encerramento
 gracioso automaticamente.
+
+Na restauração, Chrome e Chromium são iniciados com
+`--restore-last-session`. Assim, suas janelas anteriores devem abrir
+automaticamente, sem repetir Ctrl+Shift+T. A opção não é aplicada a sessões
+Guest ou Incognito.
 
 ## Instalar a branch local
 
