@@ -233,7 +233,8 @@ selected.
 
 After a Manual snapshot, `omarchy-sesh quit-browsers` sends one Ctrl+Q to each
 main Zen process and Ctrl+Shift+Q to each main Chromium-family browser process,
-then waits up to ten seconds for all browser windows to disappear. If Chrome
+then confirms Zen's `Close and quit` dialog when it is enabled, and waits up to
+ten seconds for all browser windows to disappear. If Chrome
 ignores its shortcut, the command sends SIGTERM only to its main PID after a
 three-second grace period. It deliberately avoids `pkill` and `kill -9` across
 browser subprocesses.

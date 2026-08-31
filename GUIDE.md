@@ -20,8 +20,9 @@ Use esta ordem antes de desligar:
    omarchy-sesh quit-browsers
    ```
 
-   O comando envia Ctrl+Q ao Zen e Ctrl+Shift+Q ao Chrome uma vez por processo
-   principal. Se o Chrome ignorar o atalho, após três segundos ele envia
+   O comando envia Ctrl+Q ao Zen e confirma automaticamente o diálogo
+   `Close and quit`, se aparecer. Para o Chrome, envia Ctrl+Shift+Q uma vez por
+   processo principal. Se o Chrome ignorar o atalho, após três segundos ele envia
    SIGTERM somente ao PID principal e continua aguardando. Não use `pkill` ou
    `kill -9` nos subprocessos do navegador.
 4. Reinicie ou desligue pelo menu do Omarchy.

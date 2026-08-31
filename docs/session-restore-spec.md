@@ -447,7 +447,8 @@ All confirmed against the installed Omarchy defaults.
 - `prepare-power` — preserves the selected snapshot untouched in Manual mode;
   in Active mode, synchronously saves the logout snapshot and gracefully quits
   session-aware applications before the stock Omarchy power command.
-- `quit-browsers` — sends Ctrl+Q to each distinct main Zen PID and
+- `quit-browsers` — sends Ctrl+Q to each distinct main Zen PID, confirms its
+  generated `Close and quit` dialog when present, and
   Ctrl+Shift+Q to each distinct main Chromium-family browser PID. After a
   three-second shortcut grace period, a lingering Chromium main PID receives
   SIGTERM. Renderer processes are never targeted directly and there is no

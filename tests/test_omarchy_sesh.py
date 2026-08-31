@@ -4642,7 +4642,7 @@ class OmarchySeshTests(unittest.TestCase):
             self.assertTrue(self.module.recover_completed_restore_gate())
             self.assertTrue(self.module.restore_is_ready())
 
-    def test_graceful_power_quit_sends_one_ctrl_q_per_zen_process(self):
+    def test_graceful_power_quit_confirms_zen_close_and_quit_once(self):
         clients = [
             {
                 "mapped": True,
@@ -4684,9 +4684,11 @@ class OmarchySeshTests(unittest.TestCase):
                 compositor=compositor, clock=Clock(), write_log=lambda _msg: None
             )
         )
-        self.assertEqual(1, len(compositor.requests))
+        self.assertEqual(2, len(compositor.requests))
         self.assertIn("mods = [[CTRL]]", compositor.requests[0])
         self.assertIn("key = [[Q]]", compositor.requests[0])
+        self.assertIn("mods = [[]]", compositor.requests[1])
+        self.assertIn("key = [[ENTER]]", compositor.requests[1])
 
     def test_graceful_browser_quit_targets_chrome_and_zen_main_processes(self):
         clients = [
@@ -4732,7 +4734,7 @@ class OmarchySeshTests(unittest.TestCase):
                 compositor=compositor, clock=Clock(), write_log=lambda _msg: None
             )
         )
-        self.assertEqual(2, len(compositor.requests))
+        self.assertEqual(3, len(compositor.requests))
         self.assertTrue(any("address:0xa" in lua for lua in compositor.requests))
         chrome_request = next(
             lua for lua in compositor.requests if "address:0xc" in lua
