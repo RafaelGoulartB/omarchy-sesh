@@ -8,27 +8,36 @@ desktop. The evidence command itself is read-only.
 ## Reboot Restore And Service Health
 
 1. Open a tiled terminal, a floating terminal with a distinctive size and
-   position, a browser, and a multi-window application. Put them on at least two
-   workspaces. Include a complete window group when testing Hyprland 0.56+.
+   position, Zen with multiple windows and tabs, and a multi-window application.
+   Put them on at least two workspaces. Include a complete scrolling workspace
+   and window group when testing those features on Hyprland 0.56+.
 2. Record each application's workspace. Record the floating window's `at` and
    `size` from `hyprctl -j clients` before reboot. For a nested dwindle layout,
    record all tiled rectangles as well.
-3. Use the Omarchy **Reboot** power-menu action. Do not use a direct reboot
-   command; this exercises the synchronous pre-shutdown snapshot.
+3. For Active-mode acceptance, select **Active**, then use the Omarchy **Reboot**
+   power-menu action. Do not use a direct reboot command; this exercises the
+   synchronous pre-shutdown snapshot. For Manual-mode acceptance, select
+   **Manual** while Zen is open, close Zen yourself, and then use **Reboot**;
+   this exercises preservation of the explicit snapshot.
 4. After login and after applications settle, run:
 
    ```sh
-   omarchy-sesh acceptance --expect-power-save
+   omarchy-sesh acceptance --expect-power-save  # Active mode
    ```
 
-5. Confirm every line reports `PASS`. The command verifies the current
+5. In Active mode, confirm every line reports `PASS`. The command verifies the current
    compositor marker, source snapshot, restore service, autosave state, and
    one-to-one saved-window matching. `--expect-power-save` additionally proves
-   that the restored source snapshot has the `logout` label.
+   that the restored source snapshot has the `logout` label. In Manual mode,
+   run `omarchy-sesh acceptance` without `--expect-power-save`, then confirm
+   with `omarchy-sesh status` that the source retained its `manual` label and
+   includes the Zen windows captured before exit.
 6. Compare the recorded workspace and floating geometry with `hyprctl -j
-   clients`. Confirm browser content using the browser's own restore behavior.
+   clients`. Confirm Zen restored every window and tab through its own session
+   behavior without extra empty windows.
    For a complete nested dwindle layout, compare every recorded tiled rectangle
-   and group member order. Tiled layout remains best-effort when its documented
+   and group member order. On a scrolling workspace, confirm its saved viewport
+   and focused window. Tiled layout remains best-effort when its documented
    replay prerequisites are not met.
 
 ## Failure Recovery

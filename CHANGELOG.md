@@ -4,6 +4,57 @@ All notable changes to `omarchy-sesh` are documented here.
 
 ## Unreleased
 
+### Fixed
+
+- Google Chrome now launches only once for a saved multi-window process and is
+  not launched again after any restored window appears, preventing one extra
+  empty window per saved Chrome window.
+- Normal Chrome/Chromium restores add `--restore-last-session`, reopening saved
+  browser windows without repeated Ctrl+Shift+T; guest and incognito launches
+  are excluded.
+- Browser quit now uses Chrome's Ctrl+Shift+Q chord and falls back to SIGTERM on
+  only a lingering Chromium main PID, while Zen continues to receive Ctrl+Q.
+- Zen quit now confirms its generated `Close and quit` dialog automatically.
+- Scratchpad and other special-workspace windows now launch, match, move, and
+  restore by their stable `special:*` name instead of a session-local negative
+  workspace ID.
+
+## v0.3.0 - 2026-08-30
+
+### Added
+
+- `quit-browsers` automates a clean Ctrl+Q for each Zen and Chromium-family
+  browser process after a Manual snapshot, avoiding unsafe process-wide kills.
+- Power-menu preparation now saves synchronously and gracefully quits each Zen
+  or Chromium-family browser process before Omarchy's stock close-all teardown,
+  giving browsers time to persist all windows and tabs.
+- Complete scrolling workspaces can restore a uniformly shifted viewport and
+  now return to the saved active workspace and focused tiled window.
+- Autosave can safely recover an incomplete startup gate after every saved
+  window becomes uniquely matchable later in the same compositor instance.
+
+### Fixed
+
+- AppImage captures replace transient `/tmp/.mount_*` executables with a
+  validated persistent AppImage path, so applications such as T3 Code relaunch
+  after reboot.
+- Zen process groups launch only once, preventing generic missing-window retries
+  from producing empty browser windows.
+- Hyprland's `enabled`-only workspace-rule placeholders no longer disable exact
+  tiled geometry capture and replay.
+- Scrolling inhibition is always released and a release failure is reported
+  instead of silently leaving the layout stuck.
+
+### Compatibility
+
+- Database schema version 7 adds nullable saved active-workspace and
+  focused-window metadata. Existing databases migrate in place.
+- The new `prepare-power` command is installed only in marker-owned menu
+  actions; user-authored power actions remain untouched.
+- `prepare-power` is mode-aware: Manual mode preserves the explicit snapshot
+  without saving again or closing Zen, while Active mode retains the automatic
+  shutdown save and graceful browser quit.
+
 ## v0.2.7 - 2026-08-26
 
 ### Changed

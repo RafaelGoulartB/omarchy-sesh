@@ -231,7 +231,7 @@ for menu_id, (icon, label, command) in actions.items():
         print(f"warning: preserving customized {menu_id} action")
         continue
     action = (
-        '"$HOME/.local/bin/omarchy-sesh" save --label logout --wait || true; '
+        '"$HOME/.local/bin/omarchy-sesh" prepare-power || true; '
         f"exec {command}"
     )
     payload = json.dumps(
@@ -274,4 +274,4 @@ install -d -m 700 "$(dirname "$INSTALL_MARKER")"
 printf '%s\n' "$PLUGIN_VERSION" >"$INSTALL_MARKER"
 chmod 600 "$INSTALL_MARKER"
 
-echo "omarchy-sesh: installed. Restore runs on next login; saves run before power-menu actions and periodically."
+echo "omarchy-sesh: installed. Restore runs on next login; Active mode saves before power-menu actions and periodically."

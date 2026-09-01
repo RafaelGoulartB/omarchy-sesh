@@ -110,7 +110,7 @@ CREATE TABLE windows (
     cmdline       TEXT NOT NULL,            -- argv join(' ') from /proc/pid/cmdline
     cwd           TEXT,                     -- /proc/pid/cwd
     workspace_id  INTEGER,                  -- numeric workspace at save time
-    workspace_name TEXT,
+    workspace_name TEXT,                    -- stable selector for special workspaces
     monitor_name  TEXT,                     -- hyprctl monitor name (e.g. DP-2)
     monitor_description TEXT,                -- physical display description
     at_x          INTEGER, at_y INTEGER,    -- exact float position or tiled slot metadata
@@ -130,7 +130,8 @@ CREATE TABLE sessions (
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     label     TEXT,                      -- 'manual' | 'logout' | 'periodic'
     capture_status TEXT NOT NULL DEFAULT 'complete', -- complete | partial | failed
-    capture_error TEXT
+    capture_error TEXT,
+    active_workspace_id INTEGER           -- focused workspace at capture time
 );
 
 -- Stable user-visible names for explicitly saved sessions. The referenced
@@ -151,12 +152,13 @@ CREATE TABLE workspace_layouts (
     work_w       INTEGER, work_h INTEGER,
     gap_top      INTEGER, gap_right INTEGER,
     gap_bottom   INTEGER, gap_left INTEGER,
+    focused_ord  INTEGER,                 -- focused saved tiled row
     complete     INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (session, workspace_id),
     FOREIGN KEY (session) REFERENCES sessions(id)
 );
 
-PRAGMA user_version = 6;
+PRAGMA user_version = 7;
 ```
 
 Rules:
@@ -185,20 +187,26 @@ Rules:
   visible spacing. `complete` requires every mapped, non-fullscreen tiled client
   on that workspace to be captured. Legacy snapshots and snapshots with
   workspace-specific rules remain valid but are ineligible for nested replay.
+  Hyprland's runtime `enabled`-only workspace entries are metadata placeholders,
+  not effectful rules, and therefore do not disable capture or replay.
 
 ## 4. Save path (`omarchy-sesh save`)
 
 1. Query `hyprctl -j clients`, `monitors`, and `workspaces`.
-2. For each, read `/proc/<pid>/cmdline` and `/proc/<pid>/cwd` (resolve cwd
-   symlink). Skip windows whose cmdline is empty, is `hyprctl`, or is in the
-   exclude list.
-3. Group windows by saved PID. Determine numeric `workspace_id`; resolve the
+2. For each, read `/proc/<pid>/cmdline`, `/proc/<pid>/cwd` (resolve cwd
+   symlink), and the relevant `/proc/<pid>/environ` AppImage metadata. When the
+   running executable belongs to an AppImage `/tmp/.mount_*` directory, replace
+   only `argv[0]` with the validated, executable persistent `APPIMAGE`/`ARGV0`
+   path. Skip windows whose cmdline is empty, is `hyprctl`, or is in the exclude
+   list.
+3. Group windows by saved PID. Determine numeric `workspace_id` and retain the
+   stable `special:*` name for special workspaces; resolve the
    monitor connector name and description via `hyprctl -j monitors` (map
    `monitor` id to its monitor record). Retain `at` and `size` for tiled windows
    as slot identity metadata and inputs to guarded post-launch sizing.
-4. Record the tiled layout name, tiled client bounds, and per-workspace capture
-   completeness, then insert the session, window, and workspace-layout rows in
-   one transaction.
+4. Record the tiled layout name, tiled client bounds, focused tiled row,
+   per-workspace capture completeness, and focused monitor's active workspace,
+   then insert the session, window, and workspace-layout rows in one transaction.
 5. When `--name NAME` is supplied, reject an existing name before capture and,
    only for a complete capture, insert its `named_sessions` reference in the
    same transaction. Named sessions are not an automatic boot restore source.
@@ -207,7 +215,7 @@ Triggers (any one fires a save):
 
 | Trigger | Mechanism |
 |---|---|
-| Clean logout / reboot / shutdown | Power-menu entries (see §6) run `omarchy-sesh save` before `uwsm stop` / `loginctl` |
+| Clean logout / reboot / shutdown | Power-menu entries (see §6) run mode-aware `omarchy-sesh prepare-power` before the stock Omarchy command |
 | Systemd teardown diagnostic | `ExecStop=omarchy-sesh save --teardown`; never supersedes a healthy snapshot |
 | Periodic (crash cover) | systemd daemon, every 60 s, writes a `periodic` snapshot |
 
@@ -234,8 +242,16 @@ the service retries after two seconds.
      launch each through `omarchy-launch-webapp`, because the base Chromium
      process does not reopen those windows after reboot. Chromium's `Default`
      and `Profile_N` class suffixes are treated as the same web-app identity.
+   - Zen and normal Chromium-family browsers receive at most one launch per
+     saved process group. If any window from such a group is already present,
+     no launch is sent. The browser's own session restoration must recreate the
+     remaining windows; generic retries would create empty windows instead.
+     Normal Chromium-family launches add `--restore-last-session`; guest and
+     incognito commands are excluded from this behavior.
    - Launch through `hl.dsp.exec_cmd` with the saved silent workspace and
-     floating rules.
+     floating rules. Normal workspaces use their numeric ID; special workspaces
+     use their stable name, such as `special:scratchpad`, for launch, matching,
+     placement, and monitor movement.
    - Discover windows by polling and matching class, initial class/title,
      title, and workspace one-to-one.
     - Before applying the first window's state on each workspace, move the
@@ -298,6 +314,13 @@ the service retries after two seconds.
       not settle to the saved geometry fails restore instead of silently leaving
       the default 50/50 split. Exact compatible-slot swaps remain available, and
       a monitor-origin change alone does not prevent either path.
+    - A complete `scrolling` workspace is eligible for viewport correction when
+      every saved tiled window is uniquely matched, no unrelated tiled client is
+      present, sizes agree, and all position differences form one uniform
+      translation. Focus its saved active row, inhibit automatic scrolling,
+      apply the dominant signed layout move, verify all rectangles, and always
+      release inhibition. Structurally different scrolling columns are left
+      unchanged.
 3. Rebuild or correct a tiled layout as soon as all of that workspace's saved
    windows are matched, without waiting for unrelated applications. Keep the
    final all-workspace pass after ordinary placement completes. Equivalent but
@@ -315,6 +338,9 @@ the service retries after two seconds.
    Hyprland 0.55 keeps ordinary window restoration and skips group formation.
    IPC loss is retryable; a requested mutation or verification failure is an
    application failure.
+5. Restore the snapshot's active workspace and its saved focused tiled window
+   after layout and group correction. Older snapshots retain the live focus
+   context observed before restore.
 
 Restore failures return nonzero so systemd can retry startup IPC failures. Log
 details to `${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/log/omarchy-sesh.log`,
@@ -354,12 +380,22 @@ All confirmed against the installed Omarchy defaults.
    `ExecStop` is diagnostic because graphical teardown may already have removed
    clients. It cannot replace the newest complete snapshot.
 
-3. **Power-menu / logout wiring** — marker-delimited user menu overrides save
-   synchronously, then invoke `omarchy-system-logout`, `omarchy-system-reboot`,
-   or `omarchy-system-shutdown`. The save closes the current compositor's
-   autosave gate while holding the operation lock and before querying Hyprland;
+3. **Power-menu / logout wiring** — marker-delimited user menu overrides invoke
+   `prepare-power`. In Active mode it saves synchronously and then sends one
+   Ctrl+Q per distinct Zen or Chromium-family browser process, waiting up to ten
+   seconds for a clean exit before invoking
+   `omarchy-system-logout`, `omarchy-system-reboot`, or
+   `omarchy-system-shutdown`. This runs before Omarchy's stock close-all helper,
+   allowing browsers to persist their multi-window sessions. The save closes the current
+   compositor's autosave gate while holding the operation lock and before
+   querying Hyprland;
    periodic saves recheck that gate after acquiring the same lock. This ordering
    prevents a timer firing during teardown from superseding the power snapshot.
+   In Manual mode, `prepare-power` does not save or send shortcuts. The explicit
+   Manual snapshot remains authoritative after the user closes Zen, instead of
+   being replaced by a shutdown snapshot from which Zen is absent. If the
+   systemd enablement state cannot be determined, use the Active-mode path as
+   the data-preserving fallback.
    Direct power commands bypass these overrides and rely on the latest periodic
    snapshot.
 
@@ -404,8 +440,19 @@ All confirmed against the installed Omarchy defaults.
   the current Hyprland instance from the systemd user manager before each
   capture so a startup restore retry cannot leave it on a stale compositor, and
   rechecks the completion gate under the operation lock. Failed restore and
-  synchronous shutdown markers keep autosave gated until restore succeeds or
-  the user explicitly establishes a new baseline through manual/Active mode.
+  synchronous shutdown markers keep autosave gated until restore succeeds. If
+  all previously missing saved windows later become uniquely matchable, the
+  daemon marks that restore complete and resumes automatically; manual/Active
+  mode can still explicitly establish a new baseline.
+- `prepare-power` — preserves the selected snapshot untouched in Manual mode;
+  in Active mode, synchronously saves the logout snapshot and gracefully quits
+  session-aware applications before the stock Omarchy power command.
+- `quit-browsers` — sends Ctrl+Q to each distinct main Zen PID, confirms its
+  generated `Close and quit` dialog when present, and
+  Ctrl+Shift+Q to each distinct main Chromium-family browser PID. After a
+  three-second shortcut grace period, a lingering Chromium main PID receives
+  SIGTERM. Renderer processes are never targeted directly and there is no
+  SIGKILL mode.
 - `status` — lists recent sessions.
 - `list` — lists retained named sessions.
 - `delete --name NAME` — removes a named session and its captured state.

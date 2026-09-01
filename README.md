@@ -66,8 +66,14 @@ selecting **Active** again captures a new baseline and re-enables the periodic
 saver. A restore runs at the next graphical login via `omarchy-sesh.service`;
 the autosave service is ordered after it and waits one interval before its first
 capture.
-Saves before logout, reboot, or shutdown happen synchronously so the reboot
-snapshot is never superseded by a periodic capture during teardown.
+Before logout, reboot, or shutdown, the menu integration saves synchronously
+and then asks Zen and Chromium-family browsers to quit cleanly. This lets the
+browsers persist all of their windows and tabs before Omarchy closes the
+remaining Hyprland clients, while the autosave gate keeps the reboot snapshot from being
+superseded during teardown. This applies only in Active mode. Manual mode keeps
+the explicit snapshot selected with **Manual** authoritative: power actions do
+not save again or send browsers a shortcut, so you can save, close them yourself,
+and then shut down without replacing that snapshot with one that omits Zen.
 
 See [How it works](#how-it-works) for the full save/restore behavior and
 `install.sh`/`Service.qml` for the installation and first-open wiring.
@@ -78,6 +84,8 @@ See [How it works](#how-it-works) for the full save/restore behavior and
 omarchy-sesh save [--label manual|logout] [--name NAME]                 # snapshot current windows
 omarchy-sesh restore [--name NAME] [--dry-run]                          # restore latest or named snapshot
 omarchy-sesh autosave [--interval 60]                                   # periodic save (crash cover)
+omarchy-sesh prepare-power                                              # preserve Manual, or prepare Active for shutdown
+omarchy-sesh quit-browsers                                              # gracefully quit Zen and Chrome from the terminal
 omarchy-sesh status                                                     # list saved sessions
 omarchy-sesh list                                                       # list named sessions
 omarchy-sesh delete --name NAME                                         # delete a named session
@@ -119,8 +127,9 @@ treated as transient: every command logs it and continues with the defaults.
 - `bash` — runs `install.sh`/`uninstall.sh`.
 - `python3` (stdlib only: `sqlite3`, `json`, `shlex`) — implements the
   `omarchy-sesh` CLI.
-- `/proc/<pid>/{cmdline,cwd}` — read directly to capture each window's
-  launch command and working directory.
+- `/proc/<pid>/{cmdline,cwd,environ}` — read directly to capture each window's
+  launch command and working directory. AppImage environment metadata replaces
+  an ephemeral `/tmp/.mount_*` executable with the persistent `.AppImage` path.
 - systemd user units (`omarchy-sesh.service`,
   `omarchy-sesh-autosave.service`) — installed to drive restore-on-login and
   periodic autosave.
@@ -169,7 +178,13 @@ appear during one shared bounded polling window. If a process does not recreate
 all of its saved windows, its command is retried independently. Chromium app-mode
 windows are restored individually through
 Omarchy's web-app launcher because Chromium does not reopen them from the base
-browser command. After matching, eligible nested dwindle workspaces are rebuilt
+browser command. Zen and normal Chromium-family browsers are launched only once
+per saved process group; their own session restoration recreates all saved
+browser windows, avoiding retries that open empty windows. Special workspaces
+such as `special:scratchpad` are matched, launched, and placed by their stable
+name instead of Hyprland's session-local negative workspace ID. After matching,
+eligible nested
+dwindle workspaces are rebuilt
 in one fast Lua evaluation: one seed remains on the target workspace while the
 other leaves pass through a temporary staging workspace. Focus, insertion
 direction, and split ratios recreate the saved geometry, which is then verified.
@@ -194,13 +209,43 @@ are left unchanged. Hyprland does not expose the saved active tab or lock/deny
 state; reconstructed groups select their first saved member. Hyprland 0.55
 continues to restore the windows without grouping them.
 
+For a complete `scrolling` workspace whose windows return with the saved sizes
+but a uniform viewport offset, restore focuses the window that was active at
+capture time, applies the saved layout offset, verifies every final rectangle,
+and releases scrolling inhibition even on failure. The originally active
+workspace and focused tiled window are restored at the end. This corrects the
+observed shifted-column case; rebuilding a different scrolling column structure
+remains outside Hyprland's exposed session API.
+
 **Autosave** (`omarchy-sesh autosave`) waits one interval before its first
 capture, then saves periodically (default 60s, configurable). It remains gated
 until restore succeeds, so a partial login cannot replace the reboot snapshot,
 and refreshes the active Hyprland instance before every capture. Explicitly
 selecting Active mode captures the current desktop first when no successful
-restore marker exists. A synchronous logout, reboot, or shutdown save closes
+restore marker exists. If startup restore was incomplete but the user later
+opens the missing applications, autosave verifies a complete one-to-one match
+against the saved session and safely reopens its gate. A synchronous logout,
+reboot, or shutdown save closes
 the gate before capture so a periodic save cannot supersede it during teardown.
+In Manual mode, the same power action deliberately skips both this final save
+and automatic application quit, preserving the snapshot created when Manual was
+selected.
+
+After a Manual snapshot, `omarchy-sesh quit-browsers` sends one Ctrl+Q to each
+main Zen process and Ctrl+Shift+Q to each main Chromium-family browser process,
+then confirms Zen's `Close and quit` dialog when it is enabled, and waits up to
+ten seconds for all browser windows to disappear. If Chrome
+ignores its shortcut, the command sends SIGTERM only to its main PID after a
+three-second grace period. It deliberately avoids `pkill` and `kill -9` across
+browser subprocesses.
+
+Zen and normal Chromium-family browsers are launched at most once for each
+saved process group. Their own session manager is responsible for creating all
+saved browser windows; if one of those windows is already present, the restore
+waits for the remaining windows instead of launching another empty one.
+Normal Chrome/Chromium launches also receive `--restore-last-session`, so the
+saved browser windows reopen without requiring repeated Ctrl+Shift+T. Guest and
+incognito launches never receive this option.
 
 Exact dwindle tree replay, including two-window ratios, requires a schema-v5
 snapshot, `dwindle:use_active_for_splits =
@@ -212,6 +257,8 @@ continue to launch in parallel. Replay runs independently per workspace and
 restores the focused window or empty workspace afterward; because Hyprland
 layout messages act on the focused workspace, a very brief workspace change may
 still be visible during login.
+The runtime `enabled` entries returned for ordinary workspaces are metadata, not
+workspace-specific geometry rules, and no longer disable exact dwindle replay.
 Ineligible workspaces retain the guarded two-window and compatible-slot
 fallback without moving unrelated windows. Hyprland's `stableId` is only a live
 compositor window-object selector and resets with Hyprland, so ambiguous
